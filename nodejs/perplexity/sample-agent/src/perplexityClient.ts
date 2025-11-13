@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 import { Perplexity } from "@perplexity-ai/perplexity_ai";
 import {
   InferenceScope,

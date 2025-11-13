@@ -1,6 +1,12 @@
-import { TurnContext, TurnState } from '@microsoft/agents-hosting';
-import { PerplexityClient } from './perplexityClient.js';
-import { AgentNotificationActivity, NotificationType } from '@microsoft/agents-a365-notifications';
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+import { TurnContext, TurnState } from "@microsoft/agents-hosting";
+import { PerplexityClient } from "./perplexityClient.js";
+import {
+  AgentNotificationActivity,
+  NotificationType,
+} from "@microsoft/agents-a365-notifications";
 
 export class PerplexityAgent {
   isApplicationInstalled: boolean = false;
@@ -14,27 +20,38 @@ export class PerplexityAgent {
   /**
    * Handles incoming user messages and sends responses using Perplexity.
    */
-  async handleAgentMessageActivity(turnContext: TurnContext, state: TurnState): Promise<void> {
+  async handleAgentMessageActivity(
+    turnContext: TurnContext,
+    state: TurnState
+  ): Promise<void> {
     if (!this.isApplicationInstalled) {
-      await turnContext.sendActivity("Please install the application before sending messages.");
+      await turnContext.sendActivity(
+        "Please install the application before sending messages."
+      );
       return;
     }
 
     if (!this.termsAndConditionsAccepted) {
       if (turnContext.activity.text?.trim().toLowerCase() === "i accept") {
         this.termsAndConditionsAccepted = true;
-        await turnContext.sendActivity("Thank you for accepting the terms and conditions! How can I assist you today?");
+        await turnContext.sendActivity(
+          "Thank you for accepting the terms and conditions! How can I assist you today?"
+        );
         return;
       } else {
-        await turnContext.sendActivity("Please accept the terms and conditions to proceed. Send 'I accept' to accept.");
+        await turnContext.sendActivity(
+          "Please accept the terms and conditions to proceed. Send 'I accept' to accept."
+        );
         return;
       }
     }
 
-    const userMessage = turnContext.activity.text?.trim() || '';
+    const userMessage = turnContext.activity.text?.trim() || "";
 
     if (!userMessage) {
-      await turnContext.sendActivity('Please send me a message and I\'ll help you!');
+      await turnContext.sendActivity(
+        "Please send me a message and I'll help you!"
+      );
       return;
     }
 
@@ -43,7 +60,7 @@ export class PerplexityAgent {
       const response = await perplexityClient.invokeAgentWithScope(userMessage);
       await turnContext.sendActivity(response);
     } catch (error) {
-      console.error('Perplexity query error:', error);
+      console.error("Perplexity query error:", error);
       const err = error as any;
       await turnContext.sendActivity(`Error: ${err.message || err}`);
     }
@@ -52,20 +69,30 @@ export class PerplexityAgent {
   /**
    * Handles agent notification activities by parsing the activity type.
    */
-  async handleAgentNotificationActivity(turnContext: TurnContext, state: TurnState, agentNotificationActivity: AgentNotificationActivity): Promise<void> {
+  async handleAgentNotificationActivity(
+    turnContext: TurnContext,
+    state: TurnState,
+    agentNotificationActivity: AgentNotificationActivity
+  ): Promise<void> {
     try {
       if (!this.isApplicationInstalled) {
-        await turnContext.sendActivity("Please install the application before sending notifications.");
+        await turnContext.sendActivity(
+          "Please install the application before sending notifications."
+        );
         return;
       }
 
       if (!this.termsAndConditionsAccepted) {
         if (turnContext.activity.text?.trim().toLowerCase() === "i accept") {
           this.termsAndConditionsAccepted = true;
-          await turnContext.sendActivity("Thank you for accepting the terms and conditions! How can I assist you today?");
+          await turnContext.sendActivity(
+            "Thank you for accepting the terms and conditions! How can I assist you today?"
+          );
           return;
         } else {
-          await turnContext.sendActivity("Please accept the terms and conditions to proceed. Send 'I accept' to accept.");
+          await turnContext.sendActivity(
+            "Please accept the terms and conditions to proceed. Send 'I accept' to accept."
+          );
           return;
         }
       }
@@ -73,45 +100,72 @@ export class PerplexityAgent {
       // Find the first known notification type entity
       switch (agentNotificationActivity.notificationType) {
         case NotificationType.EmailNotification:
-          await this.emailNotificationHandler(turnContext, state, agentNotificationActivity);
+          await this.emailNotificationHandler(
+            turnContext,
+            state,
+            agentNotificationActivity
+          );
           break;
         case NotificationType.WpxComment:
-          await this.wordNotificationHandler(turnContext, state, agentNotificationActivity);
+          await this.wordNotificationHandler(
+            turnContext,
+            state,
+            agentNotificationActivity
+          );
           break;
         default:
-          await turnContext.sendActivity('Notification type not yet implemented.');
+          await turnContext.sendActivity(
+            "Notification type not yet implemented."
+          );
       }
     } catch (error) {
-      console.error('Error handling agent notification activity:', error);
+      console.error("Error handling agent notification activity:", error);
       const err = error as any;
-      await turnContext.sendActivity(`Error handling notification: ${err.message || err}`);
+      await turnContext.sendActivity(
+        `Error handling notification: ${err.message || err}`
+      );
     }
   }
 
   /**
    * Handles agent installation and removal events.
    */
-  async handleInstallationUpdateActivity(turnContext: TurnContext, state: TurnState): Promise<void> {
-    if (turnContext.activity.action === 'add') {
+  async handleInstallationUpdateActivity(
+    turnContext: TurnContext,
+    state: TurnState
+  ): Promise<void> {
+    if (turnContext.activity.action === "add") {
       this.isApplicationInstalled = true;
       this.termsAndConditionsAccepted = false;
-      await turnContext.sendActivity('Thank you for hiring me! Looking forward to assisting you with Perplexity AI! Before I begin, could you please confirm that you accept the terms and conditions? Send "I accept" to accept.');
-    } else if (turnContext.activity.action === 'remove') {
+      await turnContext.sendActivity(
+        'Thank you for hiring me! Looking forward to assisting you with Perplexity AI! Before I begin, could you please confirm that you accept the terms and conditions? Send "I accept" to accept.'
+      );
+    } else if (turnContext.activity.action === "remove") {
       this.isApplicationInstalled = false;
       this.termsAndConditionsAccepted = false;
-      await turnContext.sendActivity('Thank you for your time, I enjoyed working with you.');
+      await turnContext.sendActivity(
+        "Thank you for your time, I enjoyed working with you."
+      );
     }
   }
 
   /**
    * Handles @-mention notification activities.
    */
-  async wordNotificationHandler(turnContext: TurnContext, state: TurnState, mentionActivity: AgentNotificationActivity): Promise<void> {
-    await turnContext.sendActivity('Thanks for the @-mention notification! Working on a response...');
+  async wordNotificationHandler(
+    turnContext: TurnContext,
+    state: TurnState,
+    mentionActivity: AgentNotificationActivity
+  ): Promise<void> {
+    await turnContext.sendActivity(
+      "Thanks for the @-mention notification! Working on a response..."
+    );
     const mentionNotificationEntity = mentionActivity.wpxCommentNotification;
 
     if (!mentionNotificationEntity) {
-      await turnContext.sendActivity('I could not find the mention notification details.');
+      await turnContext.sendActivity(
+        "I could not find the mention notification details."
+      );
       return;
     }
 
@@ -121,14 +175,16 @@ export class PerplexityAgent {
     const subjectCommentId = mentionNotificationEntity.subjectCommentId;
 
     let mentionPrompt = `You have been mentioned in a Word document.
-      Document ID: ${documentId || 'N/A'}
-      OData ID: ${odataId || 'N/A'}
-      Initiating Comment ID: ${initiatingCommentId || 'N/A'}
-      Subject Comment ID: ${subjectCommentId || 'N/A'}
+      Document ID: ${documentId || "N/A"}
+      OData ID: ${odataId || "N/A"}
+      Initiating Comment ID: ${initiatingCommentId || "N/A"}
+      Subject Comment ID: ${subjectCommentId || "N/A"}
       Please retrieve the text of the initiating comment and return it in plain text.`;
 
     const perplexityClient = this.getPerplexityClient();
-    const commentContent = await perplexityClient.invokeAgentWithScope(mentionPrompt);
+    const commentContent = await perplexityClient.invokeAgentWithScope(
+      mentionPrompt
+    );
     const response = await perplexityClient.invokeAgentWithScope(
       `You have received the following comment. Please follow any instructions in it. ${commentContent}`
     );
@@ -138,18 +194,28 @@ export class PerplexityAgent {
   /**
    * Handles email notification activities.
    */
-  async emailNotificationHandler(turnContext: TurnContext, state: TurnState, emailActivity: AgentNotificationActivity): Promise<void> {
-    await turnContext.sendActivity('Thanks for the email notification! Working on a response...');
+  async emailNotificationHandler(
+    turnContext: TurnContext,
+    state: TurnState,
+    emailActivity: AgentNotificationActivity
+  ): Promise<void> {
+    await turnContext.sendActivity(
+      "Thanks for the email notification! Working on a response..."
+    );
     const emailNotificationEntity = emailActivity.emailNotification;
 
     if (!emailNotificationEntity) {
-      await turnContext.sendActivity('I could not find the email notification details.');
+      await turnContext.sendActivity(
+        "I could not find the email notification details."
+      );
       return;
     }
 
     const emailNotificationId = emailNotificationEntity.id;
-    const emailNotificationConversationId = emailNotificationEntity.conversationId;
-    const emailNotificationConversationIndex = emailNotificationEntity.conversationIndex;
+    const emailNotificationConversationId =
+      emailNotificationEntity.conversationId;
+    const emailNotificationConversationIndex =
+      emailNotificationEntity.conversationIndex;
     const emailNotificationChangeKey = emailNotificationEntity.changeKey;
 
     const perplexityClient = this.getPerplexityClient();
@@ -172,10 +238,10 @@ export class PerplexityAgent {
   private getPerplexityClient(): PerplexityClient {
     const apiKey = process.env.PERPLEXITY_API_KEY;
     if (!apiKey) {
-      throw new Error('PERPLEXITY_API_KEY environment variable is not set');
+      throw new Error("PERPLEXITY_API_KEY environment variable is not set");
     }
 
-    const model = process.env.PERPLEXITY_MODEL || 'sonar';
+    const model = process.env.PERPLEXITY_MODEL || "sonar";
     return new PerplexityClient(apiKey, model);
   }
 }
