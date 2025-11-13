@@ -182,7 +182,6 @@ export class N8nAgent {
     try {
       mcpServers.push(...await this.toolService.getMcpServers(
         process.env.AGENTIC_USER_ID || '',
-        process.env.MCP_ENVIRONMENT_ID || "",
         this.authorization,
         turnContext,
         process.env.MCP_AUTH_TOKEN || ""

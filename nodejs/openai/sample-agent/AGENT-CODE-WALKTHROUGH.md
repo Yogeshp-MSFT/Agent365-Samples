@@ -126,7 +126,6 @@ export async function getClient(authorization: any, turnContext: TurnContext): P
     await toolService.addToolServersToAgent(
       agent,
       process.env.AGENTIC_USER_ID || '',
-      process.env.MCP_ENVIRONMENT_ID || "",
       authorization,
       turnContext,
       process.env.MCP_AUTH_TOKEN || "",
@@ -149,7 +148,6 @@ export async function getClient(authorization: any, turnContext: TurnContext): P
 
 **Environment Variables**:
 - `AGENTIC_USER_ID`: User identifier for the agent
-- `MCP_ENVIRONMENT_ID`: Environment where MCP servers are provisioned
 - `MCP_AUTH_TOKEN`: Bearer token for MCP server authentication
 
 ---
@@ -223,7 +221,6 @@ MCP servers are registered in the `getClient` function:
 await toolService.addToolServersToAgent(
   agent,
   process.env.AGENTIC_USER_ID || '',
-  process.env.MCP_ENVIRONMENT_ID || "",
   authorization,
   turnContext,
   process.env.MCP_AUTH_TOKEN || "",
@@ -234,7 +231,6 @@ await toolService.addToolServersToAgent(
 
 **Environment Variables**:
 - `AGENTIC_USER_ID`: Identifier for the agent instance
-- `MCP_ENVIRONMENT_ID`: Environment ID for MCP server provisioning
 - `MCP_AUTH_TOKEN`: Bearer token for MCP authentication
 
 **Authentication Modes**:

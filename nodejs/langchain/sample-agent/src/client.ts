@@ -60,7 +60,6 @@ export async function getClient(authorization: Authorization, turnContext: TurnC
     agentWithMcpTools = await toolService.addToolServersToAgent(
       agent,
       '',
-      process.env.ENVIRONMENT_ID || "",
       authorization,
       turnContext,
       process.env.BEARER_TOKEN || "",
