@@ -12,8 +12,7 @@ from aiohttp.web import Application, Request, Response, json_response, run_app
 from aiohttp.web_middlewares import middleware as web_middleware
 from dotenv import load_dotenv
 from agent_interface import AgentInterface, check_agent_inheritance
-from microsoft_agents.activity import load_configuration_from_env, Activity
-from microsoft_agents.activity_types import ActivityTypes
+from microsoft_agents.activity import load_configuration_from_env, Activity, ActivityTypes
 from microsoft_agents.authentication.msal import MsalConnectionManager
 from microsoft_agents.hosting.aiohttp import (
     CloudAdapter,
@@ -35,8 +34,9 @@ from microsoft_agents_a365.notifications.agent_notification import (
     NotificationTypes,
     AgentNotificationActivity,
     ChannelId,
-    EmailResponse,
 )
+from microsoft_agents_a365.notifications import EmailResponse
+
 from microsoft_agents_a365.observability.core.config import configure
 from microsoft_agents_a365.observability.core.middleware.baggage_builder import (
     BaggageBuilder,
