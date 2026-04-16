@@ -84,11 +84,20 @@ class GenericAgentHost:
         if not check_agent_inheritance(agent_class):
             raise TypeError(f"Agent class {agent_class.__name__} must inherit from AgentInterface")
         
-        # Auth handler name can be configured via environment
-        # Defaults to empty (no auth handler) - set AUTH_HANDLER_NAME=AGENTIC for production agentic auth
+        # Auth handler name is used for token exchange (e.g. getting Graph API tokens).
+        # Keep it available even in anonymous mode for downstream token exchange.
         self.auth_handler_name = os.getenv("AUTH_HANDLER_NAME", "") or None
-        if self.auth_handler_name:
+
+        # Only enforce auth_handlers on route registration when real client credentials
+        # are configured. Without them the server runs anonymous and no identity is
+        # validated, so requiring auth_handlers on handlers would silently skip them.
+        self._has_auth_credentials = bool(
+            environ.get("CLIENT_ID") and environ.get("TENANT_ID") and environ.get("CLIENT_SECRET")
+        )
+        if self.auth_handler_name and self._has_auth_credentials:
             logger.info(f"🔐 Using auth handler: {self.auth_handler_name}")
+        elif self.auth_handler_name:
+            logger.info(f"🔐 Auth handler '{self.auth_handler_name}' available for token exchange (anonymous mode — not enforced on routes)")
         else:
             logger.info("🔓 No auth handler configured (AUTH_HANDLER_NAME not set)")
 
@@ -123,9 +132,13 @@ class GenericAgentHost:
         """Setup the Microsoft Agents SDK message handlers"""
 
         
-        # Configure auth handlers - only required when auth_handler_name is set
+        # Configure auth handlers - only enforce on routes when real credentials exist.
+        # In anonymous mode (no CLIENT_ID/TENANT_ID/CLIENT_SECRET), handlers must run
+        # without auth so the agent can respond to Agents Playground messages.
         handler_config = (
-            {"auth_handlers": [self.auth_handler_name]} if self.auth_handler_name else {}
+            {"auth_handlers": [self.auth_handler_name]}
+            if self.auth_handler_name and self._has_auth_credentials
+            else {}
         )
 
         async def help_handler(context: TurnContext, _: TurnState):

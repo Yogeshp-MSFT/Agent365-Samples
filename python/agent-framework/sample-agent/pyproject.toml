@@ -6,46 +6,51 @@ authors = [
     { name = "Microsoft", email = "support@microsoft.com" }
 ]
 dependencies = [
-    # AgentFramework SDK - The official package
-    "agent-framework-azure-ai",
-    
-    # Azure AI Projects - explicitly require pre-release version
+    # AgentFramework SDK - latest pre-release
+    "agent-framework-core>=1.0.1",
+    "agent-framework-openai>=1.0.1",
+    "agent-framework-azure-ai>=1.0.0rc6",
+
+    # Azure AI
     "azure-ai-agents>=1.2.0b5",
-    "azure-ai-projects>=2.0.0b2",
+    "azure-ai-projects>=2.0.1",
 
-    # Microsoft Agents SDK - Official packages for hosting and integration
-    "microsoft-agents-hosting-aiohttp",
-    "microsoft-agents-hosting-core",
-    "microsoft-agents-authentication-msal",
-    "microsoft-agents-activity",
+    # Microsoft Agents SDK
+    "microsoft-agents-hosting-aiohttp>=0.5.3",
+    "microsoft-agents-hosting-core>=0.5.3",
+    "microsoft-agents-authentication-msal>=0.5.3",
+    "microsoft-agents-activity>=0.5.3",
 
-    # Azure SDK components
-    "azure-identity",
+    # Azure SDK
+    "azure-identity>=1.25.0",
 
     # Core dependencies
-    "python-dotenv",
-    "aiohttp",
+    "python-dotenv>=1.0.0",
+    "aiohttp>=3.7.0",
 
-    # HTTP server support for MCP servers
+    # HTTP server
     "uvicorn[standard]>=0.20.0",
     "fastapi>=0.100.0",
 
     # HTTP client
-    "httpx>=0.24.0",
+    "httpx>=0.28.0",
+
+    # MCP support
+    "mcp>=1.27.0",
 
     # Data validation
     "pydantic>=2.0.0",
 
-    # Additional utilities
+    # Utilities
     "typing-extensions>=4.0.0",
 
-    # Microsoft Agent 365 SDK packages
-    "microsoft_agents_a365_tooling >= 0.1.0",
-    "microsoft_agents_a365_tooling_extensions_agentframework >= 0.1.0",
-    "microsoft_agents_a365_observability_core >= 0.1.0",
-    "microsoft_agents_a365_observability_extensions_agent_framework >= 0.1.0",
-    "microsoft_agents_a365_runtime >= 0.1.0",
-    "microsoft_agents_a365_notifications >= 0.1.0"
+    # Microsoft Agent 365 SDK packages - latest pre-release
+    "microsoft-agents-a365-tooling>=0.2.1.dev48",
+    "microsoft-agents-a365-tooling-extensions-agentframework>=0.2.1.dev48",
+    "microsoft-agents-a365-observability-core>=0.2.1.dev48",
+    "microsoft-agents-a365-observability-extensions-agent-framework>=0.2.1.dev48",
+    "microsoft-agents-a365-runtime>=0.2.1.dev48",
+    "microsoft-agents-a365-notifications>=0.2.1.dev48",
 ]
 requires-python = ">=3.11"
 

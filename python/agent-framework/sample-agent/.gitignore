@@ -9,6 +9,9 @@ env/.env.sandbox
 .notification.playgroundstore.json
 appPackage/build
 
+# Manifest folder — generated during deploy
+manifest/
+
 # Python
 __pycache__/
 *.pyc

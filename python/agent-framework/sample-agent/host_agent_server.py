@@ -366,6 +366,8 @@ class GenericAgentHost:
         app.router.add_post("/api/messages", entry_point)
         app.router.add_get("/api/messages", lambda _: Response(status=200))
         app.router.add_get("/api/health", health)
+        app.router.add_get("/", health)
+        app.router.add_get("/robots933456.txt", health)
 
         app["agent_configuration"] = auth_configuration
         app["agent_app"] = self.agent_app
@@ -374,24 +376,33 @@ class GenericAgentHost:
         app.on_startup.append(lambda app: self.initialize_agent())
         app.on_shutdown.append(lambda app: self.cleanup())
 
+        isProduction = (
+            os.getenv("WEBSITE_SITE_NAME") is not None
+            or os.getenv("K_SERVICE") is not None
+            or os.getenv("ENVIRONMENT", "").lower() == "production"
+        )
+
         desired_port = int(environ.get("PORT", 3978))
         port = desired_port
 
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(0.5)
-            if s.connect_ex(("127.0.0.1", desired_port)) == 0:
-                port = desired_port + 1
+        if not isProduction:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(0.5)
+                if s.connect_ex(("127.0.0.1", desired_port)) == 0:
+                    port = desired_port + 1
+
+        host = "0.0.0.0" if isProduction else "localhost"
 
         print("=" * 80)
         print(f"🏢 {self.agent_class.__name__}")
         print("=" * 80)
         print(f"🔒 Auth: {'Enabled' if auth_configuration else 'Anonymous'}")
-        print(f"🚀 Server: localhost:{port}")
-        print(f"📚 Endpoint: http://localhost:{port}/api/messages")
-        print(f"❤️  Health: http://localhost:{port}/api/health\n")
+        print(f"🚀 Server: {host}:{port}")
+        print(f"📚 Endpoint: http://{host}:{port}/api/messages")
+        print(f"❤️  Health: http://{host}:{port}/api/health\n")
 
         try:
-            run_app(app, host="localhost", port=port, handle_signals=True)
+            run_app(app, host=host, port=port, handle_signals=True)
         except KeyboardInterrupt:
             print("\n👋 Server stopped")
 
