@@ -9,12 +9,15 @@
     "test-tool": "agentsplayground",
     "install:clean": "npm run clean && npm install",
     "clean": "rimraf dist node_modules package-lock.json",
-    "build": "tsc"
+    "build": "tsc",
+    "connector:create": "ts-node src/connector/create-connection.ts",
+    "connector:ingest": "ts-node src/connector/ingest-items.ts"
   },
   "keywords": [],
   "license": "MIT",
   "description": "",
   "dependencies": {
+    "@azure/identity": "^4.13.1",
     "@microsoft/agents-a365-notifications": "^0.1.0-preview.125",
     "@microsoft/agents-a365-observability": "^0.1.0-preview.125",
     "@microsoft/agents-a365-observability-extensions-openai": "^0.1.0-preview.125",
@@ -24,10 +27,13 @@
     "@microsoft/agents-a365-tooling-extensions-openai": "^0.1.0-preview.125",
     "@microsoft/agents-activity": "^1.2.2",
     "@microsoft/agents-hosting": "^1.2.2",
+    "@microsoft/microsoft-graph-client": "^3.0.7",
     "@openai/agents": "^0.1.11",
     "dotenv": "^17.2.2",
     "express": "^5.1.0",
-    "openai": "^4.77.0"
+    "isomorphic-fetch": "^3.0.0",
+    "openai": "^4.77.0",
+    "zod": "^3.25.76"
   },
   "devDependencies": {
     "@microsoft/m365agentsplayground": "^0.2.18",

@@ -22,6 +22,7 @@ import {
 } from '@microsoft/agents-a365-observability';
 import { AgenticTokenCacheInstance } from '@microsoft/agents-a365-observability-hosting';
 import { tokenResolver } from './token-cache';
+import { searchNasaApod } from './graph/search-tool';
 
 export interface Client {
   invokeInferenceScope(prompt: string): Promise<string>;
@@ -141,6 +142,7 @@ export async function getClient(authorization: Authorization, authHandlerName: s
   const personalizedAgent = createAgent({
     model,
     name: agentName,
+    tools: [searchNasaApod],
     systemPrompt: `You are a helpful assistant with access to tools. The user's name is ${displayName}.
 
 CRITICAL SECURITY RULES - NEVER VIOLATE THESE:
@@ -233,10 +235,16 @@ class LangChainClient implements Client {
       model: "gpt-4o-mini",
     };
 
+    const resolvedTenantId = this.turnContext?.activity?.recipient?.tenantId
+      || (this.turnContext?.activity?.conversation as any)?.tenantId
+      || process.env.GRAPH_TENANT_ID
+      || '00000000-0000-0000-0000-000000000000';
+    console.log(`InferenceScope tenantId resolved to: ${resolvedTenantId}`);
+
     const agentDetails: AgentDetails = {
       agentId: this.turnContext?.activity?.recipient?.agenticAppId || agentName,
       agentName: agentName,
-      tenantId: this.turnContext?.activity?.recipient?.tenantId || 'sample-tenant',
+      tenantId: resolvedTenantId,
     };
 
     let response = '';

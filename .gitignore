@@ -108,6 +108,7 @@ a365.config.json
 a365.generated.config.json
 app.zip
 publish/
+manifest/
 
 # OS-specific files
 .DS_Store

@@ -28,6 +28,7 @@ import {
 } from '@microsoft/agents-a365-observability';
 import { OpenAIAgentsTraceInstrumentor } from '@microsoft/agents-a365-observability-extensions-openai';
 import { tokenResolver } from './token-cache';
+import { searchNasaApod } from './graph/search-tool';
 
 // Configure OpenAI/Azure OpenAI client before any agent operations
 configureOpenAIClient();
@@ -76,6 +77,7 @@ export async function getClient(authorization: Authorization, authHandlerName: s
       // You can customize the agent configuration here if needed
       name: 'OpenAI Agent',
       model: modelName,
+      tools: [searchNasaApod],
       instructions: `You are a helpful assistant with access to tools provided by MCP (Model Context Protocol) servers. The user's name is ${displayName}.
 
 When users ask about your MCP servers, tools, or capabilities, use introspection to list the tools you have available. You can see all the tools registered to you and should report them accurately when asked.
