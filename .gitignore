@@ -110,6 +110,9 @@ app.zip
 publish/
 manifest/
 
+# Playground settings (contain secrets)
+appsettings.Playground.json
+
 # OS-specific files
 .DS_Store
 Thumbs.db
