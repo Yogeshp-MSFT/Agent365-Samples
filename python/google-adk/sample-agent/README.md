@@ -11,6 +11,58 @@ This sample uses the [Microsoft Agent 365 SDK for Python](https://github.com/mic
 
 For comprehensive documentation and guidance on building agents with the Microsoft Agent 365 SDK, including how to add tooling, observability, and notifications, visit the [Microsoft Agent 365 Developer Documentation](https://learn.microsoft.com/en-us/microsoft-agent-365/developer/).
 
+## Observability S2S export
+
+OBS attribution uses `recipient.agentic_app_id`, or the explicitly configured
+`AGENT365_OBS_AGENT_ID` when instance metadata is absent. It never treats the
+agent-user object ID as the application client ID. Business authentication and
+the caller's user metadata are not changed.
+
+When enabling A365 export, provide these **dedicated** settings in `.env` or deployment
+secrets. Leaving the exporter disabled retains console-only observability.
+
+```dotenv
+ENABLE_A365_OBSERVABILITY_EXPORTER=true
+AGENT365_OBS_TENANT_ID=<<YOUR_TENANT_ID>>
+AGENT365_OBS_AGENT_ID=<<YOUR_AGENT_INSTANCE_CLIENT_ID>>
+AGENT365_OBS_BLUEPRINT_CLIENT_ID=<<YOUR_BLUEPRINT_CLIENT_ID>>
+AGENT365_OBS_BLUEPRINT_CLIENT_SECRET=<<YOUR_BLUEPRINT_CLIENT_SECRET>>
+```
+
+Use the actual **instance client ID**, never `AGENTIC_USER_ID`, a blueprint, or a
+service-principal object ID. Permissionless S2S export is conditional on **eligible
+agent instance registration** and authorization, not merely Entra identity
+creation or selecting the S2S endpoint. This sample does not provision identities or
+grant OBS permissions; workload MCP/Graph/OBO permissions remain independent.
+
+This sample provider is single-instance: one configured tenant and agent instance, plus a separate blueprint secret. It has no managed-identity option and requests tokens from `login.microsoftonline.com`, so sovereign clouds need provider changes. Multi-instance or multi-tenant deployments should cache per agent/tenant and reuse the hosting connection credential.
+
+Absent or empty `roles` are accepted only with `idtyp=app`, or without `idtyp` when
+`oid` equals `sub`. Valid nonempty roles also support legacy app tokens without
+`idtyp`; any `scp` claim is rejected.
+
+`observability_token_service.py` adapts the autonomous sample's
+[two-step FMI flow](https://learn.microsoft.com/en-us/entra/agent-id/autonomous-agent-authentication-authorization-flow):
+blueprint credentials + `fmi_path=agent instance client ID` acquire T1 for
+`api://AzureADTokenExchange/.default`; the instance uses T1 as its client assertion
+to request `api://9b975845-388f-4429-889e-eab1ef63949c/.default`. Both grants are
+`client_credentials`. Business MCP/Graph/OBO authentication and original user/agent
+baggage are not changed.
+
+Missing/placeholder settings fail when export is enabled; with export disabled, placeholders do not block local/Playground startup. Export tenant/agent and returned
+token identity must match the configured instance, and delegated `scp` tokens are
+rejected. The OBS-only cache uses real `expires_in`/`exp` with a 60-second refresh margin.
+Token failures produce safe errors without stale, empty, delegated or legacy-route
+fallback. On 401/403, check IDs, blueprint credentials, instance registration and authorization
+for the exact agent instance.
+If existing instrumentation supplies an agent-user/object ID as agent baggage, export
+fails closed: do not put that ID in the dedicated client-ID setting or rewrite baggage
+merely to bypass the check.
+
+The provided secret flow is for **development**. Production should use the documented
+certificate/managed-identity blueprint assertion flow through your approved provider.
+
+
 ---
 
 ## Prerequisites

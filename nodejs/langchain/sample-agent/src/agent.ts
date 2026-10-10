@@ -8,10 +8,8 @@ import { Activity, ActivityTypes } from '@microsoft/agents-activity';
 import '@microsoft/agents-a365-notifications';
 import { AgentNotificationActivity, NotificationType, createEmailResponseActivity } from '@microsoft/agents-a365-notifications';
 // Observability Imports
-import { BaggageBuilder, AgenticTokenCacheInstance, BaggageBuilderUtils, InvokeAgentScope } from '@microsoft/opentelemetry';
+import { BaggageBuilder, BaggageBuilderUtils, InvokeAgentScope } from '@microsoft/opentelemetry';
 import type { A365Request, CallerDetails, InvokeAgentScopeDetails } from '@microsoft/opentelemetry';
-import { getObservabilityAuthenticationScope } from '@microsoft/agents-a365-runtime';
-import tokenCache, { createAgenticTokenCacheKey } from './token-cache';
 import { buildAgentDetails, resolveChannelName } from './observability';
 import { Client, getClient } from './client';
 
@@ -99,9 +97,9 @@ export class A365Agent extends AgentApplication<TurnState> {
   }
 
   /**
-   * Runs `work` under the full A365 trace context: refreshed exporter token, turn baggage,
-   * and a root `invoke_agent` scope. Every path that calls the LLM must go through this,
-   * otherwise its spans have no identity group and are dropped before export.
+   * Runs `work` under the full A365 trace context: turn baggage and a root `invoke_agent`
+   * scope. Every path that calls the LLM must go through this, otherwise its spans have no
+   * identity group and are dropped before export.
    */
   private async runTraced<T>(
     turnContext: TurnContext,
@@ -109,8 +107,6 @@ export class A365Agent extends AgentApplication<TurnState> {
     work: (scope: InvokeAgentScope | null) => Promise<T>,
     channelName?: string
   ): Promise<T> {
-    await this.preloadObservabilityToken(turnContext);
-
     const baggageScope = BaggageBuilderUtils.fromTurnContext(
       new BaggageBuilder(),
       turnContext as any
@@ -169,30 +165,6 @@ export class A365Agent extends AgentApplication<TurnState> {
     };
 
     return InvokeAgentScope.start(request, scopeDetails, agentDetails, callerDetails);
-  }
-
-    /**
-   * Preloads or refreshes the Observability token used by the Agent 365 Observability exporter.
-   */
-  private async preloadObservabilityToken(turnContext: TurnContext): Promise<void> {
-    const agentId = turnContext?.activity?.recipient?.agenticAppId ?? '';
-    const tenantId = turnContext?.activity?.recipient?.tenantId ?? '';
-
-    if (process.env.Use_Custom_Resolver === 'true') {
-      const aauToken = await this.authorization.exchangeToken(turnContext, 'agentic', {
-        scopes: getObservabilityAuthenticationScope()
-      });
-      console.log(`Preloaded Observability token for agentId=${agentId}, tenantId=${tenantId} token=${aauToken?.token?.substring(0, 10)}...`);
-      const cacheKey = createAgenticTokenCacheKey(agentId, tenantId);
-      tokenCache.set(cacheKey, aauToken?.token || '');
-    } else {
-      await AgenticTokenCacheInstance.refreshObservabilityToken(
-        agentId,
-        tenantId,
-        turnContext as any,
-        this.authorization as any
-      );
-    }
   }
 
   async handleAgentNotificationActivity(context: TurnContext, state: TurnState, agentNotificationActivity: AgentNotificationActivity) {

@@ -1,5 +1,6 @@
 # Copilot Studio Sample Agent - Node.js
 
+
 This sample demonstrates how to integrate a **Microsoft Copilot Studio** agent with the **Microsoft Agent 365 SDK**. It enables enterprise developers to bridge low-code Copilot Studio agents into Agent 365 managed environments with full feature parity.
 
 ## Why use this integration?
@@ -129,6 +130,40 @@ connections__service_connection__settings__tenantId=<<TENANT_ID>>
 2. Go to **Settings > Channels > Custom website**
 3. Copy the connection details (Environment ID and Schema Name)
 4. Alternatively, use the Direct Connect URL if available
+
+### Observability export
+
+`src/index.ts` imports `src/otel.ts` first. This sample uses
+`@microsoft/agents-a365-observability@1.0.0`; with
+`Agent365ExporterOptions.useS2SEndpoint = true`, exports post to
+`/observabilityService/tenants/{tenant}/otlp/agents/{agent}/traces?api-version=1`.
+Leave `ENABLE_A365_OBSERVABILITY_PER_REQUEST_EXPORT` unset or false because the
+1.0.0 per-request mode still reads `runWithExportToken`, not the configured
+app-only resolver.
+
+`@opentelemetry/core` is an explicit dependency because the 1.0.0 exporter imports it
+without declaring it; relying on incidental dependency hoisting can fail at startup.
+
+When `ENABLE_A365_OBSERVABILITY_EXPORTER=true`, set `AGENT365_OBS_TENANT_ID`,
+`AGENT365_OBS_AGENT_ID`, `AGENT365_OBS_BLUEPRINT_CLIENT_ID`, and
+`AGENT365_OBS_BLUEPRINT_CLIENT_SECRET` from the template. `AGENT365_OBS_AGENT_ID`
+must be the actual agent instance client ID. The sample-local resolver uses
+blueprint credentials plus `fmi_path` to acquire T1, then the agent identity's
+`client_credentials` grant for OBS. It fails closed on delegated `scp` tokens,
+identity, tenant, audience, role, expiry, or response-shape mismatches. Business
+MCP, Graph, Power Platform, and OBO calls remain separate.
+
+**Single-instance limitation:** this resolver exports for one statically configured
+agent instance and tenant (`AGENT365_OBS_*`). It needs its own copy of the
+blueprint secret and has no managed-identity option. Multi-instance or multi-tenant
+deployments should reuse the hosting connection per agent/tenant instead of sharing
+this static provider.
+
+Sovereign clouds are not supported by this sample provider because the authority is
+hard-coded to `login.microsoftonline.com`. For AI Teammates, complete the
+`Agent365.Observability.OtelWrite` application-role step printed by
+`a365 setup all --aiteammate`; AI Teammate S2S without it has not been validated.
+
 
 ## How to run this sample
 
