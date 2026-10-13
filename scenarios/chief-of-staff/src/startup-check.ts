@@ -7,6 +7,7 @@
 // Emits ✅ / ⚠️  / ❌ / ℹ️  per config item so you can see what's live at a glance.
 
 import { describePersistence } from './state/persistentMap';
+import { directUserActionsEnabled } from './security-policy';
 
 function line(s: string): void {
   console.log(`[startup] ${s}`);
@@ -42,6 +43,12 @@ function shortId(s: string): string {
  */
 export function printStartupBanner(): void {
   line('─── Chief of Staff — Configuration Check ───');
+
+  info(
+    directUserActionsEnabled()
+      ? 'ALLOW_DIRECT_USER_ACTIONS=true — authenticated direct requests may invoke action tools'
+      : 'ALLOW_DIRECT_USER_ACTIONS=false — direct user commands remain data-only'
+  );
 
   // ── Foundry LLM ──
   const foundryEndpoint = process.env.AZURE_OPENAI_ENDPOINT?.trim();

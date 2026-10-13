@@ -1175,6 +1175,10 @@ Grouped by concern. Every var has a code default; only the ones marked
 | `LOG_HTTP` | `false` | Log every axios call with status + latency (masked auth) |
 | `DEBUG` | — | Bot Framework SDK debug namespaces (`agents:*` prints a lot) |
 
+`ALLOW_DIRECT_USER_ACTIONS` defaults to `false`. Set it to `true` to allow
+authenticated direct requests to invoke action tools while keeping embedded
+email, document, transcript, web, and tool-result content untrusted.
+
 ### A.2 Agent identity (from `a365 develop setup`)
 
 All **required**.

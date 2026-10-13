@@ -355,6 +355,10 @@ for the exhaustive list):
 | `PLANNER_PLAN_NAME` | — | Disambiguate when `LEADERSHIP_TEAM_ID` has multiple plans (case-insensitive exact match) |
 | `PLANNER_BUCKET_NAME` | `New` | Bucket-name to search for in the auto-resolved plan |
 
+`ALLOW_DIRECT_USER_ACTIONS` defaults to `false`. Set it to `true` to let
+authenticated direct requests invoke action tools. Instructions embedded in
+emails, documents, transcripts, web content, and tool results stay untrusted.
+
 ---
 
 ## 6. Run
