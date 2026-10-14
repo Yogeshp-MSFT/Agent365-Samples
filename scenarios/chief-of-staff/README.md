@@ -262,7 +262,7 @@ extraction from the raw WebVTT transcript. Nothing else changes.
 ## 4. Clone + install
 
 ```powershell
-cd "Chief of staff/cos-agent"
+cd scenarios/chief-of-staff
 npm install
 ```
 
