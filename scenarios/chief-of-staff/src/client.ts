@@ -150,7 +150,7 @@ export async function getClient(
 ): Promise<Client> {
   const modelName = getModelName();
   console.log(
-    `[client] Creating agent (model=${modelName}, foundry=${isFoundryEndpoint()}, user=${displayName})`
+    `[client] Creating agent (model=${modelName}, foundry=${isFoundryEndpoint()})`
   );
 
   const peopleOpts = {

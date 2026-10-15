@@ -397,25 +397,27 @@ function toDetectedTranscript(cap: PendingCapture): DetectedTranscript {
   };
 }
 
-// Transcripts are created when recording starts, so allow a little slack
-// before the scheduled start for meetings that begin early.
+// Transcripts are created when transcription starts, which happens during
+// the meeting. Allow a little slack on both sides for meetings that start
+// early or run over, but never reach into a later meeting on the same join URL.
 const OCCURRENCE_EARLY_SLACK_MS = 15 * 60 * 1000;
+const OCCURRENCE_LATE_SLACK_MS = 15 * 60 * 1000;
 
 /**
  * Pick the transcript that belongs to this calendar occurrence: created
- * between (scheduled start - slack) and the capture deadline, and not
- * already consumed by another capture. Upcoming occurrences never match
- * an earlier occurrence's transcript.
+ * between (scheduled start - slack) and (scheduled end + slack), and not
+ * already consumed by another capture. Transcripts from earlier or later
+ * meetings that reuse the same join URL never match.
  */
 export function selectTranscriptForOccurrence(
   transcripts: TranscriptSummary[],
-  cap: Pick<PendingCapture, 'eventId' | 'startTime' | 'endTime' | 'durationMinutes' | 'giveUpAfter'>,
+  cap: Pick<PendingCapture, 'eventId' | 'startTime' | 'endTime' | 'durationMinutes'>,
   now: number
 ): TranscriptSummary | undefined {
   const start = cap.startTime ?? cap.endTime - cap.durationMinutes * 60 * 1000;
   if (now < start - OCCURRENCE_EARLY_SLACK_MS) return undefined;
   const windowStart = start - OCCURRENCE_EARLY_SLACK_MS;
-  const windowEnd = Math.max(cap.giveUpAfter, now);
+  const windowEnd = cap.endTime + OCCURRENCE_LATE_SLACK_MS;
   const candidates = transcripts
     .filter((t) => !isTranscriptClaimed(t.transcriptId, cap.eventId))
     .filter((t) => {

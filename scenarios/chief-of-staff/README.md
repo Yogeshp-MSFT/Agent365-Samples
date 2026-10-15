@@ -40,12 +40,14 @@ A running Node service on your dev machine (or Azure App Service) that:
 | **Escalation** — 🚨 card DM'd to the leader if the owner ignores their follow-up | Post-followup sweep after `FOLLOWUP_ESCALATE_AFTER_HOURS`; auto-cancels if the task is closed first |
 | **Task complete (Planner)** — owner marks it done in Planner, leader gets a confirmation DM | Planner poll detects `percentComplete: 100` |
 | **Task complete (chat)** — owner tells the agent in plain language ("`The task "X" is done`"), agent PATCHes Planner to 100 % and notifies leader | Message router matches completion phrase + quoted title, fuzzy-matches Planner |
-| **Recall / chit-chat** — the leader asks "where are we on X?" and gets a status answer, restricted to leadership team members | LLM turn with `planner_list_tasks` + `mcp_CalendarTools` |
+| **Recall / chit-chat** — the leader asks "where are we on X?" and gets a status answer, restricted to leadership team members (Teams chat **and** email) | LLM turn with `planner_list_tasks` + `mcp_CalendarTools` |
 
-Everything is deterministic **except** the two flows that explicitly need
-natural-language understanding: capture extraction (LLM parses the transcript)
-and recall/chit-chat. All routing, dedup, date math, and Planner writes are
-TypeScript.
+Everything is deterministic **except** capture extraction (LLM parses the
+transcript), recall/chit-chat, and the blocker card's `book_meeting` handler,
+which uses the LLM only as the transport to `mcp_CalendarTools` (start/end,
+attendees, and subject are fixed in TypeScript). Every other card verb —
+approve/reject, reassign, defer, escalate — sends its DMs deterministically.
+All routing, dedup, date math, and Planner writes are TypeScript.
 
 ---
 
@@ -220,9 +222,11 @@ In Teams:
 3. Add the **agent user** (`Chief-of-Staff@…`) as a member.
 4. Add the **second test user** as a member.
 5. Grab the **Team ID** from the Team URL (`groupId=<GUID>`) → this is
-   `LEADERSHIP_TEAM_ID` in `.env`. You can also paste the *display name*
-   (`Leadership Operations`) or the *channel email* — the agent resolves
-   any of those on first turn.
+   `LEADERSHIP_TEAM_ID` in `.env`. The GUID is recommended because this value
+   is the access boundary. A *display name* (`Leadership Operations`) or the
+   *channel email* also works, but only if it matches exactly one group — if
+   two Teams share the name, the agent refuses to pick one and denies
+   non-leaders until you set the GUID.
 
 ### 3e. Create the Planner plan
 
@@ -500,7 +504,15 @@ POST /planner/tasks   × N
     yet and the request stays pending for a retry.
   - **I'm blocked** → agent proposes 3 slots (10:00 / 14:00 / 16:00 in
     `BRIEF_DISPLAY_TZ`) and DMs the leader a meeting picker. Leader clicks a
-    slot → agent books the calendar invite and DMs the owner.
+    slot → agent books the calendar invite first; only when the booking
+    returns `OK` does it close the check-in and DM the owner that the meeting
+    is scheduled. A failed booking leaves the check-in open, tells the owner
+    nothing was booked, and lets the leader pick another slot.
+  - If the leader's card can't be delivered (e.g. the leader hasn't messaged
+    the agent yet), the extension/blocker request is saved and retried on
+    every follow-up cycle (up to `LEADER_DELIVERY_MAX_ATTEMPTS`, default 24);
+    the owner is DM'd once it's delivered, or told to contact the leader
+    directly if it never is.
 
 Every card also accepts a plain-text keyword reply. Owners can reply
 `ontrack`, `extend`, or `blocked`. The leader can reply `approve` or
@@ -508,7 +520,13 @@ Every card also accepts a plain-text keyword reply. Owners can reply
 asks you to use the matching card's buttons), plus `reassign` / `defer` /
 `escalate`. Leader keywords are only honored from the configured leader;
 card buttons are checked against the sender too — owners can only act on
-their own check-ins and tasks.
+check-ins that are still open and on tasks Planner currently assigns to
+them (a closed check-in only accepts **Complete**).
+
+**Reassign is a manual handoff.** The agent has no "change assignee" action:
+clicking **Reassign** closes the check-in and tells the leader to change the
+assignee in Planner. The next follow-up cycle then checks in with the new
+owner.
 
 ### 8.4 Escalation (owner ignored the check-in)
 
@@ -544,10 +562,12 @@ the in-memory resolve fired by `runTaskComplete`).
   ```text
   Hi — the task "Send Contoso proposal to Mario" is done.
   ```
-- Agent recognises an affirmative completion statement
-  (`complete|completed|done|finished|closed|wrapped`). Negations ("I have
-  not completed…") and questions ("Is … done?") are never treated as
-  completion.
+- Agent recognises only an affirmative statement that the work is already
+  done (e.g. "is done", "I've finished", "completed"). Negations ("I have
+  not completed…"), questions ("Is … done?"), and future or conditional
+  phrasing ("I will finish …", "almost done", "done once Bob replies") are
+  never treated as completion. Quoted titles are ignored when classifying
+  the sentence.
 - The quoted title is matched against open Planner tasks **assigned to the
   sender** (the leader may name any task), ignoring
   `[BLOCKER]`/`[RISK]`/`[DECISION]`/`[COMPLETED]` prefixes. Identifying
@@ -570,9 +590,13 @@ the in-memory resolve fired by `runTaskComplete`).
   `mcp_CalendarTools` to compose a bulleted answer.
 - Non-leadership-team members get a polite refusal instead of leaking any
   task titles — and their turn runs without Planner, calendar, mail, Teams,
-  or card tools attached. If `LEADERSHIP_TEAM_ID` is set but can't be
-  resolved (or membership can't be read), non-leaders are treated as
-  non-members (fail closed).
+  or card tools attached. The same gate applies to **email**: the sender is
+  resolved to an Entra user (the channel's AAD id, or a lookup of the sender
+  address), and a sender who isn't a member — or can't be identified, such
+  as an external address — gets the restricted toolset. If
+  `LEADERSHIP_TEAM_ID` is set but can't be resolved (including a display
+  name shared by several Teams) or membership can't be read, non-leaders are
+  treated as non-members (fail closed).
 
 ### 8.8 Restart resumes scheduled work and doesn't re-capture meetings
 

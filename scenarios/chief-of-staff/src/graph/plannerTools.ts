@@ -26,6 +26,8 @@ import { tool } from '@openai/agents';
 import { Authorization, TurnContext } from '@microsoft/agents-hosting';
 import { getPlannerPlanId, getPlannerBucketId } from './plannerConfig';
 import { acquireAppOnlyGraphToken } from './graphAppToken';
+import { PersistentMap } from '../state/persistentMap';
+import { currentSourceRef, recordToolOutcome } from '../util/toolContext';
 
 const GRAPH_BASE = 'https://graph.microsoft.com/v1.0';
 
@@ -56,7 +58,31 @@ function toolError(name: string, err: unknown): string {
   const e = err as any;
   const msg = e?.response?.data ?? e?.message ?? String(e);
   console.error(`[plannerTools] ${name} failed:`, msg);
+  recordToolOutcome({ tool: name, ok: false, error: typeof msg === 'string' ? msg : JSON.stringify(msg) });
   return JSON.stringify({ ok: false, tool: name, error: msg });
+}
+
+// Index of tasks created by a deterministic run (e.g. a meeting capture), so a
+// retried run returns the task it already created instead of a duplicate.
+interface CreatedTaskRecord {
+  taskId: string;
+  createdAt: number;
+}
+const CREATED_TASK_RETENTION_MS = 14 * 24 * 60 * 60 * 1000;
+const createdTaskIndex = new PersistentMap<CreatedTaskRecord>({
+  file: 'created-tasks.json',
+  keepOnHydrate: (r) => !!r && Date.now() - r.createdAt < CREATED_TASK_RETENTION_MS,
+});
+
+function createdTaskKey(
+  sourceRef: string | undefined,
+  planId: string,
+  title: string,
+  assignees: string[]
+): string | undefined {
+  if (!sourceRef) return undefined;
+  const who = assignees.map((a) => a.trim().toLowerCase()).sort().join(',');
+  return `${sourceRef}|${planId}|${title.trim().toLowerCase()}|${who}`;
 }
 
 // ─── Tool argument types ───────────────────────────────────────────────────
@@ -190,7 +216,8 @@ function createCreateTaskTool(opts: PlannerToolOptions) {
     name: 'planner_create_task',
     description:
       'Create a new Planner task in a plan+bucket, optionally with assignees, a due date, and a description. ' +
-      'Idempotent: if an open task with the same title already exists in the plan, it is returned instead of creating a duplicate.',
+      'Each call creates a separate task; tasks with the same title for different owners stay separate. ' +
+      'Only a retried meeting capture reuses the task it already created for the same title and assignees.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -263,26 +290,27 @@ function createCreateTaskTool(opts: PlannerToolOptions) {
         const token = await acquireGraphToken(opts);
 
         // Retry safety: a capture re-run after a partial failure must not
-        // duplicate tasks that were already created on the earlier attempt.
-        const titleKey = args.title.trim().toLowerCase();
-        const existingRes = await axios.get(
-          `${GRAPH_BASE}/planner/plans/${encodeURIComponent(planId)}/tasks?$select=id,title,bucketId,percentComplete,assignments&$top=200`,
-          { headers: { Authorization: `Bearer ${token}` } }
-        );
-        const existing = ((existingRes.data?.value ?? []) as any[]).find(
-          (t) => (t.percentComplete ?? 0) < 100 && String(t.title ?? '').trim().toLowerCase() === titleKey
-        );
-        if (existing) {
-          return JSON.stringify({
-            ok: true,
-            alreadyExisted: true,
-            taskId: existing.id,
-            title: existing.title,
-            bucketId: existing.bucketId,
-            assignees: Object.keys(existing.assignments ?? {}),
-          });
+        // duplicate tasks it already created. Deduplication is scoped to the
+        // run's source (e.g. one meeting capture) + title + assignees — never
+        // to the title alone, so distinct owners' tasks stay separate.
+        const dedupeKey = createdTaskKey(currentSourceRef(), planId, args.title, assignees);
+        if (dedupeKey) {
+          const prior = createdTaskIndex.get(dedupeKey);
+          if (prior) {
+            const live = await getPlannerTaskDetails(prior.taskId);
+            if (live.ok) {
+              recordToolOutcome({ tool: 'planner_create_task', ok: true });
+              return JSON.stringify({
+                ok: true,
+                alreadyExisted: true,
+                taskId: prior.taskId,
+                title: live.title ?? args.title,
+                assignees: live.assigneeAads,
+              });
+            }
+            createdTaskIndex.delete(dedupeKey);
+          }
         }
-
         const res = await axios.post(`${GRAPH_BASE}/planner/tasks`, body, {
           headers: {
             Authorization: `Bearer ${token}`,
@@ -298,6 +326,8 @@ function createCreateTaskTool(opts: PlannerToolOptions) {
             console.warn(`[plannerTools] task created but description was not saved: ${saved.error}`);
           }
         }
+        if (dedupeKey) createdTaskIndex.set(dedupeKey, { taskId: res.data.id, createdAt: Date.now() });
+        recordToolOutcome({ tool: 'planner_create_task', ok: true });
         return JSON.stringify({
           ok: true,
           taskId: res.data.id,
@@ -351,7 +381,7 @@ export async function acknowledgePlannerTask(
     // If already in progress or complete, don't overwrite. Just report back.
     if (currentPct >= 50) {
       console.log(
-        `[plannerTools] acknowledgePlannerTask task=${taskId.slice(0, 8)}… by=${ackByName} skipped (already ${currentPct}%)`
+        `[plannerTools] acknowledgePlannerTask task=${taskId.slice(0, 8)}… skipped (already ${currentPct}%)`
       );
       return {
         ok: true,
@@ -377,7 +407,7 @@ export async function acknowledgePlannerTask(
       }
     );
     console.log(
-      `[plannerTools] acknowledgePlannerTask task=${taskId.slice(0, 8)}… by=${ackByName} pct=${newPct} startDate=${startIso.slice(0, 10)}`
+      `[plannerTools] acknowledgePlannerTask task=${taskId.slice(0, 8)}… pct=${newPct} startDate=${startIso.slice(0, 10)}`
     );
     return { ok: true, percentComplete: newPct, startDateTime: startIso, alreadyStarted: false };
   } catch (err) {
@@ -480,7 +510,7 @@ export async function updatePlannerTaskTitle(
       }
     );
     console.log(
-      `[plannerTools] updatePlannerTaskTitle task=${taskId.slice(0, 8)}… "${previousTitle ?? '∅'}" → "${newTitle}"`
+      `[plannerTools] updatePlannerTaskTitle task=${taskId.slice(0, 8)}… title updated`
     );
     return { ok: true, previousTitle, newTitle };
   } catch (err) {
@@ -595,7 +625,7 @@ export async function completePlannerTask(
       }
     );
     console.log(
-      `[plannerTools] completePlannerTask task=${taskId.slice(0, 8)}… "${title ?? '∅'}" ${previousPercent}% → 100%`
+      `[plannerTools] completePlannerTask task=${taskId.slice(0, 8)}… ${previousPercent}% → 100%`
     );
     return { ok: true, title, previousPercent, alreadyComplete: false };
   } catch (err) {
@@ -708,7 +738,7 @@ export async function findOpenTaskByTitle(
     };
   } catch (err) {
     const msg = (err as any)?.response?.data ?? (err as any)?.message ?? String(err);
-    console.error(`[plannerTools] findOpenTaskByTitle failed for hint="${titleHint}":`, msg);
+    console.error(`[plannerTools] findOpenTaskByTitle failed (hint chars=${titleHint.length}):`, msg);
     return { ok: false, reason: 'graph_error', error: typeof msg === 'string' ? msg : JSON.stringify(msg) };
   }
 }

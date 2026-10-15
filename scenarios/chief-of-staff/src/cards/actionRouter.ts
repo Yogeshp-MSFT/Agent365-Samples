@@ -4,8 +4,9 @@
 // Card action router. Parses either:
 //   - Adaptive Card Action.Submit click  (arrives as activity.value = {verb, ...})
 //   - or a plain text keyword reply      (blocked / extend / ontrack / approve / …)
-// Then dispatches to a handler that prompts the LLM to do the follow-up work
-// (send extension request card to leader, book meeting, etc.).
+// Then dispatches to a deterministic TypeScript handler (Planner writes,
+// proactive DMs, leader cards). The only handler that still calls the LLM is
+// book_meeting, which uses it purely as the transport to mcp_CalendarTools.
 //
 // If nothing matches (activity has no card data and no keyword), returns
 // { handled: false } so the caller can proceed with the normal LLM turn.
@@ -16,10 +17,13 @@ import {
   findLatestOpenFollowupForOwner,
   findOpenFollowupForOwnerTask,
   findPendingExtensionRequests,
+  findPendingLeaderDeliveries,
   getFollowup,
   markResolved,
   PendingFollowup,
+  queueLeaderDelivery,
   recordExtensionRequest,
+  recordLeaderDeliveryAttempt,
   recordOwnerResponse,
   setExtensionStatus,
 } from '../state/followupStore';
@@ -32,7 +36,12 @@ import {
   updatePlannerTaskTitle,
 } from '../graph/plannerTools';
 import { resolveAadToUpn } from '../graph/peopleTools';
-import { sendBlockerMeetingCardDirect, sendExtensionRequestCardDirect, sendPlainDmToUser } from './followupCards';
+import {
+  sendBlockerMeetingCardDirect,
+  sendExtensionRequestCardDirect,
+  sendPlainDmToUser,
+  type CardToolOptions,
+} from './followupCards';
 import { civilDateInZone, DISPLAY_TZ, zonedWallTimeToUtc } from '../util/time';
 
 export interface CardActionResult {
@@ -187,25 +196,124 @@ function computeNextDueDateIso(currentDueIso?: string | null): string {
 }
 
 /**
+ * Deliver a queued owner request (extension / blocker) to the leader. Used by
+ * the router right after the owner responds and by the scheduler retry pass.
+ * The queued record is cleared only after the card is delivered.
+ */
+export async function deliverPendingLeaderRequest(
+  opts: CardToolOptions,
+  followup: PendingFollowup,
+  leaderAad: string,
+  ownerDisplayName?: string
+): Promise<{ ok: boolean; error?: string }> {
+  const d = followup.pendingLeaderDelivery;
+  if (!d) return { ok: true };
+  const ownerName = followup.ownerName || ownerDisplayName || 'the owner';
+  let res: { ok: boolean; error?: string };
+  if (d.kind === 'extension') {
+    const suggestedNewDueDate = d.suggestedNewDueDate ?? computeNextDueDateIso(followup.dueDate);
+    res = await sendExtensionRequestCardDirect(opts, {
+      leaderAadObjectId: leaderAad,
+      followupId: followup.followupId,
+      taskId: followup.taskId,
+      taskTitle: followup.taskTitle,
+      ownerName,
+      currentDueDate: followup.dueDate ?? null,
+      suggestedNewDueDate,
+      agentRationale: `Owner (${ownerName}) requested more time via the check-in card.`,
+    });
+    if (res.ok) recordExtensionRequest(followup.followupId, suggestedNewDueDate);
+  } else {
+    // Slots are recomputed per attempt so a retried card never offers past times.
+    const slots = proposeMeetingSlots();
+    res = await sendBlockerMeetingCardDirect(opts, {
+      leaderAadObjectId: leaderAad,
+      followupId: followup.followupId,
+      taskId: followup.taskId,
+      taskTitle: followup.taskTitle,
+      ownerName,
+      ownerAadObjectId: followup.ownerAad,
+      blockerSummary: d.blockerSummary ?? 'No additional details provided.',
+      proposedTimes: slots.map((s) => s.label),
+      proposedTimesIso: slots.map((s) => s.iso),
+    });
+  }
+  recordLeaderDeliveryAttempt(followup.followupId, res.ok, res.error);
+  return res;
+}
+
+const LEADER_DELIVERY_MAX_ATTEMPTS = Math.max(1, Number(process.env.LEADER_DELIVERY_MAX_ATTEMPTS ?? '24'));
+
+/**
+ * Scheduler retry pass for owner requests that never reached the leader.
+ * On success the owner is told the request was delivered; after
+ * LEADER_DELIVERY_MAX_ATTEMPTS failures the owner is told to contact the
+ * leader directly and the request is dropped.
+ */
+export async function retryPendingLeaderDeliveries(opts: CardToolOptions, leaderAad: string): Promise<void> {
+  const queued = findPendingLeaderDeliveries();
+  if (queued.length === 0) return;
+  console.log(`[leaderDelivery] retrying ${queued.length} undelivered owner request(s)`);
+  for (const f of queued) {
+    const kind = f.pendingLeaderDelivery!.kind === 'extension' ? 'extension request' : 'blocker';
+    const res = await deliverPendingLeaderRequest(opts, f, leaderAad);
+    if (res.ok) {
+      await sendPlainDmToUser(opts, f.ownerAad, `Your ${kind} for "${f.taskTitle}" has now reached the leader. I'll DM you when they decide.`);
+      continue;
+    }
+    const attempts = getFollowup(f.followupId)?.pendingLeaderDelivery?.attempts ?? 0;
+    if (attempts >= LEADER_DELIVERY_MAX_ATTEMPTS) {
+      recordLeaderDeliveryAttempt(f.followupId, true);
+      console.warn(`[leaderDelivery] giving up on followup=${f.followupId.slice(0, 8)}… after ${attempts} attempt(s)`);
+      await sendPlainDmToUser(
+        opts,
+        f.ownerAad,
+        `I couldn't deliver your ${kind} for "${f.taskTitle}" to the leader after several attempts. Please contact them directly.`
+      );
+    }
+  }
+}
+
+/**
  * Extract a card-action payload from an incoming activity.
  * Teams surfaces Action.Submit clicks as `activity.value = {verb, ...}`.
  * We also fall back to keyword matching in `activity.text`.
  */
 /**
- * True only when the text affirmatively reports completion. Negations
- * ("I have not completed…", "isn't done yet") and questions ("Is it done?")
- * must never mutate Planner.
+ * True only when the text affirmatively reports that work is ALREADY done.
+ * Uses an allow-list of completion statements; negations ("I have not
+ * completed…"), questions ("Is it done?"), and future/conditional/intent
+ * phrasing ("I will finish…", "almost done", "done once Bob replies") never
+ * mutate Planner. Quoted task titles are ignored when classifying.
  */
 export function isAffirmativeCompletion(rawText: string): boolean {
-  const text = rawText.toLowerCase().replace(/[\u2018\u2019]/g, "'").trim();
+  const normalized = rawText.toLowerCase().replace(/[\u2018\u2019]/g, "'").trim();
+  if (!normalized) return false;
+  // Classify the sentence, not the task title it quotes.
+  const text = normalized
+    .replace(/"[^"]*"|`[^`]*`|[\u201C\u201D][^\u201C\u201D]*[\u201C\u201D]|(^|\s)'[^']*'(?=\s|$|[.,!])/g, ' TASK ')
+    .replace(/^(hi|hello|hey|ok|okay|fyi|update|quick update)\b[\s,:;!.\u2014-]*/, '')
+    .trim();
   if (!text) return false;
   if (text.includes('?')) return false;
   if (/^(is|are|was|were|did|does|do|has|have|had|can|could|will|would|should|when|what|why|how|which|who)\b/.test(text)) {
     return false;
   }
   const negation =
-    /\b(not|never|no longer|yet to|still working|still in progress|not yet|cannot|can't|won't|isn't|aren't|wasn't|weren't|haven't|hasn't|hadn't|didn't|doesn't|don't)\b|n't\b/;
-  return !negation.test(text);
+    /\b(not|never|no longer|nothing|yet to|still working|still in progress|not yet|cannot|can't|won't|isn't|aren't|wasn't|weren't|haven't|hasn't|hadn't|didn't|doesn't|don't)\b|n't\b/;
+  if (negation.test(text)) return false;
+  const nonFactual =
+    /\b(will|shall|going to|gonna|plan(?:ning)? to|about to|need to|needs to|have to|has to|want to|wants to|trying to|try to|hope to|hoping to|should|would|could|might|may|almost|nearly|soon|later|tomorrow|next week|once|after|before|until|unless|if|when)\b|'ll\b/;
+  if (nonFactual.test(text)) return false;
+
+  const done = '(done|complete|completed|finished|closed|wrapped up)';
+  const statements = [
+    new RegExp(`^(task\\s+|all\\s+)?(done|complete|completed|finished)\\b`),
+    new RegExp(`\\b(i'm|im|i am|we're|we are)\\s+(all\\s+|now\\s+)?done\\b`),
+    new RegExp(`\\b(i|we)('ve|\\s+have|\\s+had)?\\s+(just\\s+|already\\s+|now\\s+|finally\\s+)?(completed|finished|done|wrapped up|closed)\\b`),
+    new RegExp(`\\b(is|are|was|were|has been|have been|got)\\s+(now\\s+|already\\s+|fully\\s+|all\\s+)?${done}\\b`),
+  ];
+  return statements.some((re) => re.test(text));
 }
 
 function extractIntent(
@@ -333,9 +441,10 @@ function resolveTargetFollowup(
  * Centralized authorization, evaluated before any verb runs.
  *  - Leader verbs require the sender to be the configured leader.
  *  - Owner verbs require the targeted follow-up to belong to the sender
- *    (the leader may also act on any owner card).
- *  - A taskId submitted in card data is honored only when it matches the
- *    follow-up on record or a Planner task assigned to the sender.
+ *    (the leader may also act on any owner card), the follow-up to still be
+ *    open (closed ones accept only "complete"), and the target Planner task
+ *    to be assigned to the sender RIGHT NOW (live Graph check).
+ *  - A taskId submitted in card data must match the follow-up on record.
  * Returns an error message to show the sender, or undefined when allowed.
  */
 async function authorizeIntent(
@@ -355,9 +464,20 @@ async function authorizeIntent(
   if (followup && !sameAad(followup.ownerAad, senderAad)) {
     return 'That check-in belongs to someone else, so I did not change it.';
   }
+  // Old cards stay clickable: a closed check-in only accepts "complete",
+  // which is still gated by the live assignment check below.
+  if (followup?.status === 'resolved' && verb !== 'complete') {
+    return "That check-in is already closed, so I didn't change anything.";
+  }
+  // Always check the LIVE Planner assignment. A stored follow-up can predate
+  // a reassignment, so matching the record alone is not authorization.
   const submittedTaskId = typeof data.taskId === 'string' && data.taskId ? data.taskId : undefined;
-  if (submittedTaskId && followup?.taskId !== submittedTaskId) {
-    const details = await getPlannerTaskDetails(submittedTaskId);
+  if (submittedTaskId && followup && followup.taskId !== submittedTaskId) {
+    return "That card doesn't match the check-in on record, so I didn't change anything.";
+  }
+  const targetTaskId = submittedTaskId ?? followup?.taskId;
+  if (targetTaskId) {
+    const details = await getPlannerTaskDetails(targetTaskId);
     if (!details.ok) return "I couldn't verify that task in Planner, so I didn't change it.";
     if (!details.assigneeAads.some((aad) => sameAad(aad, senderAad))) {
       return 'That task is not assigned to you, so I did not change it.';
@@ -567,25 +687,19 @@ async function routeIntent(
     // the extension card straight to the leader. Previously the LLM was
     // asked to "pick a sensible date" and it hallucinated dates from its
     // training cutoff era (e.g. "2023-10-05"), which Planner then rejected.
+    // The request is queued first so a failed send is retried by the scheduler.
     const suggestedNewDueDate = computeNextDueDateIso(followup.dueDate);
-    const res = await sendExtensionRequestCardDirect(client.getPeopleOpts(), {
-      leaderAadObjectId: leaderAad,
-      followupId: followup.followupId,
-      taskId: followup.taskId,
-      taskTitle: followup.taskTitle,
-      ownerName: followup.ownerName ?? senderName,
-      currentDueDate: followup.dueDate ?? null,
-      suggestedNewDueDate,
-      agentRationale: `Owner (${followup.ownerName ?? senderName}) requested more time via the check-in card.`,
-    });
+    const queued = queueLeaderDelivery(followup.followupId, { kind: 'extension', suggestedNewDueDate });
+    const res = queued
+      ? await deliverPendingLeaderRequest(client.getPeopleOpts(), queued, leaderAad, senderName)
+      : { ok: false, error: 'follow-up record missing' };
     if (res.ok) {
-      recordExtensionRequest(followup.followupId, suggestedNewDueDate);
       await context.sendActivity(
         `Thanks — I\'ve asked the leader to approve an extension to **${suggestedNewDueDate.slice(0, 10)}**. I\'ll DM you as soon as they decide.`
       );
     } else {
       await context.sendActivity(
-        `Thanks — I\'ve noted the request but couldn\'t reach the leader with a card just now (${res.error ?? 'unknown error'}). I\'ll retry.`
+        `Thanks — I\'ve saved the request but couldn\'t reach the leader just now. I\'ll keep retrying on the next follow-up cycle and DM you once it\'s delivered.`
       );
     }
     return { handled: true };
@@ -600,10 +714,10 @@ async function routeIntent(
     }
     recordOwnerResponse(followup.followupId, 'blocked');
 
-    // Deterministic path — no LLM. Compute 3 real IST slots and post the
-    // blocker card straight to the leader. The card carries the ISO for
-    // each slot in button data so book_meeting doesn't need to parse
-    // anything with the LLM either.
+    // Deterministic path — no LLM. Queue the blocker for the leader, then
+    // deliver a card with 3 real slots (in BRIEF_DISPLAY_TZ). Each button
+    // carries its ISO so book_meeting never parses text with the LLM. A
+    // failed send stays queued and the scheduler retries it.
     const blockerText = context.activity.text?.trim() ?? '';
     const blockerSummary =
       blockerText.length > 0
@@ -611,25 +725,17 @@ async function routeIntent(
           ? blockerText.slice(0, 199) + '…'
           : blockerText
         : 'No additional details provided.';
-    const slots = proposeMeetingSlots();
-    const result = await sendBlockerMeetingCardDirect(client.getPeopleOpts(), {
-      leaderAadObjectId: leaderAad,
-      followupId: followup.followupId,
-      taskId: followup.taskId,
-      taskTitle: followup.taskTitle,
-      ownerName: followup.ownerName ?? senderName,
-      ownerAadObjectId: senderAad ?? followup.ownerAad,
-      blockerSummary,
-      proposedTimes: slots.map((s) => s.label),
-      proposedTimesIso: slots.map((s) => s.iso),
-    });
+    const queued = queueLeaderDelivery(followup.followupId, { kind: 'blocker', blockerSummary });
+    const result = queued
+      ? await deliverPendingLeaderRequest(client.getPeopleOpts(), queued, leaderAad, senderName)
+      : { ok: false, error: 'follow-up record missing' };
     if (result.ok) {
       await context.sendActivity(
         `Understood. I\'ve flagged this to the leader with 3 candidate meeting times — I\'ll book whichever they pick and DM you the invite.`
       );
     } else {
       await context.sendActivity(
-        `Understood — I\'ve recorded the blocker. I couldn\'t reach the leader with a card just now (${result.error ?? 'unknown error'}), but the record is saved and I\'ll retry on the next cycle.`
+        `Understood — I\'ve saved the blocker but couldn\'t reach the leader just now. I\'ll keep retrying on the next follow-up cycle and DM you once it\'s delivered.`
       );
     }
     return { handled: true };
@@ -674,14 +780,20 @@ async function routeIntent(
     if (intent.verb === 'reject_extend') {
       markResolved(target.followupId);
       setExtensionStatus(target.followupId, 'rejected');
-      const prompt = `The Leader REJECTED an extension request.
-- task: ${target.taskTitle}
-- owner aad: ${target.ownerAad}
-- owner name: ${target.ownerName}
-
-DM the owner via mcp_TeamsServer: politely explain the extension wasn't approved and ask them to reply with what specifically is at risk of slipping. Keep it constructive, one short paragraph. Return a one-line summary of what you sent.`;
-      const summary = await client.invokeAgentWithScope(prompt);
-      await context.sendActivity(`❌ Extension rejected. ${summary}`);
+      // Deterministic DM — no LLM.
+      const dm = await sendPlainDmToUser(
+        client.getPeopleOpts(),
+        target.ownerAad,
+        `❌ **Extension not approved: ${target.taskTitle}**\n\n` +
+          `The leader didn't approve the extension, so the current due date stands. ` +
+          `Reply here with what specifically is at risk of slipping and I'll pass it on.`
+      );
+      await context.sendActivity(
+        `❌ Extension rejected for "${target.taskTitle}". ` +
+          (dm.ok
+            ? `${target.ownerName} has been notified via DM.`
+            : `I couldn't DM ${target.ownerName} (${dm.error ?? 'unknown error'}) — please let them know directly.`)
+      );
       return { handled: true };
     }
 
@@ -736,18 +848,7 @@ DM the owner via mcp_TeamsServer: politely explain the extension wasn't approved
     return { handled: true };
   }
 
-  if (intent.verb === 'reassign') {
-    if (followup) markResolved(followup.followupId);
-    const prompt = `The Leader wants to REASSIGN a task.
-- task: ${followup?.taskTitle ?? '<unknown>'}
-- current owner aad: ${followup?.ownerAad ?? '<unknown>'}
-- current owner name: ${followup?.ownerName ?? 'the owner'}
-
-DM the leader via mcp_TeamsServer: ask them who to reassign to (reply with a name or UPN), and note you'll handle the handoff DM to the current owner once they say. One short paragraph. Return one-line summary.`;
-    const summary = await client.invokeAgentWithScope(prompt);
-    await context.sendActivity(`🔀 Reassignment queued. ${summary}`);
-    return { handled: true };
-  }
+  if (intent.verb === 'reassign') return handleManualReassign(context, followup);
 
   if (intent.verb === 'book_meeting') {
     const timeslot = typeof intent.data.timeslot === 'string' ? intent.data.timeslot : 'the proposed time';
@@ -766,89 +867,60 @@ DM the leader via mcp_TeamsServer: ask them who to reassign to (reply with a nam
       return { handled: true };
     }
 
-    if (followup) markResolved(followup.followupId, { meetingScheduledAt: Date.now() });
-
     const taskTitle = followup?.taskTitle ?? 'the blocked task';
     const ownerName = followup?.ownerName ?? 'the owner';
 
-    // ── DM the owner (deterministic) ──────────────────────────────────────
-    let ownerNotified = false;
-    let ownerNoteError: string | undefined;
-    if (ownerAad) {
-      const ownerMsg =
-        `📅 **Meeting scheduled to unblock: ${taskTitle}**\n\n` +
-        `Time: ${timeslot}\n` +
-        `The leader (${process.env.LEADER_NAME?.trim() || 'the leader'}) picked this slot. Calendar invite coming next.` +
-        (timeslotIso ? `\n\n_ISO start: ${timeslotIso}_` : '');
-      const r = await sendPlainDmToUser(client.getPeopleOpts(), ownerAad, ownerMsg);
-      ownerNotified = r.ok;
-      ownerNoteError = r.error;
-    }
-    const ownerLine = ownerAad
-      ? ownerNotified
-        ? `— ${ownerName} has been notified via DM.`
-        : `— tried to DM ${ownerName} but hit an error (${ownerNoteError ?? 'unknown'}).`
-      : `— no owner AAD on record, so I couldn\'t DM them directly.`;
-
-    // First-line reply to the leader (immediate, deterministic).
-    await context.sendActivity(
-      `📅 Locked in **${timeslot}** for the unblock meeting on "${taskTitle}" ${ownerLine}\n\n_Booking the calendar invite now…_`
-    );
-
-    // ── Mark the Planner task with a [BLOCKER] prefix ─────────────────────
-    // So the brief's Risks section surfaces it and taskComplete DMs the
-    // leader when it closes. Best-effort — a Graph failure should NOT
-    // block the calendar booking.
-    if (followup?.taskId && followup.taskTitle) {
-      const alreadyPrefixed =
-        followup.taskTitle.startsWith('[BLOCKER]') ||
-        followup.taskTitle.startsWith('[RISK]');
-      if (!alreadyPrefixed) {
-        const newTitle = `[BLOCKER] ${followup.taskTitle}`;
-        const r = await updatePlannerTaskTitle(followup.taskId, newTitle);
-        if (!r.ok) {
-          console.warn(
-            `[book_meeting] could not prefix task "${followup.taskTitle}" with [BLOCKER]: ${r.error}`
-          );
-        }
-      }
+    if (followup?.meetingScheduledAt) {
+      await context.sendActivity(
+        `An unblock meeting for "${taskTitle}" was already booked from this card, so I didn't book another one.`
+      );
+      return { handled: true };
     }
 
-    // ── Actually book the calendar event via mcp_CalendarTools ────────────
+    if (!timeslotIso) {
+      // Nothing was booked: keep the follow-up open and the card retryable.
+      bookMeetingSeen.delete(dedupeKey);
+      await context.sendActivity(
+        `_Couldn\'t auto-book — no ISO timestamp on the button data. Nothing was scheduled; create the invite manually if needed._`
+      );
+      return { handled: true };
+    }
+
+    // Book FIRST. The follow-up is resolved and the owner is told the meeting
+    // is scheduled only after the calendar tool returns exactly "OK".
+    await context.sendActivity(`📅 Booking **${timeslot}** for the unblock meeting on "${taskTitle}"…`);
+
+    // ── Book the calendar event via mcp_CalendarTools ─────────────────────
     // The LLM is used ONLY as the transport to reach the MCP tool. All
     // decisions (start/end time, attendees, subject) are already made
-    // deterministically above; we hand the LLM literal values and tell it
-    // to invoke the tool with those exact values — no dates for it to
+    // deterministically; we hand the LLM literal values and tell it to
+    // invoke the tool with those exact values — no dates for it to
     // hallucinate.
-    if (timeslotIso) {
-      const startIso = timeslotIso;
-      const endIso = new Date(new Date(timeslotIso).getTime() + 30 * 60 * 1000).toISOString();
-      const leaderUpn = process.env.LEADER_UPN?.trim() ?? '';
+    const startIso = timeslotIso;
+    const endIso = new Date(new Date(timeslotIso).getTime() + 30 * 60 * 1000).toISOString();
+    const leaderUpn = process.env.LEADER_UPN?.trim() ?? '';
 
-      // FIX (Bug 4): resolve owner AAD → UPN DETERMINISTICALLY before the
-      // LLM call. Previously the prompt told the LLM to call graph_find_user
-      // and silently fell through to a leader-only invite on failure —
-      // meaning the blocker owner (e.g. Peyton) never made it onto the
-      // calendar invite for their own unblock meeting.
-      let ownerUpn: string | null = null;
-      if (ownerAad) {
-        try {
-          ownerUpn = await resolveAadToUpn(ownerAad, client.getPeopleOpts());
-        } catch (err) {
-          console.warn('[book_meeting] resolveAadToUpn threw:', (err as Error)?.message ?? err);
-        }
+    // Resolve owner AAD → UPN deterministically so the owner is always on
+    // the invite (the LLM is never asked to look people up).
+    let ownerUpn: string | null = null;
+    if (ownerAad) {
+      try {
+        ownerUpn = await resolveAadToUpn(ownerAad, client.getPeopleOpts());
+      } catch (err) {
+        console.warn('[book_meeting] resolveAadToUpn threw:', (err as Error)?.message ?? err);
       }
-      if (ownerAad && !ownerUpn) {
-        await context.sendActivity(
-          `⚠️ Couldn't resolve ${ownerName}'s email from Graph — the calendar invite will only go to you. Please add ${ownerName} manually if you want them on the invite.`
-        );
-      }
+    }
+    if (ownerAad && !ownerUpn) {
+      await context.sendActivity(
+        `⚠️ Couldn't resolve ${ownerName}'s email from Graph — the calendar invite will only go to you. Please add ${ownerName} manually if you want them on the invite.`
+      );
+    }
 
-      const attendeeList = ownerUpn
-        ? `    - leader UPN: "${leaderUpn}"\n    - owner UPN:  "${ownerUpn}"`
-        : `    - leader UPN: "${leaderUpn}"  (owner UPN unresolved — leader-only)`;
+    const attendeeList = ownerUpn
+      ? `    - leader UPN: "${leaderUpn}"\n    - owner UPN:  "${ownerUpn}"`
+      : `    - leader UPN: "${leaderUpn}"  (owner UPN unresolved — leader-only)`;
 
-      const bookingPrompt = `Book a calendar meeting using mcp_CalendarTools. Use these EXACT values. Do NOT change them. Do NOT invent dates. Do NOT call graph_find_user — the attendee list below is already resolved.
+    const bookingPrompt = `Book a calendar meeting using mcp_CalendarTools. Use these EXACT values. Do NOT change them. Do NOT invent dates. Do NOT call graph_find_user — the attendee list below is already resolved.
 
 - subject: "Unblock: ${taskTitle}"
 - startDateTime: "${startIso}"  (UTC, ISO 8601)
@@ -863,27 +935,72 @@ Steps:
 2. Return ONLY one of two exact strings (no other text, no event ids, no ids of any kind):
    - "OK" on success
    - "FAIL: <one short reason>" on error`;
-      try {
-        const bookResult = await client.invokeAgentWithScope(bookingPrompt);
-        console.log('[book_meeting] mcp_CalendarTools raw result:', bookResult);
-        const trimmed = (bookResult ?? '').trim();
-        // The booking contract is exactly "OK" or "FAIL: <reason>"; anything
-        // else (including a failure that mentions "booked") is not success.
-        const succeeded = /^OK$/i.test(trimmed);
-        const userMsg = succeeded
-          ? `_📅 Calendar invite sent to ${ownerName} for ${timeslot}._`
-          : `_Booking failed: ${trimmed || 'unknown error'}. You may need to create the invite manually._`;
-        await context.sendActivity(userMsg);
-      } catch (err) {
-        const msg = (err as Error)?.message ?? String(err);
-        console.error('[book_meeting] booking failed:', msg);
-        await context.sendActivity(`_Booking failed: ${msg}. You may need to create the invite manually._`);
-      }
-    } else {
-      await context.sendActivity(
-        `_Couldn\'t auto-book — no ISO timestamp on the button data. Create the invite manually if needed._`
-      );
+
+    let failure: string | undefined;
+    try {
+      const bookResult = await client.invokeAgentWithScope(bookingPrompt);
+      const trimmed = (bookResult ?? '').trim();
+      // The booking contract is exactly "OK" or "FAIL: <reason>"; anything
+      // else (including a failure that mentions "booked") is not success.
+      if (!/^OK$/i.test(trimmed)) failure = trimmed.slice(0, 200) || 'unknown error';
+    } catch (err) {
+      failure = (err as Error)?.message ?? String(err);
     }
+    console.log(`[book_meeting] result=${failure ? 'FAIL' : 'OK'} followup=${followup?.followupId.slice(0, 8) ?? 'none'}…`);
+
+    if (failure) {
+      // Leave the follow-up open (no meeting cooldown) and let the leader
+      // click a slot again; tell the owner nothing was booked.
+      bookMeetingSeen.delete(dedupeKey);
+      if (ownerAad) {
+        await sendPlainDmToUser(
+          client.getPeopleOpts(),
+          ownerAad,
+          `⚠️ **Unblock meeting not booked yet: ${taskTitle}**\n\n` +
+            `The leader picked ${timeslot}, but the calendar invite couldn't be created. No meeting is scheduled yet — the leader will pick another time or reach out.`
+        );
+      }
+      await context.sendActivity(
+        `_Booking failed: ${failure}. Nothing was scheduled and the check-in is still open — pick another slot on the card or create the invite manually._`
+      );
+      return { handled: true };
+    }
+
+    if (followup) markResolved(followup.followupId, { meetingScheduledAt: Date.now() });
+
+    // ── Mark the Planner task with a [BLOCKER] prefix ─────────────────────
+    // So the brief's Risks section surfaces it and taskComplete DMs the
+    // leader when it closes. Best-effort.
+    if (followup?.taskId && followup.taskTitle) {
+      const alreadyPrefixed =
+        followup.taskTitle.startsWith('[BLOCKER]') ||
+        followup.taskTitle.startsWith('[RISK]');
+      if (!alreadyPrefixed) {
+        const r = await updatePlannerTaskTitle(followup.taskId, `[BLOCKER] ${followup.taskTitle}`);
+        if (!r.ok) {
+          console.warn(
+            `[book_meeting] could not prefix task=${followup.taskId.slice(0, 8)}… with [BLOCKER]: ${r.error}`
+          );
+        }
+      }
+    }
+
+    // ── DM the owner only now that the invite exists ──────────────────────
+    let ownerLine = `No owner on record, so I couldn\'t DM them directly.`;
+    if (ownerAad) {
+      const r = await sendPlainDmToUser(
+        client.getPeopleOpts(),
+        ownerAad,
+        `📅 **Meeting scheduled to unblock: ${taskTitle}**\n\n` +
+          `Time: ${timeslot}\n` +
+          `The leader (${process.env.LEADER_NAME?.trim() || 'the leader'}) picked this slot and the calendar invite has been sent.` +
+          `\n\n_ISO start: ${timeslotIso}_`
+      );
+      ownerLine = r.ok
+        ? `${ownerName} has been notified via DM.`
+        : `Tried to DM ${ownerName} but hit an error (${r.error ?? 'unknown'}).`;
+    }
+    await context.sendActivity(`_📅 Calendar invite sent for ${timeslot}. ${ownerLine}_`);
     return { handled: true };
   }
 
@@ -895,36 +1012,50 @@ Steps:
     return { handled: true };
   }
 
-  if (intent.verb === 'esc_reassign') return handleActionForwardToReassign(context, client, followup);
+  if (intent.verb === 'esc_reassign') return handleManualReassign(context, followup);
   if (intent.verb === 'esc_extend') return handleActionForwardToExtendOffer(context, client, followup, leaderAad);
   if (intent.verb === 'esc_escalate') {
-    const prompt = `The Leader wants to ESCALATE personally on a stalled task.
-- task: ${followup?.taskTitle ?? '<unknown>'}
-- owner aad: ${followup?.ownerAad ?? '<unknown>'}
-- owner name: ${followup?.ownerName ?? 'the owner'}
-
-DM the owner via mcp_TeamsServer: firm-but-professional message that the Leader is going to reach out directly about the task. Keep it short. Return one-line summary.`;
-    const summary = await client.invokeAgentWithScope(prompt);
-    await context.sendActivity(`📢 Escalation acknowledged. ${summary}`);
+    // Deterministic DM — no LLM.
+    const taskTitle = followup?.taskTitle ?? 'the task';
+    const ownerName = followup?.ownerName ?? 'the owner';
+    const dm = followup?.ownerAad
+      ? await sendPlainDmToUser(
+          client.getPeopleOpts(),
+          followup.ownerAad,
+          `📢 **Leader follow-up: ${taskTitle}**\n\n` +
+            `${process.env.LEADER_NAME?.trim() || 'The leader'} is going to reach out to you directly about this task. ` +
+            `Please have a current status ready.`
+        )
+      : { ok: false, error: 'no owner on record' };
+    await context.sendActivity(
+      `📢 Escalation acknowledged for "${taskTitle}". ` +
+        (dm.ok
+          ? `${ownerName} has been told you'll reach out directly.`
+          : `I couldn't DM ${ownerName} (${dm.error ?? 'unknown error'}).`)
+    );
     return { handled: true };
   }
 
   return { handled: false };
 }
 
-async function handleActionForwardToReassign(
+/**
+ * Reassign is a manual handoff: the agent has no "change assignee" write
+ * path, so it closes the check-in and tells the leader exactly what to do.
+ * Once Planner shows the new assignee, the next follow-up cycle checks in
+ * with them (orphaned check-ins for the old owner are auto-resolved).
+ */
+async function handleManualReassign(
   context: TurnContext,
-  client: Client,
   followup: PendingFollowup | undefined
 ): Promise<CardActionResult> {
   if (followup) markResolved(followup.followupId);
-  const prompt = `From an escalation card, the Leader picked REASSIGN.
-- task: ${followup?.taskTitle ?? '<unknown>'}
-- current owner: ${followup?.ownerName ?? 'the owner'} (aad: ${followup?.ownerAad ?? '<unknown>'})
-
-DM the Leader via mcp_TeamsServer asking who to reassign to (a name or UPN). One short paragraph. Return a one-line summary.`;
-  const summary = await client.invokeAgentWithScope(prompt);
-  await context.sendActivity(`🔀 Reassignment queued. ${summary}`);
+  const taskTitle = followup?.taskTitle ?? 'this task';
+  await context.sendActivity(
+    `🔀 To reassign **"${taskTitle}"**, change its assignee in Planner. ` +
+      `I've closed this check-in; once Planner shows the new owner, the next follow-up cycle will check in with them. ` +
+      `I haven't changed the task or messaged anyone.`
+  );
   return { handled: true };
 }
 
@@ -952,7 +1083,7 @@ async function handleActionForwardToExtendOffer(
   if (res.ok) {
     if (followup) recordExtensionRequest(followup.followupId, suggestedNewDueDate);
     await context.sendActivity(
-      `⏰ Extension offered. I've DM'd ${followup?.ownerName ?? 'the owner'} a card proposing a new due date of **${suggestedNewDueDate.slice(0, 10)}**.`
+      `⏰ Extension proposed. I've sent you an approval card for "${followup?.taskTitle ?? 'the task'}" with a new due date of **${suggestedNewDueDate.slice(0, 10)}** — approve it to update Planner and notify ${followup?.ownerName ?? 'the owner'}.`
     );
   } else {
     await context.sendActivity(

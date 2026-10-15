@@ -156,6 +156,7 @@ async function resolveTeamIdentifier(
     // Graph doesn't allow startsWith on id, so (c) falls back to a filtered scan.
     const hexPrefix = raw.split('.', 1)[0];
     if (GUID_REGEX.test(hexPrefix + '-0000-0000-0000-000000000000')) {
+      const prefixMatches: string[] = [];
       // hexPrefix is 8 valid hex chars — search groups where the id starts with it.
       try {
         const scanUrl = `${GRAPH_BASE}/groups?$select=id,displayName&$top=200`;
@@ -164,14 +165,20 @@ async function resolveTeamIdentifier(
           const res: any = await axios.get(url, { headers: { Authorization: `Bearer ${token}` } });
           for (const g of res.data?.value ?? []) {
             if (typeof g.id === 'string' && g.id.toLowerCase().startsWith(hexPrefix.toLowerCase())) {
-              teamIdResolveCache.set(cacheKey, g.id);
-              console.log(
-                `[resolveTeamIdentifier] channel-email prefix "${hexPrefix}" → group "${g.displayName}" (${g.id})`
-              );
-              return g.id;
+              prefixMatches.push(g.id);
             }
           }
           url = res.data?.['@odata.nextLink'] ?? null;
+        }
+        if (prefixMatches.length === 1) {
+          teamIdResolveCache.set(cacheKey, prefixMatches[0]);
+          return prefixMatches[0];
+        }
+        if (prefixMatches.length > 1) {
+          console.warn(
+            `[resolveTeamIdentifier] ${prefixMatches.length} groups match prefix "${hexPrefix}" — refusing to pick one. Set LEADERSHIP_TEAM_ID to the Team's group GUID.`
+          );
+          return undefined;
         }
         console.warn(
           `[resolveTeamIdentifier] No group found with id starting "${hexPrefix}" — is the email a Teams channel address?`
@@ -204,9 +211,12 @@ async function resolveTeamIdentifier(
       return undefined;
     }
     if (groups.length > 1) {
+      // Display names aren't unique. This value is an authorization boundary,
+      // so never guess — require the operator to configure the Team GUID.
       console.warn(
-        `[resolveTeamIdentifier] Multiple Teams named "${raw}" — using first (${groups[0].id})`
+        `[resolveTeamIdentifier] ${groups.length} Teams are named "${raw}" — refusing to pick one. Set LEADERSHIP_TEAM_ID to the Team's group GUID.`
       );
+      return undefined;
     }
     const id = groups[0].id as string;
     teamIdResolveCache.set(cacheKey, id);

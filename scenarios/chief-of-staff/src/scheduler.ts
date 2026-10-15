@@ -41,6 +41,7 @@ import { markCaptureComplete, markCaptureProcessingFailed } from './state/pendin
 import { lookupConversationRef } from './state/conversationRefs';
 import { PersistentMap } from './state/persistentMap';
 import { sendEscalationCardDirect } from './cards/followupCards';
+import { retryPendingLeaderDeliveries } from './cards/actionRouter';
 import { getPlannerTaskDetails } from './graph/plannerTools';
 
 // ─── Config (env-driven) ───────────────────────────────────────────────────
@@ -189,6 +190,7 @@ export function startScheduler(deps: SchedulerDeps): void {
       onTick: () =>
         fireInAuthedContext(deps, 'followup', async (ctx, state, client) => {
           await runFollowup({}, ctx, state, client);
+          await retryUndeliveredLeaderRequests(deps, ctx);
           await sweepStaleFollowupsAndEscalate(deps, ctx, client);
         }),
       errorHandler: (err) => console.error('[scheduler] followup cron error:', err),
@@ -288,6 +290,24 @@ export function stopScheduler(): void {
   started = false;
 }
 
+// ─── Undelivered owner requests (extension / blocker) ─────────────────────
+/** Retry owner requests whose leader card failed to send. Runs on every
+ *  follow-up cron fire, before the stale sweep. */
+async function retryUndeliveredLeaderRequests(deps: SchedulerDeps, ctx: TurnContext): Promise<void> {
+  const opts = { authorization: deps.authorization, context: ctx, authHandlerName: deps.authHandlerName };
+  try {
+    const { resolveUpnToAad } = await import('./graph/peopleTools');
+    const leaderAad = process.env.LEADER_AAD_ID?.trim() || (await resolveUpnToAad(LEADER_UPN, opts));
+    if (!leaderAad) {
+      console.warn('[scheduler] leader-delivery retry skipped — leader identity could not be resolved.');
+      return;
+    }
+    await retryPendingLeaderDeliveries(opts, leaderAad);
+  } catch (err) {
+    console.error('[scheduler] leader-delivery retry failed:', (err as Error)?.message ?? err);
+  }
+}
+
 // ─── Stale follow-up escalation sweep ─────────────────────────────────────
 /**
  * Direct-code (no LLM) escalation of any followup older than
@@ -335,7 +355,7 @@ async function sweepStaleFollowupsAndEscalate(
       if (details.ok && (details.percentComplete ?? 0) >= 100) {
         markResolved(f.followupId);
         console.log(
-          `[scheduler] skip escalation for "${f.taskTitle}" — task is 100% complete (auto-resolved followup ${f.followupId.slice(0, 8)}…).`
+          `[scheduler] skip escalation for task=${f.taskId.slice(0, 8)}… — task is 100% complete (auto-resolved followup ${f.followupId.slice(0, 8)}…).`
         );
         continue;
       }

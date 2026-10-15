@@ -63,13 +63,27 @@ async function getServerToken(
 ): Promise<string> {
   const envKey = `BEARER_TOKEN_${server.mcpServerName.toUpperCase()}`;
   const configuredToken = process.env[envKey]?.trim();
-  if (configuredToken) return configuredToken;
+  const sharedToken =
+    resolveWorkIqTokenScope(server) === SHARED_MCP_SCOPE ? process.env.BEARER_TOKEN?.trim() : undefined;
+  const devAuth = process.env.USE_AGENTIC_AUTH?.trim().toLowerCase() === 'false';
 
-  if (process.env.USE_AGENTIC_AUTH === 'false') {
-    const sharedToken = process.env.BEARER_TOKEN?.trim();
-    if (sharedToken && resolveWorkIqTokenScope(server) === SHARED_MCP_SCOPE) return sharedToken;
+  if (devAuth) {
+    // Static tokens are development-only and must never replace the agentic
+    // exchange in a production deployment.
+    if (process.env.NODE_ENV?.trim().toLowerCase() === 'production') {
+      throw new Error('USE_AGENTIC_AUTH=false (static WorkIQ bearer tokens) is not allowed when NODE_ENV=production');
+    }
+    if (configuredToken) return configuredToken;
+    if (sharedToken) return sharedToken;
     throw new Error(
       `${envKey} is required for local V2 WorkIQ authentication when USE_AGENTIC_AUTH=false`
+    );
+  }
+
+  if (configuredToken || sharedToken) {
+    // Reject the conflict instead of silently overriding the agentic identity.
+    throw new Error(
+      `${configuredToken ? envKey : 'BEARER_TOKEN'} is set but USE_AGENTIC_AUTH is not 'false'. Static bearer tokens are development-only — remove it, or set USE_AGENTIC_AUTH=false for local testing.`
     );
   }
 

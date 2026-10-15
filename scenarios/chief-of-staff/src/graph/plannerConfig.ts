@@ -74,6 +74,7 @@ async function resolveGroupId(rawInput: string): Promise<string | undefined> {
   if (raw.includes('@')) {
     const hexPrefix = raw.split('.', 1)[0];
     if (/^[0-9a-f]{8}$/i.test(hexPrefix)) {
+      const prefixMatches: GraphGroup[] = [];
       try {
         let url: string | null =
           `${GRAPH_BASE}/groups?$select=id,displayName&$top=200`;
@@ -82,15 +83,23 @@ async function resolveGroupId(rawInput: string): Promise<string | undefined> {
             headers: { Authorization: `Bearer ${token}` },
           });
           for (const g of (res.data?.value ?? []) as GraphGroup[]) {
-            if (g.id?.toLowerCase().startsWith(hexPrefix.toLowerCase())) {
-              cachedGroupId = g.id;
-              console.log(
-                `[plannerConfig] LEADERSHIP_TEAM_ID channel-email "${raw}" → group "${g.displayName ?? g.id}" (${g.id.slice(0, 8)}…)`
-              );
-              return g.id;
-            }
+            if (g.id?.toLowerCase().startsWith(hexPrefix.toLowerCase())) prefixMatches.push(g);
           }
           url = res.data?.['@odata.nextLink'] ?? null;
+        }
+        if (prefixMatches.length === 1) {
+          const g = prefixMatches[0];
+          cachedGroupId = g.id;
+          console.log(
+            `[plannerConfig] LEADERSHIP_TEAM_ID channel-email → group ${g.id.slice(0, 8)}…`
+          );
+          return g.id;
+        }
+        if (prefixMatches.length > 1) {
+          console.warn(
+            `[plannerConfig] ${prefixMatches.length} groups match channel-email prefix "${hexPrefix}" — refusing to pick one. Set LEADERSHIP_TEAM_ID to the Team's group GUID.`
+          );
+          return undefined;
         }
       } catch (err) {
         console.warn(
@@ -126,9 +135,12 @@ async function resolveGroupId(rawInput: string): Promise<string | undefined> {
       return undefined;
     }
     if (groups.length > 1) {
+      // Display names aren't unique and this id also drives the access gate —
+      // never guess; require the Team GUID.
       console.warn(
-        `[plannerConfig] Multiple Teams named "${raw}" — using first (${groups[0].id.slice(0, 8)}…)`
+        `[plannerConfig] ${groups.length} Teams are named "${raw}" — refusing to pick one. Set LEADERSHIP_TEAM_ID to the Team's group GUID.`
       );
+      return undefined;
     }
     cachedGroupId = groups[0].id;
     console.log(

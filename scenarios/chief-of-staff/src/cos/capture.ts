@@ -13,6 +13,7 @@ import type { Client } from '../client';
 import type { SimpleActionItem, SimpleMeetingNote } from '../state/pendingCaptureStore';
 import { log } from '../util/logger';
 import { getPlannerPlanId, getPlannerBucketId } from '../graph/plannerConfig';
+import { runWithToolContext } from '../util/toolContext';
 
 export interface TranscriptPayload {
   meetingId?: string;
@@ -49,7 +50,7 @@ export async function runCapture(
   log.info('capture', 'trigger received', {
     meetingId: payload.meetingId,
     transcriptId: payload.transcriptId,
-    subject: payload.subject,
+    hasSubject: !!payload.subject,
     hasInsights: insightsCount > 0,
     actionItemCount: payload.actionItems?.length ?? 0,
     meetingNoteCount: payload.meetingNotes?.length ?? 0,
@@ -166,13 +167,29 @@ Return a concise summary of what you did (tasks created, decisions logged, any e
     'capture',
     `dispatching prompt to LLM (${prompt.length} chars, insights=${insightsAvailable ? 'yes' : 'no'}, transcriptInlined=${transcriptInlined ? 'yes' : 'no'})`
   );
-  const result = await client.invokeAgentWithScope(prompt);
-  log.info('capture', 'result', { summary: result });
-  // invokeAgent reports model/tool failures as an "Error: …" string. Treat it
-  // as a failure so the capture stays retryable; planner_create_task is
-  // idempotent by title, so a retry won't duplicate tasks already created.
+  // Run inside a tool context so (a) a retry of this same capture reuses the
+  // Planner tasks it already created and (b) failed planner_create_task calls
+  // are detected deterministically, whatever the model's summary says.
+  const { result, outcomes } = await runWithToolContext(`capture:${payload.transcriptId}`, () =>
+    client.invokeAgentWithScope(prompt)
+  );
+  const creates = outcomes.filter((o) => o.tool === 'planner_create_task');
+  const failedCreates = creates.filter((o) => !o.ok);
+  log.info('capture', 'result', {
+    summaryChars: result?.length ?? 0,
+    tasksCreatedOrReused: creates.length - failedCreates.length,
+    taskCreateFailures: failedCreates.length,
+  });
+  // invokeAgent reports model/tool failures as an "Error: …" string.
   if (/^\s*error:/i.test(result ?? '')) {
     throw new Error(`runCapture: extraction failed — ${result}`);
+  }
+  // Any failed Planner write keeps the capture retryable; the retry reuses
+  // tasks created on this attempt instead of duplicating them.
+  if (failedCreates.length > 0) {
+    throw new Error(
+      `runCapture: ${failedCreates.length} planner_create_task call(s) failed — ${failedCreates[0].error ?? 'unknown error'}`
+    );
   }
 }
 

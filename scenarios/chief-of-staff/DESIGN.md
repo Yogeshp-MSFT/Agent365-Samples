@@ -246,18 +246,22 @@ setInterval, guarded by `meetingPollInFlight` — see §10.2):
   reopened when the reschedule moves it into a new capture window.
 - **Pass 2 — retry sweep.** For each pending capture whose `nextCheckAt` has
   arrived, `advanceCapture` tries to fetch the transcript for **this
-  occurrence** (created between its scheduled start and its capture
-  deadline, and not already consumed by another capture — a recurring
-  meeting reuses its join URL) and the Copilot insights, then decides one
-  of three outcomes:
+  occurrence** (created between 15 minutes before its scheduled start and
+  its scheduled end, and not already consumed by another capture — a
+  recurring meeting reuses its join URL) and the Copilot insights, then
+  decides one of three outcomes:
   1. **Ready** — transcript is here AND (insights arrived OR wait budget
      exhausted OR `attempts >= CAPTURE_MIN_ATTEMPTS_TRANSCRIPT_ONLY`).
      The capture is marked `ready` (durably, with its artifacts) and emitted
      to the scheduler, which fires `runCapture`. The scheduler marks it
-     `complete` only after `runCapture` succeeds; on failure it stays
-     `ready` and is retried (up to `CAPTURE_MAX_PROCESSING_FAILURES`,
-     default 3). `planner_create_task` skips titles that already exist, so a
-     retry doesn't duplicate tasks.
+     `complete` only after `runCapture` succeeds — an `Error:` reply from the
+     model **or any failed `planner_create_task` call** (tracked per run via
+     `util/toolContext.ts`, independent of the model's summary) is a
+     failure. On failure it stays `ready` and is retried (up to
+     `CAPTURE_MAX_PROCESSING_FAILURES`, default 3). A retry reuses the tasks
+     the same capture already created (keyed by capture + title +
+     assignees in `created-tasks.json`), so it doesn't duplicate them;
+     unrelated tasks that merely share a title are never merged.
   2. **Give up** — no transcript after `CAPTURE_GIVE_UP_AFTER_HOURS`.
      Marks the capture `gave-up` and moves on.
   3. **Retry** — computes the next delay from a `[1, 3, 7, 15, 30]` minute
@@ -365,20 +369,35 @@ sequenceDiagram
     Router->>Owner: "Great — I'll mark this on-track."
   else Owner clicks "Need more time"
     Owner->>Router: Invoke {verb: 'extend', followupId}
-    Router->>Router: compute suggestedNewDueDate (+5d)
-    Router->>Leader: send_extension_request_card
-    Router->>Owner: "Thanks — asked leader for approval."
-    Leader->>Router: Invoke {verb: 'approve_extend', taskId, newDate}
+    Router->>Router: authorizeIntent (open check-in + live Planner assignee)
+    Router->>Router: compute suggestedNewDueDate (+5 business days)
+    Router->>Store: recordOwnerResponse + queueLeaderDelivery
+    Router->>Leader: extension card (deliverPendingLeaderRequest)
+    alt delivered
+      Router->>Store: clear queue + recordExtensionRequest
+      Router->>Owner: "Thanks — asked leader for approval."
+    else send failed
+      Router->>Owner: "Saved — I'll keep retrying."
+      Note over Store: scheduler retries each follow-up tick (LEADER_DELIVERY_MAX_ATTEMPTS)
+    end
+    Leader->>Router: Invoke {verb: 'approve_extend', followupId}
     Router->>P: PATCH dueDateTime
-    Router->>Owner: DM with new date
+    Router->>Owner: DM with new date (only after PATCH succeeds)
   else Owner clicks "I'm blocked"
-    Owner->>Router: Invoke {verb: 'blocked', taskId}
-    Router->>Router: proposeMeetingSlots (3 IST business hours)
-    Router->>Leader: send_blocker_meeting_card
+    Owner->>Router: Invoke {verb: 'blocked', followupId}
+    Router->>Store: recordOwnerResponse + queueLeaderDelivery
+    Router->>Router: proposeMeetingSlots (3 slots in BRIEF_DISPLAY_TZ)
+    Router->>Leader: blocker meeting card (retried like the extension card)
     Leader->>Router: Invoke {verb: 'book_meeting', slotIso}
-    Router->>Router: LLM+mcp_CalendarTools.book_meeting (only remaining LLM call in this path)
-    Router->>P: PATCH title "[BLOCKER] …"
-    Router->>Owner: DM with invite
+    Router->>Router: LLM + mcp_CalendarTools.book_meeting (only remaining LLM call in this path)
+    alt booking returned exactly "OK"
+      Router->>Store: markResolved (meetingScheduledAt)
+      Router->>P: PATCH title "[BLOCKER] …"
+      Router->>Owner: DM "meeting scheduled"
+    else booking failed
+      Router->>Owner: DM "not booked yet"
+      Router->>Leader: "Booking failed — pick another slot"
+    end
   end
 ```
 
@@ -387,6 +406,11 @@ The router's `extractIntent` (in `cards/actionRouter.ts`) also handles
 `reject`, `reassign`, `defer`, and the new completion detection (see §5.6)
 all work even in Teams builds where Graph-sent Adaptive Card clicks don't
 route back as Invoke activities.
+
+**Reassign is a manual handoff.** `reassign` / `esc_reassign` close the
+check-in and tell the leader to change the assignee in Planner; the agent has
+no assignee-update write path and does not promise one. The next follow-up
+cycle checks in with whoever Planner then shows as the owner.
 
 ### 5.4 Escalation
 
@@ -465,35 +489,35 @@ sequenceDiagram
 
   Owner->>Router: DM "the task 'Send Contoso proposal' is done"
   Router->>Router: extractIntent → verb=complete, taskTitleHint="Send Contoso proposal"
-  Router->>PT: findOpenTaskByTitle(hint, {assigneeAad})
+  Router->>PT: findOpenTaskByTitle(hint, {assigneeAad, onlyAssignedTo = sender unless leader})
   PT->>P: GET tasks?$select=id,title,percentComplete,assignments
   PT->>PT: normalize + match (exact / substring / wordset)
-  PT->>PT: prefer tasks assigned to sender
-  alt exactly one candidate
+  alt one exact title match
     PT-->>Router: taskId
     Router->>P: PATCH percentComplete=100 (with If-Match ETag)
     Router->>Store: markResolved on the followup (if any)
     Router->>Owner: "✅ Nice work — marking 'X' complete."
+  else one close (substring / wordset) match
+    Router->>Owner: "Did you mean 'X'? I haven't changed anything yet."
   else multiple matches
     Router->>Owner: "Which one? • 'X' • 'Y' • 'Z'"
   else no match
-    Router->>Router: fall back to sender's latest open followup
-    alt followup exists
-      Router->>P: PATCH percentComplete=100
-    else no followup
-      Router->>Owner: "I couldn't find an open task — quote the title"
-    end
+    Router->>Owner: "I couldn't find an open task of yours titled 'X'. I haven't changed anything."
   end
   Note over TC: On the next plannerPoller tick, runTaskComplete fires and DMs the leader
 ```
 
-The completion detection lives in `extractIntent`. It matches phrases
-(`\b(complet(ed|e|ing)|finish(ed)?|done|closed?|wrapped( up)?)\b`) and pulls
-a quoted title (straight/curly quotes, backticks) as the primary hint. Short
-messages without a quoted title fall back to the sender's latest open
-follow-up. Long narrative messages are ignored so the router doesn't hijack
-a sentence like *"I got the design done but need help wrapping up the
-prototype."*
+The completion detection lives in `extractIntent` and
+`isAffirmativeCompletion`. It accepts only statements that the work is
+already done ("is done", "I've finished", "completed …"), with quoted titles
+masked out before classifying. Questions, negations, and future or
+conditional phrasing ("I will finish …", "almost done", "done once Bob
+replies") are rejected. A quoted title (straight/curly quotes, backticks) is
+the primary hint. Only when the message names **no** task at all (a short
+affirmative message, ≤140 chars) does the router use the sender's latest
+open follow-up; an explicit title that doesn't match never falls back. Long
+narrative messages are ignored so the router doesn't hijack a sentence like
+*"I got the design done but need help wrapping up the prototype."*
 
 ### 5.7 Recall / chit-chat (the only LLM-first flow)
 
@@ -506,12 +530,12 @@ sequenceDiagram
   participant LLM as gpt-4o
   participant Tools as planner_list_tasks + mcp_CalendarTools
 
-  User->>Agent: DM "where are we on Contoso?"
-  Agent->>Router: handleCardActionIfAny
+  User->>Agent: DM "where are we on Contoso?" (or an email to the agent mailbox)
+  Agent->>Router: handleCardActionIfAny (Teams only)
   Router-->>Agent: handled=false (no keyword match)
-  Agent->>Team: isUserInTeam(sender, LEADERSHIP_TEAM_ID)
-  Team-->>Agent: true/false/null
-  Agent->>LLM: buildUserTurnPrompt(text, inTeam, leader identity)
+  Agent->>Team: resolveSenderAccess → isUserInTeam(sender, LEADERSHIP_TEAM_ID)
+  Team-->>Agent: true/false/null (unidentified sender → false)
+  Agent->>LLM: buildUserTurnPrompt(text, channel, inTeam, leader identity)
   LLM->>Tools: planner_list_tasks, planner_get_task, mcp_CalendarTools.list_events
   Tools-->>LLM: task rows, calendar events
   LLM-->>Agent: bulleted status answer
@@ -549,8 +573,18 @@ is synchronous at construction time. See
   responseKind?: 'ontrack' | 'extend' | 'blocked';
   respondedAt?: number;
   escalatedAt?: number;
-  meetingScheduledAt?: number;
+  meetingScheduledAt?: number;   // set only after a booking returns "OK"
   extendedTo?: string;
+  extensionRequestedTo?: string; // proposal shown to the leader
+  extensionStatus?: 'pending' | 'approved' | 'rejected';
+  pendingLeaderDelivery?: {      // owner request not yet delivered to the leader
+    kind: 'extension' | 'blocker';
+    suggestedNewDueDate?: string;
+    blockerSummary?: string;
+    queuedAt: number;
+    attempts: number;
+    lastError?: string;
+  };
 }
 ```
 
@@ -711,18 +745,22 @@ Two places, and only two:
    insights when available; raw VTT otherwise). Calls
    `planner_create_task` + `send_task_assignment_card` + `mcp_TeamsServer`
    to post the meeting summary.
-2. **`src/agent.ts` → `handleUserMessage` fallback path.** One LLM turn per
-   user DM that isn't a card action or keyword reply. Powers Recall and
-   chit-chat. The Unblock flow described in the system prompt is only
-   used when the user DMs the agent about a blocker in free text —
-   the deterministic `blocked` verb (card click or keyword) is the primary
-   path.
+2. **`src/agent.ts` → `handleUserMessage` fallback path** (and
+   `handleUserEmail` for email). One LLM turn per user DM or email that
+   isn't a card action or keyword reply, after the same leadership-team gate.
+   Powers Recall and chit-chat. The Unblock flow described in the system
+   prompt is only used when the user DMs the agent about a blocker in free
+   text — the deterministic `blocked` verb (card click or keyword) is the
+   primary path.
 
 The blocker card handler's calendar booking (`book_meeting` verb) also
 routes through the LLM, but only because `mcp_CalendarTools.book_meeting`
 is exposed as an MCP tool and not (yet) directly reachable via HTTP. The
 LLM is fed fully pre-computed values with a 1-token response contract
-(`OK` / `FAIL: reason`) so it can't hallucinate.
+(`OK` / `FAIL: reason`) so it can't hallucinate. Booking runs **before**
+anything is recorded: only an exact `OK` resolves the follow-up and DMs the
+owner. It is the only card verb that calls the LLM — reject, reassign,
+defer, and escalate send their DMs deterministically.
 
 Everything else — filtering Planner tasks in Brief and Follow-up, computing
 new due dates in Extend, proposing meeting slots in Blocker, resolving
@@ -773,10 +811,12 @@ Both paths converge on `handleCardActionIfAny(context, client, leaderAad)`
 in `src/cards/actionRouter.ts`. That's the single entry point for every
 card-driven verb. Before any verb runs, `authorizeIntent` checks the sender:
 leader-only verbs (`approve_extend`, `reject_extend`, `reassign`,
-`book_meeting`, `defer_blocker`, `esc_*`) require the configured leader;
-owner verbs must target a follow-up owned by the sender, and a `taskId`
-submitted in card data is honored only if it matches that follow-up or a
-Planner task assigned to the sender.
+`book_meeting`, `defer_blocker`, `esc_*`) require the configured leader.
+Owner verbs must target a follow-up owned by the sender that is still open
+(a closed one only accepts `complete`), a `taskId` in card data must match
+that follow-up, and the target task must be assigned to the sender **in
+Planner right now** — a live Graph check, because a stored follow-up can
+predate a reassignment.
 
 ### 9.3 The verbs
 
@@ -785,15 +825,17 @@ All card verbs are strings in `activity.value.verb`:
 | Verb | Sent from | Handler |
 |---|---|---|
 | `ontrack` | Follow-up check-in | Deterministic: `acknowledgePlannerTask` (5%) + `markResolved` |
-| `extend` | Follow-up check-in | Compute new date, send extension request card to leader |
-| `blocked` | Follow-up check-in | Propose 3 slots, send blocker meeting card to leader |
+| `extend` | Follow-up check-in | Compute new date, queue + send extension request card to leader (retried by the scheduler if delivery fails) |
+| `blocked` | Follow-up check-in | Propose 3 slots, queue + send blocker meeting card to leader (retried likewise) |
 | `complete` | (also matched via chat regex) | `findOpenTaskByTitle` → `completePlannerTask` (100%) |
 | `approve_extend` | Extension request card | `updatePlannerTaskDueDate` + DM owner |
-| `reject_extend` | Extension request card | DM owner "not approved" |
-| `reassign` | Escalation card | DM owner (leader will follow up manually) |
-| `book_meeting` | Blocker meeting card | LLM + `mcp_CalendarTools.book_meeting`, PATCH `[BLOCKER]` title prefix |
+| `reject_extend` | Extension request card | Deterministic DM to owner "not approved" |
+| `reassign` | Extension request card | Manual handoff: closes the check-in and tells the leader to change the assignee in Planner |
+| `book_meeting` | Blocker meeting card | LLM + `mcp_CalendarTools.book_meeting` first; on exact `OK` → resolve, PATCH `[BLOCKER]` title prefix, DM owner; on failure → DM owner "not booked", keep the check-in open |
 | `defer_blocker` | Blocker meeting card | Snooze — resolves the followup with a note |
-| `esc_reassign` / `esc_extend` / `esc_escalate` | Escalation card | DM owner appropriate acknowledgement |
+| `esc_reassign` | Escalation card | Same manual handoff as `reassign` |
+| `esc_extend` | Escalation card | Sends the leader an extension approval card |
+| `esc_escalate` | Escalation card | Deterministic DM to owner that the leader will reach out |
 
 Each handler is a small `if (intent.verb === '…') { … return {handled:true}; }`
 block in `actionRouter.ts`. New verbs are added by defining the card action
@@ -897,11 +939,12 @@ debounced (200 ms) write on every mutation. This makes restarts safe:
 | Store | File | TTL prune on hydrate | Fat-field strip on persist |
 |---|---|---|---|
 | `pendingCaptureStore` | `pending-captures.json` | Terminal records older than `CAPTURE_STATE_RETENTION_DAYS` (30) | `transcriptContent`, insights arrays dropped for `complete`/`gave-up` records |
-| `followupStore` | `followups.json` | Terminal records older than `FOLLOWUP_STATE_RETENTION_HOURS` (72) | None |
+| `followupStore` | `followups.json` | Terminal records older than `FOLLOWUP_STATE_RETENTION_HOURS` (72); records with an undelivered owner request (`pendingLeaderDelivery`) or a pending extension decision are always kept | None |
 | `conversationRefs` | `conversation-refs.json` | None — refs are tiny and useful indefinitely | Only personal (1:1) references are stored |
 | `plannerPoller.lastProgress` | `planner-progress.json` | None — `{taskId: percent}` map | None |
 | `plannerPoller.pendingCompletions` | `planner-completions-pending.json` | Removed once every notification is delivered (or after `TASK_COMPLETE_MAX_ATTEMPTS`, default 12) | None |
 | scheduler bootstrap reference | `scheduler-ref.json` | None | None |
+| capture-created task index | `created-tasks.json` | Entries older than 14 days | None — `{capture + title + assignees → taskId}`, used only so a retried capture reuses its own tasks |
 
 **Guarantees:**
 
@@ -1066,18 +1109,24 @@ Copy the pattern in `src/cards/followupCards.ts`:
 
 ### 12.5 Change the leadership team gate
 
-`src/agent.ts` calls `isUserInTeam(senderAad, LEADERSHIP_TEAM_ID, …)` before
-building the client. `isUserInTeam` (in `src/graph/peopleTools.ts`) returns
-`true`/`false`/`null`. `null` means only "no team configured". When a team
-IS configured, an unresolvable team id or a failed membership lookup returns
-`false` — the gate fails closed. The configured leader is always allowed.
+`src/agent.ts::resolveSenderAccess` runs the gate for **both** Teams
+messages and email notifications before building the client. For email, the
+sender is the channel's `aadObjectId` when present, otherwise the sender
+address resolved through Graph (`resolveUpnToAad`); a sender that can't be
+identified (for example an external address) is treated as a non-member.
+`isUserInTeam` (in `src/graph/peopleTools.ts`) returns `true`/`false`/`null`.
+`null` means only "no team configured". When a team IS configured, an
+unresolvable team id — including a display name or channel-email prefix that
+matches more than one group — or a failed membership lookup returns `false`:
+the gate fails closed. `plannerConfig.ts` applies the same ambiguity rule
+when it resolves the plan's group. The configured leader is always allowed.
 For `false`, the client is built with `restrictedAccess: true`, which omits
 the Planner, card, and WorkIQ MCP tools, so the restriction is enforced in
-the tool layer; the prompt (`buildUserTurnPrompt`) also tells the LLM to
-refuse politely. Card actions are authorized separately in
-`actionRouter.ts::authorizeIntent` (leader-only verbs, task ownership). To
-swap the gate for an Entra dynamic group or SharePoint list, change
-`isUserInTeam`.
+the tool layer; the prompt (`buildUserTurnPrompt`, which also labels the
+channel) tells the LLM to refuse politely. Card actions are authorized
+separately in `actionRouter.ts::authorizeIntent` (leader-only verbs, open
+check-ins, live Planner assignment). To swap the gate for an Entra dynamic
+group or SharePoint list, change `isUserInTeam`.
 
 ---
 
@@ -1105,10 +1154,14 @@ prevent the demo. Address before pilot / production.
   `mcp_TeamsServer.send_message` as a plain-text fallback that also
   establishes the ref.
 - **The Recall wording is LLM-generated.** Data access is enforced
-  server-side: senders outside the leadership team (or whose membership
-  can't be verified) get a client with no Planner, card, or WorkIQ MCP tools
-  (§12.5), so a prompt injection can't make the LLM read protected data. The
-  refusal *text* is still produced by the LLM.
+  server-side for Teams messages **and** email: senders outside the
+  leadership team (or whose identity or membership can't be verified) get a
+  client with no Planner, card, or WorkIQ MCP tools (§12.5), so a prompt
+  injection can't make the LLM read protected data. The refusal *text* is
+  still produced by the LLM.
+- **Logs carry no Planner content.** Follow-up, task-complete, Planner, and
+  capture logs record task-id prefixes, counts, and reason codes — never
+  task titles, meeting subjects, recipient names, or full AAD ids.
 - **`transcriptContent` truncation.** Capped at `MAX_INLINE_TRANSCRIPT_CHARS`
   = 60 000 chars in `src/cos/capture.ts`. Very long meetings (> ~40 min of
   dense speech) may lose the tail. Fix: chunk + summarise, or upgrade to
@@ -1155,7 +1208,8 @@ cos-agent/
 │   ├── util/
 │   │   ├── logger.ts                         # Level-based logger (LOG_LEVEL)
 │   │   ├── httpLogger.ts                     # Global axios interceptor (LOG_HTTP)
-│   │   └── time.ts                           # BRIEF_DISPLAY_TZ formatting + DST-aware wall-clock → UTC
+│   │   ├── time.ts                           # BRIEF_DISPLAY_TZ formatting + DST-aware wall-clock → UTC
+│   │   └── toolContext.ts                    # Per-run tool outcomes + source ref (capture retry safety)
 │   ├── graph/
 │   │   ├── graphAppToken.ts                  # Standalone Graph worker (client_credentials via MSAL)
 │   │   ├── peopleTools.ts                    # graph_find_user + attendees + UPN↔AAD + isUserInTeam + acquireGraphToken
@@ -1228,7 +1282,7 @@ Grouped by concern. Every var has a code default; only the ones marked
 | `LOG_HTTP` | `false` | Log every axios call with status + latency (masked auth) |
 | `DEBUG` | — | Bot Framework SDK debug namespaces (`agents:*` prints a lot) |
 | `SKIP_TOOLING_ON_ERRORS` | `false` | `false`: a WorkIQ MCP registration failure fails the turn. `true`: continue without those tools |
-| `BEARER_TOKEN_<MCP_SERVER_NAME>` | — | Dev only, with `USE_AGENTIC_AUTH=false`: per-server MCP token for that server's audience (e.g. `BEARER_TOKEN_MCP_MAILTOOLS`) |
+| `BEARER_TOKEN_<MCP_SERVER_NAME>` | — | Dev only, with `USE_AGENTIC_AUTH=false` and `NODE_ENV` ≠ `production`: per-server MCP token for that server's audience (e.g. `BEARER_TOKEN_MCP_MAILTOOLS`). Set while `USE_AGENTIC_AUTH` is not `false`, it is rejected as a configuration error |
 
 WorkIQ MCP servers are always read from `ToolingManifest.json` (deploy it next
 to `dist/`); there is no Tooling Gateway discovery path.
@@ -1273,7 +1327,7 @@ All **required**.
 | `LEADER_UPN` | **required.** AAD auto-resolves on first turn |
 | `LEADER_AAD_ID` | Optional — skips the resolve if pre-populated |
 | `LEADER_NAME` | Optional — used in card copy (e.g. "Assigned by: Mario") |
-| `LEADERSHIP_TEAM_ID` | Team GUID or channel email or display name. If blank, Recall is open to all |
+| `LEADERSHIP_TEAM_ID` | Team GUID (recommended) or channel email or display name; a name/prefix matching more than one group is refused (fail closed). Gates Teams **and** email turns. If blank, Recall is open to any sender identified as a tenant user |
 
 ### A.5 CoS agent identity + meeting capture
 
@@ -1340,6 +1394,7 @@ no TurnContext.
 | `POLL_TASKS_MS` | `300000` |
 | `FOLLOWUP_ESCALATE_AFTER_HOURS` | `3` |
 | `FOLLOWUP_COOLDOWN_HOURS` | `4` |
+| `LEADER_DELIVERY_MAX_ATTEMPTS` | `24` — follow-up cycles to retry an owner's extension/blocker request whose leader card failed to send |
 
 ### A.9 Display
 
@@ -1384,7 +1439,7 @@ In-process (non-MCP) tools registered on the `Agent`:
 |---|---|
 | `planner_list_tasks` | List all tasks in the configured plan |
 | `planner_get_task` | Read one task, including its description |
-| `planner_create_task` | Create a task in the "New" bucket with an optional description (skips titles that already exist) |
+| `planner_create_task` | Create a task in the "New" bucket with an optional description. Same-titled tasks for different owners stay separate; only a retried capture reuses the task it already created |
 | `graph_find_user` | Directory search by name / email |
 | `graph_list_meeting_attendees` | For a chat, list attendees + AADs |
 | `send_brief_card` | Adaptive Card DM to leader (Brief) |

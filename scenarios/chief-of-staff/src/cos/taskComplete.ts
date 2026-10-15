@@ -77,7 +77,7 @@ export async function runTaskComplete(
   const title = details.title ?? '(untitled task)';
   const assignees = details.assigneeAads ?? [];
   console.log(
-    `[taskComplete] task="${title}" percentComplete=${details.percentComplete} assignees=${assignees.length}`
+    `[taskComplete] task=${payload.taskId.slice(0, 8)}… percentComplete=${details.percentComplete} assignees=${assignees.length}`
   );
 
   // Only act on actual completions; a reopened task needs no notification.
@@ -132,15 +132,25 @@ export async function runTaskComplete(
     }
   }
 
-  // 3) DM the leader.
-  const leaderAad =
-    process.env.LEADER_AAD_ID?.trim() ||
-    (await client.resolveUpnToAad(process.env.LEADER_UPN)) ||
-    '';
-
-  if (!leaderAad) {
+  // 3) DM the leader. Only an unconfigured leader skips this step; a
+  // configured leader that can't be resolved right now (e.g. a transient
+  // Graph failure) keeps the event pending so the next poll retries.
+  const leaderConfigured = !!(process.env.LEADER_AAD_ID?.trim() || process.env.LEADER_UPN?.trim());
+  if (!leaderConfigured) {
     console.warn('[taskComplete] LEADER_AAD_ID / LEADER_UPN not configured — skipping leader DM.');
     return { complete: allDelivered, delivered };
+  }
+  let leaderAad = process.env.LEADER_AAD_ID?.trim() || '';
+  if (!leaderAad) {
+    try {
+      leaderAad = (await client.resolveUpnToAad(process.env.LEADER_UPN)) || '';
+    } catch (err) {
+      console.warn('[taskComplete] LEADER_UPN lookup threw:', (err as Error)?.message ?? err);
+    }
+  }
+  if (!leaderAad) {
+    console.warn('[taskComplete] LEADER_UPN could not be resolved right now — leader DM will be retried.');
+    return { complete: false, delivered };
   }
   if (alreadyDelivered.has(leaderAad.toLowerCase())) {
     return { complete: allDelivered, delivered };

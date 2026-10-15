@@ -35,6 +35,19 @@ export interface PendingFollowup {
   /** Due date proposed to the leader for approval. Authoritative for approval. */
   extensionRequestedTo?: string;
   extensionStatus?: 'pending' | 'approved' | 'rejected';
+  /** Owner request (extension / blocker) that still has to reach the leader.
+   *  Written BEFORE the send and cleared only after delivery, so a failed
+   *  send is retried by the scheduler instead of being lost. */
+  pendingLeaderDelivery?: PendingLeaderDelivery;
+}
+
+export interface PendingLeaderDelivery {
+  kind: 'extension' | 'blocker';
+  suggestedNewDueDate?: string; // extension
+  blockerSummary?: string; // blocker
+  queuedAt: number;
+  attempts: number;
+  lastError?: string;
 }
 
 // How long to keep terminal (responded / resolved) followups on disk. The
@@ -52,6 +65,8 @@ const store = new PersistentMap<PendingFollowup>({
     if (f.status === 'pending' || f.status === 'escalated') return true;
     // Keep extension requests that still await the leader's decision.
     if (f.extensionStatus === 'pending') return true;
+    // Keep owner requests that haven't reached the leader yet.
+    if (f.pendingLeaderDelivery) return true;
     // Keep terminal followups within the retention window for cooldowns.
     const anchor = f.respondedAt ?? f.sentAt ?? 0;
     return Date.now() - anchor < RETENTION_MS;
@@ -113,6 +128,38 @@ export function findPendingExtensionRequests(): PendingFollowup[] {
   return Array.from(store.values())
     .filter((f) => f.extensionStatus === 'pending')
     .sort((a, b) => (b.respondedAt ?? b.sentAt) - (a.respondedAt ?? a.sentAt));
+}
+
+/** Queue an owner request for delivery to the leader (before sending). */
+export function queueLeaderDelivery(
+  followupId: string,
+  delivery: Omit<PendingLeaderDelivery, 'queuedAt' | 'attempts'>
+): PendingFollowup | undefined {
+  const f = store.get(followupId);
+  if (!f) return undefined;
+  f.pendingLeaderDelivery = { ...delivery, queuedAt: Date.now(), attempts: 0 };
+  store.set(followupId, f);
+  return f;
+}
+
+/** Record a delivery attempt. Success clears the queued request. */
+export function recordLeaderDeliveryAttempt(followupId: string, ok: boolean, error?: string): void {
+  const f = store.get(followupId);
+  if (!f?.pendingLeaderDelivery) return;
+  if (ok) {
+    delete f.pendingLeaderDelivery;
+  } else {
+    f.pendingLeaderDelivery.attempts += 1;
+    f.pendingLeaderDelivery.lastError = error?.slice(0, 300);
+  }
+  store.set(followupId, f);
+}
+
+/** Owner requests whose leader card has not been delivered yet. */
+export function findPendingLeaderDeliveries(): PendingFollowup[] {
+  return Array.from(store.values())
+    .filter((f) => !!f.pendingLeaderDelivery && f.status !== 'resolved')
+    .sort((a, b) => a.pendingLeaderDelivery!.queuedAt - b.pendingLeaderDelivery!.queuedAt);
 }
 
 export function setExtensionStatus(

@@ -21,7 +21,13 @@
 
 import { tool } from '@openai/agents';
 import { Authorization, CloudAdapter, TurnContext } from '@microsoft/agents-hosting';
-import { createFollowup, deleteFollowup, PendingFollowup } from '../state/followupStore';
+import {
+  createFollowup,
+  deleteFollowup,
+  getFollowup,
+  PendingFollowup,
+  recordExtensionRequest,
+} from '../state/followupStore';
 import { getBotAppId, sendCardProactively } from './proactiveSend';
 import { hasConversationRef } from '../state/conversationRefs';
 import { formatDisplayDate } from '../util/time';
@@ -382,9 +388,20 @@ export function createExtensionRequestTool(opts: CardToolOptions) {
     } as any,
     execute: async (rawArgs: unknown) => {
       const args = (rawArgs ?? {}) as ExtensionRequestArgs;
+      // Approve / Reject act on the recorded request, so this card must map
+      // to a real follow-up for the same task.
+      const followup = getFollowup(args.followupId);
+      if (!followup || followup.taskId !== args.taskId) {
+        return toolFail(
+          'send_extension_request_card',
+          new Error('unknown followupId for this task'),
+          'Use the followupId and taskId from an existing check-in; extension requests must map to a recorded follow-up.'
+        );
+      }
       try {
         const card = buildExtensionRequestCard(args);
         const { conversationId } = await sendCardToUser(opts, args.leaderAadObjectId, card, 'extension-request');
+        recordExtensionRequest(args.followupId, args.suggestedNewDueDate);
         return JSON.stringify({ ok: true, conversationId });
       } catch (err) {
         return toolFail('send_extension_request_card', err);

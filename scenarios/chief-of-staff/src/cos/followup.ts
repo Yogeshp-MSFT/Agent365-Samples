@@ -80,7 +80,7 @@ async function resolveDisplayName(token: string, aad: string): Promise<string | 
     const name = (res.data?.displayName ?? '').toString().trim();
     return name || null;
   } catch (err) {
-    console.warn(`[followup] resolveDisplayName failed for aad=${aad}:`, (err as Error)?.message);
+    console.warn(`[followup] resolveDisplayName failed for aad=${aad.slice(0, 8)}…:`, (err as Error)?.message);
     return null;
   }
 }
@@ -184,35 +184,30 @@ export async function runFollowup(
     `[followup] scanned ${tasks.length} task(s); today=${todayIso} cutoff=${cutoffIso}`
   );
 
-  // Deterministic filter — log each rejection so it's obvious WHY a task
-  // didn't get a check-in.
-  const dropped: string[] = [];
+  // Deterministic filter. Logs only reason codes and counts — task titles
+  // (decisions, confidential work) never go to application logs.
+  const droppedByReason: Record<string, number> = {};
+  const drop = (reason: string) => {
+    droppedByReason[reason] = (droppedByReason[reason] ?? 0) + 1;
+    return false;
+  };
   const atRisk = tasks.filter((t) => {
     if (!t) return false;
-    const title = t.title ?? '(untitled)';
-    if ((t.percentComplete ?? 0) >= 100) {
-      dropped.push(`"${title}" — 100% complete`);
-      return false;
-    }
-    if ((t.title ?? '').startsWith('[DECISION]')) {
-      dropped.push(`"${title}" — [DECISION] prefix`);
-      return false;
-    }
-    if (!t.dueDateTime) {
-      dropped.push(`"${title}" — no due date`);
-      return false;
-    }
+    if ((t.percentComplete ?? 0) >= 100) return drop('complete');
+    if ((t.title ?? '').startsWith('[DECISION]')) return drop('decision');
+    if (!t.dueDateTime) return drop('no-due-date');
     const dueIso = isoDateInTz(new Date(t.dueDateTime));
-    if (dueIso > cutoffIso) {
-      dropped.push(`"${title}" — due ${dueIso} > cutoff ${cutoffIso}`);
-      return false;
-    }
+    if (dueIso > cutoffIso) return drop('due-after-cutoff');
     return true;
   });
 
-  if (dropped.length > 0) {
-    console.log(`[followup] filtered out ${dropped.length} task(s):`);
-    for (const line of dropped) console.log(`  · ${line}`);
+  const droppedTotal = Object.values(droppedByReason).reduce((a, b) => a + b, 0);
+  if (droppedTotal > 0) {
+    console.log(
+      `[followup] filtered out ${droppedTotal} task(s): ${Object.entries(droppedByReason)
+        .map(([reason, n]) => `${reason}=${n}`)
+        .join(' ')}`
+    );
   }
   console.log(`[followup] ${atRisk.length} at-risk task(s) after filter.`);
 
@@ -227,35 +222,34 @@ export async function runFollowup(
 
   let cardsSent = 0;
   const skipped: string[] = [];
+  // Log-safe task reference: an id prefix, never the title.
+  const ref = (id: string) => `task=${id.slice(0, 8)}…`;
+  const skip = (t: PlannerTask, reason: string) => {
+    const line = `${ref(t.id)} ${reason}`;
+    skipped.push(line);
+    console.log(`[followup] skip: ${line}`);
+  };
 
   for (const t of atRisk) {
     const assigneeAads = Object.keys(t.assignments ?? {});
     if (assigneeAads.length === 0) {
-      const line = `"${t.title}" no assignee`;
-      skipped.push(line);
-      console.log(`[followup] skip: ${line}`);
+      skip(t, 'no-assignee');
       continue;
     }
     const ownerAad = assigneeAads[0];
     const block = hasBlockingFollowupForTask(t.id, ownerAad);
     if (block.blocked) {
-      const line = `"${t.title}" ${block.reason}`;
-      skipped.push(line);
-      console.log(`[followup] skip: ${line}`);
+      skip(t, block.reason);
       continue;
     }
 
     const ownerName = await resolveDisplayName(token, ownerAad);
     if (!ownerName) {
-      const line = `"${t.title}" could not resolve name for aad=${ownerAad}`;
-      skipped.push(line);
-      console.log(`[followup] skip: ${line}`);
+      skip(t, 'owner-name-unresolved');
       continue;
     }
     if (!adapter || !hasConversationRef(ownerAad)) {
-      const line = `"${t.title}" ${ownerName} hasn't DM'd the agent yet (no ConversationReference)`;
-      skipped.push(line);
-      console.log(`[followup] skip: ${line}`);
+      skip(t, 'no-conversation-ref (owner has not messaged the agent yet)');
       continue;
     }
 
@@ -279,15 +273,13 @@ export async function runFollowup(
     try {
       await sendCardProactively({ adapter, botAppId, recipientAad: ownerAad, card });
       cardsSent++;
-      console.log(
-        `[followup] ✔ sent check-in to ${ownerName} (${ownerAad}) for "${t.title}" (due ${t.dueDateTime?.slice(0, 10)})`
-      );
+      console.log(`[followup] ✔ sent check-in for ${ref(t.id)} to owner=${ownerAad.slice(0, 8)}…`);
     } catch (err) {
       // The owner never received this reminder: drop the record so the next
       // tick retries and the escalation sweep can't report it as ignored.
       deleteFollowup(record.followupId);
-      skipped.push(`"${t.title}" send failed: ${(err as Error)?.message}`);
-      console.error(`[followup] send failed for "${t.title}" — will retry next tick:`, (err as Error)?.message);
+      skipped.push(`${ref(t.id)} send failed: ${(err as Error)?.message}`);
+      console.error(`[followup] send failed for ${ref(t.id)} — will retry next tick:`, (err as Error)?.message);
     }
   }
 
