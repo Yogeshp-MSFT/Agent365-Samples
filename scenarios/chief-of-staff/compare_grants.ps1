@@ -1,5 +1,18 @@
-$S3_INSTANCE  = "48a0b7df-fcd2-4812-9151-ee90b45af1e8"
-$COS_INSTANCE = "d35aaf51-693f-4b46-8935-0d8796b96ca3"
+# compare_grants.ps1
+#
+# Diagnostic: list the delegated OAuth2 grants and app-role assignments on
+# two agent-instance service principals so you can compare a working agent
+# with this one. Pass YOUR OWN instance app (client) ids — none are shipped.
+#
+#   ./compare_grants.ps1 -CosInstanceAppId <COS_AGENT_INSTANCE_APP_ID> `
+#                        -ReferenceInstanceAppId <OTHER_AGENT_INSTANCE_APP_ID>
+
+param(
+  [Parameter(Mandatory)][string]$CosInstanceAppId,
+  [Parameter(Mandatory)][string]$ReferenceInstanceAppId
+)
+
+$ErrorActionPreference = 'Stop'
 
 function Show-Grants($label, $clientId) {
   Write-Host "=== $label (clientId=$clientId) ==="
@@ -12,11 +25,11 @@ function Show-Grants($label, $clientId) {
   Write-Host ""
 }
 
-Show-Grants "sample-agent-3 INSTANCE SP" $S3_INSTANCE
-Show-Grants "cos-agent      INSTANCE SP" $COS_INSTANCE
+Show-Grants "reference INSTANCE SP" $ReferenceInstanceAppId
+Show-Grants "cos-agent INSTANCE SP" $CosInstanceAppId
 
 Write-Host "=== App role assignments (application permissions) on each SP ==="
-foreach ($sp in @(@{name="sample-agent-3"; id=$S3_INSTANCE}, @{name="cos-agent"; id=$COS_INSTANCE})) {
+foreach ($sp in @(@{name="reference"; id=$ReferenceInstanceAppId}, @{name="cos-agent"; id=$CosInstanceAppId})) {
   $spObj = az ad sp list --filter "appId eq '$($sp.id)'" -o json | ConvertFrom-Json | Select-Object -First 1
   if (-not $spObj) { Write-Host "$($sp.name): SP not found"; continue }
   $assignments = az rest --method GET --uri "https://graph.microsoft.com/v1.0/servicePrincipals/$($spObj.id)/appRoleAssignments" -o json | ConvertFrom-Json

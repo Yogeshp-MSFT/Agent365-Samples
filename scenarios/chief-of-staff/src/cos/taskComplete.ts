@@ -2,8 +2,9 @@
 // Licensed under the MIT License.
 //
 // FR-7 Task Complete handler.
-// Triggered by a `[COS-TASK-COMPLETE]` email from Power Automate when a Planner
-// task in the tracked plan is marked complete.
+// Triggered by the Planner completion poller when a task in the tracked plan
+// transitions to 100% complete. Returns a per-recipient delivery outcome so
+// the poller retries only the notifications that failed.
 //
 // Deterministic implementation — no LLM in the loop:
 //   1. Read the task from Graph (title + assignees).
@@ -22,6 +23,18 @@ import { findOpenFollowupsForTask, markResolved } from '../state/followupStore';
 export interface TaskCompletePayload {
   taskId?: string;
   planId?: string;
+  /** Recipients (AAD ids) notified on an earlier attempt — not messaged again. */
+  alreadyDelivered?: string[];
+}
+
+/**
+ * Outcome of a completion run. `complete` is true when every recipient has
+ * been notified (or the task no longer needs notifications); otherwise the
+ * poller keeps the transition and retries the remaining recipients.
+ */
+export interface TaskCompleteOutcome {
+  complete: boolean;
+  delivered: string[];
 }
 
 const GRAPH_BASE = 'https://graph.microsoft.com/v1.0';
@@ -35,7 +48,7 @@ async function resolveDisplayName(token: string, aad: string): Promise<string | 
     const name = (res.data?.displayName ?? '').toString().trim();
     return name || null;
   } catch (err) {
-    console.warn(`[taskComplete] resolveDisplayName failed for aad=${aad}:`, (err as Error)?.message);
+    console.warn(`[taskComplete] resolveDisplayName failed for aad=${aad.slice(0, 8)}…:`, (err as Error)?.message);
     return null;
   }
 }
@@ -45,19 +58,21 @@ export async function runTaskComplete(
   _ctx: TurnContext,
   _state: TurnState,
   client: Client
-): Promise<void> {
-  console.log('[taskComplete] Trigger received.', payload);
+): Promise<TaskCompleteOutcome> {
+  console.log('[taskComplete] Trigger received.', { taskId: payload.taskId });
+  const alreadyDelivered = new Set((payload.alreadyDelivered ?? []).map((a) => a.toLowerCase()));
+  const delivered: string[] = [];
 
   if (!payload.taskId) {
     console.warn('[taskComplete] Missing taskId in payload — skipping.');
-    return;
+    return { complete: true, delivered };
   }
 
-  // 1) Load task details (title + assignees).
+  // 1) Load task details (title + assignees). A failure is retried later.
   const details = await getPlannerTaskDetails(payload.taskId);
   if (!details.ok) {
-    console.warn(`[taskComplete] getPlannerTaskDetails failed: ${details.error}`);
-    return;
+    console.warn(`[taskComplete] getPlannerTaskDetails failed (will retry): ${details.error}`);
+    return { complete: false, delivered };
   }
   const title = details.title ?? '(untitled task)';
   const assignees = details.assigneeAads ?? [];
@@ -65,14 +80,12 @@ export async function runTaskComplete(
     `[taskComplete] task="${title}" percentComplete=${details.percentComplete} assignees=${assignees.length}`
   );
 
-  // Only act on actual completions. Power Automate can fire twice; ignore
-  // anything that isn't 100% (belt & suspenders — Graph should reflect it
-  // by the time we receive the mail).
+  // Only act on actual completions; a reopened task needs no notification.
   if ((details.percentComplete ?? 0) < 100) {
     console.log(
       `[taskComplete] task not 100% complete (percent=${details.percentComplete}) — skipping DMs.`
     );
-    return;
+    return { complete: true, delivered };
   }
 
   // Clear any outstanding follow-ups for this task so the escalation sweep
@@ -102,15 +115,20 @@ export async function runTaskComplete(
   );
 
   const opts = client.getPeopleOpts();
+  let allDelivered = true;
 
-  // 2) DM every assignee.
+  // 2) DM every assignee not already notified.
   for (const aad of assignees) {
+    if (alreadyDelivered.has(aad.toLowerCase())) continue;
     const ownerMsg =
       `✅ Thanks — **"${cleanTitle}"** is marked complete in Planner.` +
       (isBlocker ? `\n\nThat one was flagged as a blocker — great to see it resolved.` : '');
     const r = await sendPlainDmToUser(opts, aad, ownerMsg);
-    if (!r.ok) {
-      console.warn(`[taskComplete] owner DM failed for ${aad}: ${r.error}`);
+    if (r.ok) {
+      delivered.push(aad);
+    } else {
+      allDelivered = false;
+      console.warn(`[taskComplete] owner DM failed for ${aad.slice(0, 8)}… (will retry): ${r.error}`);
     }
   }
 
@@ -122,7 +140,10 @@ export async function runTaskComplete(
 
   if (!leaderAad) {
     console.warn('[taskComplete] LEADER_AAD_ID / LEADER_UPN not configured — skipping leader DM.');
-    return;
+    return { complete: allDelivered, delivered };
+  }
+  if (alreadyDelivered.has(leaderAad.toLowerCase())) {
+    return { complete: allDelivered, delivered };
   }
 
   const ownerNames =
@@ -135,10 +156,12 @@ export async function runTaskComplete(
     : `✅ ${ownerNames} completed **"${cleanTitle}"**.`;
 
   const r = await sendPlainDmToUser(opts, leaderAad, leaderMsg);
-  if (!r.ok) {
-    console.warn(`[taskComplete] leader DM failed: ${r.error}`);
-  } else {
+  if (r.ok) {
+    delivered.push(leaderAad);
     console.log(`[taskComplete] leader DM'd (${leaderAad.slice(0, 8)}…).`);
+  } else {
+    allDelivered = false;
+    console.warn(`[taskComplete] leader DM failed (will retry): ${r.error}`);
   }
+  return { complete: allDelivered, delivered };
 }
-

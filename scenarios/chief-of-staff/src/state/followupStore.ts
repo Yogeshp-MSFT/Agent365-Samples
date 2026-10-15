@@ -32,6 +32,9 @@ export interface PendingFollowup {
   escalatedAt?: number;
   meetingScheduledAt?: number;
   extendedTo?: string; // ISO — new due date if extension approved
+  /** Due date proposed to the leader for approval. Authoritative for approval. */
+  extensionRequestedTo?: string;
+  extensionStatus?: 'pending' | 'approved' | 'rejected';
 }
 
 // How long to keep terminal (responded / resolved) followups on disk. The
@@ -47,6 +50,8 @@ const store = new PersistentMap<PendingFollowup>({
     if (!f) return false;
     // Always keep in-flight followups so escalation survives restart.
     if (f.status === 'pending' || f.status === 'escalated') return true;
+    // Keep extension requests that still await the leader's decision.
+    if (f.extensionStatus === 'pending') return true;
     // Keep terminal followups within the retention window for cooldowns.
     const anchor = f.respondedAt ?? f.sentAt ?? 0;
     return Date.now() - anchor < RETENTION_MS;
@@ -69,6 +74,55 @@ export function createFollowup(
 
 export function getFollowup(followupId: string): PendingFollowup | undefined {
   return store.get(followupId);
+}
+
+/** Remove a record whose card was never delivered, so it cannot suppress the
+ *  next reminder or qualify for a "no reply" escalation. */
+export function deleteFollowup(followupId: string): void {
+  store.delete(followupId);
+}
+
+/** Open follow-up for a specific owner AND task. Used when a card carries a
+ *  taskId but no followupId, so we never resolve an unrelated follow-up. */
+export function findOpenFollowupForOwnerTask(
+  ownerAad: string | undefined,
+  taskId: string
+): PendingFollowup | undefined {
+  if (!ownerAad || !taskId) return undefined;
+  const key = ownerAad.toLowerCase();
+  let latest: PendingFollowup | undefined;
+  for (const f of store.values()) {
+    if (f.taskId !== taskId || f.ownerAad.toLowerCase() !== key) continue;
+    if (f.status !== 'pending' && f.status !== 'escalated') continue;
+    if (!latest || f.sentAt > latest.sentAt) latest = f;
+  }
+  return latest;
+}
+
+/** Record that an extension to `dueIso` was proposed to the leader. */
+export function recordExtensionRequest(followupId: string, dueIso: string): void {
+  const f = store.get(followupId);
+  if (!f) return;
+  f.extensionRequestedTo = dueIso;
+  f.extensionStatus = 'pending';
+  store.set(followupId, f);
+}
+
+/** Extension requests still awaiting the leader's approve / reject. */
+export function findPendingExtensionRequests(): PendingFollowup[] {
+  return Array.from(store.values())
+    .filter((f) => f.extensionStatus === 'pending')
+    .sort((a, b) => (b.respondedAt ?? b.sentAt) - (a.respondedAt ?? a.sentAt));
+}
+
+export function setExtensionStatus(
+  followupId: string,
+  status: 'pending' | 'approved' | 'rejected'
+): void {
+  const f = store.get(followupId);
+  if (!f) return;
+  f.extensionStatus = status;
+  store.set(followupId, f);
 }
 
 /** Find the most-recent pending follow-up for a given owner AAD. Used when a

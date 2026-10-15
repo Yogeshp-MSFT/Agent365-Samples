@@ -14,23 +14,49 @@ import { TurnContext } from '@microsoft/agents-hosting';
 import type { Client } from '../client';
 import {
   findLatestOpenFollowupForOwner,
+  findOpenFollowupForOwnerTask,
+  findPendingExtensionRequests,
   getFollowup,
   markResolved,
   PendingFollowup,
+  recordExtensionRequest,
   recordOwnerResponse,
+  setExtensionStatus,
 } from '../state/followupStore';
-import { acknowledgePlannerTask, completePlannerTask, findOpenTaskByTitle, updatePlannerTaskDueDate, updatePlannerTaskTitle } from '../graph/plannerTools';
+import {
+  acknowledgePlannerTask,
+  completePlannerTask,
+  findOpenTaskByTitle,
+  getPlannerTaskDetails,
+  updatePlannerTaskDueDate,
+  updatePlannerTaskTitle,
+} from '../graph/plannerTools';
 import { resolveAadToUpn } from '../graph/peopleTools';
 import { sendBlockerMeetingCardDirect, sendExtensionRequestCardDirect, sendPlainDmToUser } from './followupCards';
+import { civilDateInZone, DISPLAY_TZ, zonedWallTimeToUtc } from '../util/time';
 
 export interface CardActionResult {
   handled: boolean;
   replyText?: string;
 }
 
-// Demo tenant runs in UTC, but the leader / owners are in India — propose
-// meeting times against IST wall-clock, matching what the leader sees.
-const DISPLAY_TZ = process.env.BRIEF_DISPLAY_TZ?.trim() || 'Asia/Kolkata';
+// Verbs a task owner sends from their own check-in / assignment card.
+const OWNER_VERBS = new Set(['ontrack', 'extend', 'blocked', 'complete']);
+// Verbs only the configured leader may trigger (extension, blocker, escalation cards).
+const LEADER_VERBS = new Set([
+  'approve_extend',
+  'reject_extend',
+  'reassign',
+  'book_meeting',
+  'defer_blocker',
+  'esc_reassign',
+  'esc_extend',
+  'esc_escalate',
+]);
+
+function sameAad(a: string | undefined, b: string | undefined): boolean {
+  return !!a && !!b && a.trim().toLowerCase() === b.trim().toLowerCase();
+}
 
 // ─── Idempotency guard for card invokes ───────────────────────────────────
 // Teams retries an Action.Submit invoke if the bot doesn't ack within ~5 s
@@ -80,47 +106,33 @@ function shouldSkipBookMeeting(key: string): boolean {
  * Kept deliberately simple: no availability lookups (the leader picks the one
  * that works). Deterministic → no LLM hallucinations.
  */
-function proposeMeetingSlots(now = new Date()): Array<{ label: string; iso: string }> {
+export function proposeMeetingSlots(now = new Date()): Array<{ label: string; iso: string }> {
   // The three hours-of-day we offer, in DISPLAY_TZ.
   const HOURS = [10, 14, 16];
   const slots: Array<{ label: string; iso: string }> = [];
 
-  // Walk business days starting tomorrow.
-  const nowTzYmd = new Intl.DateTimeFormat('en-CA', {
-    timeZone: DISPLAY_TZ,
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-  }).format(now);
-  const [ty, tm, td] = nowTzYmd.split('-').map(Number);
+  // Walk business days (in DISPLAY_TZ) starting tomorrow.
+  const today = civilDateInZone(now, DISPLAY_TZ);
 
   let dayOffset = 1;
   while (slots.length < 3) {
-    // Compute the date in DISPLAY_TZ terms.
-    // We use UTC midnight of the derived Y-M-D and then add the local hour;
-    // for common TZs (like IST which is UTC+5:30, no DST) that is stable
-    // enough for a demo. If DISPLAY_TZ has DST this drifts by ≤1 hour on
-    // transition days — acceptable for the demo scenario.
-    const base = new Date(Date.UTC(ty, tm - 1, td + dayOffset));
-    const dow = base.getUTCDay(); // 0=Sun, 6=Sat
+    // Civil date arithmetic only — the instant for each slot is computed from
+    // the zone's offset on that specific date, so DST zones stay correct.
+    const civil = new Date(Date.UTC(today.year, today.month - 1, today.day + dayOffset));
+    const dow = civil.getUTCDay(); // 0=Sun, 6=Sat
     dayOffset++;
     if (dow === 0 || dow === 6) continue; // skip weekends
 
     for (const hour of HOURS) {
       if (slots.length >= 3) break;
-      // IST is UTC+5:30 → subtract 330 min to get equivalent UTC instant.
-      // For non-IST TZs, use the local time as UTC (acceptable demo drift).
-      const offsetMin = DISPLAY_TZ === 'Asia/Kolkata' ? 330 : 0;
-      const localMs = Date.UTC(
-        base.getUTCFullYear(),
-        base.getUTCMonth(),
-        base.getUTCDate(),
+      const utc = zonedWallTimeToUtc(
+        civil.getUTCFullYear(),
+        civil.getUTCMonth() + 1,
+        civil.getUTCDate(),
         hour,
         0,
-        0
+        DISPLAY_TZ
       );
-      const utcMs = localMs - offsetMin * 60 * 1000;
-      const utc = new Date(utcMs);
 
       const dayLabel = utc.toLocaleDateString('en-GB', {
         weekday: 'short',
@@ -179,8 +191,26 @@ function computeNextDueDateIso(currentDueIso?: string | null): string {
  * Teams surfaces Action.Submit clicks as `activity.value = {verb, ...}`.
  * We also fall back to keyword matching in `activity.text`.
  */
+/**
+ * True only when the text affirmatively reports completion. Negations
+ * ("I have not completed…", "isn't done yet") and questions ("Is it done?")
+ * must never mutate Planner.
+ */
+export function isAffirmativeCompletion(rawText: string): boolean {
+  const text = rawText.toLowerCase().replace(/[\u2018\u2019]/g, "'").trim();
+  if (!text) return false;
+  if (text.includes('?')) return false;
+  if (/^(is|are|was|were|did|does|do|has|have|had|can|could|will|would|should|when|what|why|how|which|who)\b/.test(text)) {
+    return false;
+  }
+  const negation =
+    /\b(not|never|no longer|yet to|still working|still in progress|not yet|cannot|can't|won't|isn't|aren't|wasn't|weren't|haven't|hasn't|hadn't|didn't|doesn't|don't)\b|n't\b/;
+  return !negation.test(text);
+}
+
 function extractIntent(
-  context: TurnContext
+  context: TurnContext,
+  isLeader: boolean
 ): { verb: string; data: Record<string, unknown> } | null {
   const value = (context.activity as any).value as Record<string, unknown> | undefined;
   if (value && typeof value === 'object' && typeof (value as any).verb === 'string') {
@@ -215,17 +245,23 @@ function extractIntent(
     'i finished': 'complete',
     'im done': 'complete',
     "i'm done": 'complete',
-
-    approve: 'approve_extend',
-    'approve extension': 'approve_extend',
-    reject: 'reject_extend',
-    reassign: 'reassign',
-    defer: 'defer_blocker',
-    escalate: 'esc_escalate',
   };
+  // Leader card replies are only honored from the configured leader; for
+  // anyone else these words fall through to the normal conversational path.
+  if (isLeader) {
+    Object.assign(kwMap, {
+      approve: 'approve_extend',
+      'approve extension': 'approve_extend',
+      reject: 'reject_extend',
+      reassign: 'reassign',
+      defer: 'defer_blocker',
+      escalate: 'esc_escalate',
+    });
+  }
   for (const [kw, verb] of Object.entries(kwMap)) {
     if (text === kw || text.startsWith(kw + ' ')) {
       if (verb === 'complete') {
+        if (!isAffirmativeCompletion(rawText)) return null;
         const hint = extractQuotedTitleHint(rawText);
         return { verb, data: hint ? { taskTitleHint: hint } : {} };
       }
@@ -238,18 +274,17 @@ function extractIntent(
   //   "The task 'Send draft proposal to Mario' is completed"
   //   "Hi — I finished the Contoso proposal"
   //   "'Send proposal' is done"
-  // Two conditions: a completion verb appears AND either a quoted title
-  // hint is present OR the message is short enough to unambiguously mean
-  // "the task I was just asked about is done".
+  // Requires an affirmative completion statement (no negation or question)
+  // AND either a quoted title hint OR a short message that unambiguously
+  // means "the task I was just asked about is done".
   const completionVerbRegex = /\b(complet(?:ed?|ing)|finish(?:ed)?|done|closed?|wrapped(?:\s+up)?)\b/i;
-  if (completionVerbRegex.test(text)) {
+  if (completionVerbRegex.test(text) && isAffirmativeCompletion(rawText)) {
     const hint = extractQuotedTitleHint(rawText);
     if (hint) {
       return { verb: 'complete', data: { taskTitleHint: hint } };
     }
-    // Short message + completion verb → treat as "close my latest task".
-    // Ignore long-form messages (>140 chars) so we don't hijack a genuine
-    // question or narrative that happens to contain the word "done".
+    // Ignore long-form messages (>140 chars) so we don't hijack a narrative
+    // that happens to contain the word "done".
     if (rawText.length <= 140) {
       return { verb: 'complete', data: {} };
     }
@@ -278,14 +313,57 @@ function extractQuotedTitleHint(text: string): string | undefined {
   return undefined;
 }
 
-/** Given a verb + data + sender, resolve the target PendingFollowup. Prefers
- *  followupId from the card data; falls back to the sender's latest open one. */
+/** Resolve the PendingFollowup a verb targets.
+ *  - An explicit followupId from card data wins.
+ *  - A card that carries only a taskId (e.g. the assignment card's "Got it")
+ *    resolves ONLY a follow-up for that same task — never an unrelated one.
+ *  - Plain-text keyword replies fall back to the sender's latest open one. */
 function resolveTargetFollowup(
   data: Record<string, unknown>,
   senderAad: string | undefined
 ): PendingFollowup | undefined {
-  const fromData = typeof data.followupId === 'string' ? getFollowup(data.followupId) : undefined;
-  return fromData ?? findLatestOpenFollowupForOwner(senderAad);
+  if (typeof data.followupId === 'string' && data.followupId) return getFollowup(data.followupId);
+  if (typeof data.taskId === 'string' && data.taskId) {
+    return findOpenFollowupForOwnerTask(senderAad, data.taskId);
+  }
+  return findLatestOpenFollowupForOwner(senderAad);
+}
+
+/**
+ * Centralized authorization, evaluated before any verb runs.
+ *  - Leader verbs require the sender to be the configured leader.
+ *  - Owner verbs require the targeted follow-up to belong to the sender
+ *    (the leader may also act on any owner card).
+ *  - A taskId submitted in card data is honored only when it matches the
+ *    follow-up on record or a Planner task assigned to the sender.
+ * Returns an error message to show the sender, or undefined when allowed.
+ */
+async function authorizeIntent(
+  verb: string,
+  data: Record<string, unknown>,
+  followup: PendingFollowup | undefined,
+  senderAad: string | undefined,
+  isLeader: boolean
+): Promise<string | undefined> {
+  if (!senderAad) return "I couldn't verify who sent this, so I didn't change anything.";
+
+  if (LEADER_VERBS.has(verb)) {
+    return isLeader ? undefined : 'Only the leader can act on this card.';
+  }
+  if (!OWNER_VERBS.has(verb) || isLeader) return undefined;
+
+  if (followup && !sameAad(followup.ownerAad, senderAad)) {
+    return 'That check-in belongs to someone else, so I did not change it.';
+  }
+  const submittedTaskId = typeof data.taskId === 'string' && data.taskId ? data.taskId : undefined;
+  if (submittedTaskId && followup?.taskId !== submittedTaskId) {
+    const details = await getPlannerTaskDetails(submittedTaskId);
+    if (!details.ok) return "I couldn't verify that task in Planner, so I didn't change it.";
+    if (!details.assigneeAads.some((aad) => sameAad(aad, senderAad))) {
+      return 'That task is not assigned to you, so I did not change it.';
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -298,12 +376,19 @@ export async function handleCardActionIfAny(
   client: Client,
   leaderAad: string
 ): Promise<CardActionResult> {
-  const intent = extractIntent(context);
+  const senderAad = context.activity.from?.aadObjectId;
+  const isLeader = sameAad(senderAad, leaderAad);
+  const intent = extractIntent(context, isLeader);
   if (!intent) return { handled: false };
 
-  const senderAad = context.activity.from?.aadObjectId;
   const senderName = context.activity.from?.name ?? 'the user';
-  const followup = resolveTargetFollowup(intent.data, senderAad);
+  // Leader verbs target the follow-up named on the card; they must never
+  // fall back to the leader's own check-ins.
+  const followup = LEADER_VERBS.has(intent.verb)
+    ? typeof intent.data.followupId === 'string' && intent.data.followupId
+      ? getFollowup(intent.data.followupId)
+      : undefined
+    : resolveTargetFollowup(intent.data, senderAad);
 
   // Global per-activity dedupe. Teams reuses activity.id on invoke retries,
   // so if we've seen this exact click in the last 60 s we no-op — protects
@@ -313,18 +398,25 @@ export async function handleCardActionIfAny(
     ? `${activityId}:${intent.verb}`
     : `${intent.verb}:${followup?.followupId ?? senderAad ?? 'unknown'}:${JSON.stringify(intent.data)}`;
   if (shouldSkipCardInvoke(dedupeKey)) {
-    console.log(`[cardActionRouter] duplicate invoke suppressed verb=${intent.verb} key=${dedupeKey}`);
+    console.log(`[cardActionRouter] duplicate invoke suppressed verb=${intent.verb}`);
+    return { handled: true };
+  }
+
+  const denial = await authorizeIntent(intent.verb, intent.data, followup, senderAad, isLeader);
+  if (denial) {
+    console.warn(`[cardActionRouter] denied verb=${intent.verb} leader=${isLeader}`);
+    await context.sendActivity(denial);
     return { handled: true };
   }
 
   const startedAt = Date.now();
   console.log(
-    `[cardActionRouter] verb=${intent.verb} senderAad=${senderAad} matchedFollowup=${followup?.followupId ?? 'none'}`
+    `[cardActionRouter] verb=${intent.verb} leader=${isLeader} matchedFollowup=${followup?.followupId ?? 'none'}`
   );
   // Wrap the rest in a try/finally so we always log elapsed time — makes
   // "why did that card look slow" trivially observable.
   try {
-    return await routeIntent(context, client, leaderAad, intent, followup, senderName, senderAad);
+    return await routeIntent(context, client, leaderAad, intent, followup, senderName, senderAad, isLeader);
   } finally {
     const elapsed = Date.now() - startedAt;
     console.log(`[cardActionRouter] verb=${intent.verb} elapsed=${elapsed}ms`);
@@ -340,7 +432,8 @@ async function routeIntent(
   intent: { verb: string; data: Record<string, unknown> },
   followup: PendingFollowup | undefined,
   senderName: string,
-  senderAad: string | undefined
+  senderAad: string | undefined,
+  isLeader: boolean
 ): Promise<CardActionResult> {
   // ── Owner-side actions (respond to their own check-in card) ──
   if (intent.verb === 'ontrack') {
@@ -389,8 +482,19 @@ async function routeIntent(
     let resolvedTitle: string | undefined;
 
     if (!taskId && titleHint) {
-      const match = await findOpenTaskByTitle(titleHint, { assigneeAad: senderAad });
+      // Non-leaders may only complete tasks assigned to them.
+      const match = await findOpenTaskByTitle(titleHint, {
+        assigneeAad: senderAad,
+        onlyAssignedTo: isLeader ? undefined : senderAad,
+      });
       if (match.ok) {
+        if (match.matchType !== 'exact') {
+          // Completion is destructive — never apply it to a non-exact match.
+          await context.sendActivity(
+            `Did you mean **"${match.title}"**? If so, reply with the exact title in quotes, e.g. \`The task "${match.title}" is done\`. I haven't changed anything yet.`
+          );
+          return { handled: true };
+        }
         taskId = match.taskId;
         resolvedTitle = match.title;
       } else if (match.reason === 'ambiguous') {
@@ -399,19 +503,23 @@ async function routeIntent(
           `I found more than one open task that could match **"${titleHint}"**. Which one is it?\n${list}\n\nReply with the full title in quotes, or use the check-in card.`
         );
         return { handled: true };
-      } else if (match.reason === 'not_found') {
-        // Fall through — maybe the sender still has an open follow-up we
-        // can use as the target.
-        console.log(`[actionRouter] complete: no open Planner task matched hint="${titleHint}", falling back to followup`);
       } else if (match.reason === 'graph_error') {
         await context.sendActivity(
           `I tried to look up "${titleHint}" in Planner but the request failed. Please try again in a moment, or close it in Planner directly.`
         );
         return { handled: true };
+      } else {
+        // An explicit title that doesn't match must never fall back to a
+        // different task (it may already be complete, or be someone else's).
+        await context.sendActivity(
+          `I couldn't find an open task of yours titled **"${titleHint}"** — it may already be complete. I haven't changed anything.`
+        );
+        return { handled: true };
       }
     }
 
-    if (!taskId && followup) {
+    // Follow-up fallback only when the sender named no task at all.
+    if (!taskId && !titleHint && followup) {
       taskId = followup.taskId;
       resolvedTitle = followup.taskTitle;
     }
@@ -471,6 +579,7 @@ async function routeIntent(
       agentRationale: `Owner (${followup.ownerName ?? senderName}) requested more time via the check-in card.`,
     });
     if (res.ok) {
+      recordExtensionRequest(followup.followupId, suggestedNewDueDate);
       await context.sendActivity(
         `Thanks — I\'ve asked the leader to approve an extension to **${suggestedNewDueDate.slice(0, 10)}**. I\'ll DM you as soon as they decide.`
       );
@@ -527,60 +636,103 @@ async function routeIntent(
   }
 
   // ── Leader-side actions (respond to extension/blocker/escalation cards) ──
-  if (intent.verb === 'approve_extend') {
-    const newDueDate = typeof intent.data.newDueDate === 'string' ? intent.data.newDueDate : undefined;
-    if (followup) markResolved(followup.followupId, { extendedTo: newDueDate });
-
-    const taskId = followup?.taskId ?? (typeof intent.data.taskId === 'string' ? intent.data.taskId : undefined);
-    const taskTitle = followup?.taskTitle ?? 'the task';
-    const ownerAad = followup?.ownerAad ?? (typeof intent.data.ownerAad === 'string' ? intent.data.ownerAad : undefined);
-    const ownerName = followup?.ownerName ?? 'the owner';
-
-    // 1) Patch the existing Planner task's dueDateTime (no LLM, no duplicate).
-    let patchNote = '';
-    if (taskId && newDueDate) {
-      const r = await updatePlannerTaskDueDate(taskId, newDueDate);
-      if (r.ok) {
-        patchNote = ` Planner updated: due date moved to ${r.newDue.slice(0, 10)}.`;
-      } else {
-        patchNote = ` (Planner update failed: ${r.error} — you may need to edit the due date manually.)`;
-      }
-    } else if (!taskId) {
-      patchNote = ' (No taskId on record, so Planner was not updated automatically.)';
-    } else if (!newDueDate) {
-      patchNote = ' (No new due date on the button data, so Planner was not updated.)';
-    }
-
-    // 2) DM the owner deterministically — no LLM.
-    let ownerNote = '';
-    if (ownerAad) {
-      const dueLabel = newDueDate ? newDueDate.slice(0, 10) : 'the new date agreed with the leader';
-      const dmText =
-        `✅ **Extension approved: ${taskTitle}**\n\n` +
-        `The leader approved your extension request. Your new due date is **${dueLabel}**.\n\n` +
-        `The task in Planner has been updated. Reply here if anything else changes.`;
-      const r = await sendPlainDmToUser(client.getPeopleOpts(), ownerAad, dmText);
-      ownerNote = r.ok
-        ? ` ${ownerName} has been notified via DM.`
-        : ` (Tried to DM ${ownerName} but hit an error: ${r.error ?? 'unknown'}.)`;
-    } else {
-      ownerNote = ' (No owner AAD on record, so I couldn\'t DM them directly.)';
-    }
-
-    await context.sendActivity(`✅ Extension approved for "${taskTitle}".${patchNote}${ownerNote}`);
+  // Leader verbs other than extension decisions act on the follow-up named on
+  // the card; a bare keyword can't identify which task the leader means.
+  if (
+    LEADER_VERBS.has(intent.verb) &&
+    !followup &&
+    intent.verb !== 'approve_extend' &&
+    intent.verb !== 'reject_extend'
+  ) {
+    await context.sendActivity('Please use the buttons on the card so I know which task you mean.');
     return { handled: true };
   }
 
-  if (intent.verb === 'reject_extend') {
-    if (followup) markResolved(followup.followupId);
-    const prompt = `The Leader REJECTED an extension request.
-- task: ${followup?.taskTitle ?? '<unknown>'}
-- owner aad: ${followup?.ownerAad ?? '<unknown>'}
-- owner name: ${followup?.ownerName ?? 'the owner'}
+  if (intent.verb === 'approve_extend' || intent.verb === 'reject_extend') {
+    // Resolve the request: card buttons carry its followupId; a typed
+    // `approve` / `reject` resolves against requests awaiting a decision.
+    let target = followup;
+    if (!target) {
+      const pending = findPendingExtensionRequests();
+      if (pending.length === 0) {
+        await context.sendActivity('There are no extension requests waiting for your decision.');
+        return { handled: true };
+      }
+      if (pending.length > 1) {
+        const list = pending
+          .slice(0, 5)
+          .map((p) => `• "${p.taskTitle}" (${p.ownerName}) → ${p.extensionRequestedTo?.slice(0, 10) ?? '?'}`)
+          .join('\n');
+        await context.sendActivity(
+          `Several extension requests are waiting:\n${list}\n\nPlease use the buttons on the matching card so I update the right task.`
+        );
+        return { handled: true };
+      }
+      target = pending[0];
+    }
+
+    if (intent.verb === 'reject_extend') {
+      markResolved(target.followupId);
+      setExtensionStatus(target.followupId, 'rejected');
+      const prompt = `The Leader REJECTED an extension request.
+- task: ${target.taskTitle}
+- owner aad: ${target.ownerAad}
+- owner name: ${target.ownerName}
 
 DM the owner via mcp_TeamsServer: politely explain the extension wasn't approved and ask them to reply with what specifically is at risk of slipping. Keep it constructive, one short paragraph. Return a one-line summary of what you sent.`;
-    const summary = await client.invokeAgentWithScope(prompt);
-    await context.sendActivity(`❌ Extension rejected. ${summary}`);
+      const summary = await client.invokeAgentWithScope(prompt);
+      await context.sendActivity(`❌ Extension rejected. ${summary}`);
+      return { handled: true };
+    }
+
+    // The stored proposal is authoritative; button data is only a fallback
+    // for requests recorded before the proposal was persisted.
+    const newDueDate =
+      target.extensionRequestedTo ??
+      (typeof intent.data.newDueDate === 'string' ? intent.data.newDueDate : undefined);
+    const taskTitle = target.taskTitle;
+    const ownerName = target.ownerName;
+
+    if (!target.taskId || !newDueDate) {
+      await context.sendActivity(
+        `I couldn't apply the extension for "${taskTitle}" — the request has no ${!target.taskId ? 'task id' : 'proposed due date'} on record. Nothing was changed; please edit the due date in Planner.`
+      );
+      return { handled: true };
+    }
+
+    // 1) Patch Planner first; only a successful PATCH counts as approved.
+    const r = await updatePlannerTaskDueDate(target.taskId, newDueDate);
+    if (!r.ok) {
+      // Keep the request pending so the leader can retry.
+      const dm = await sendPlainDmToUser(
+        client.getPeopleOpts(),
+        target.ownerAad,
+        `⏳ **Extension approved, not yet synced: ${taskTitle}**\n\n` +
+          `The leader approved your extension to **${newDueDate.slice(0, 10)}**, but Planner hasn't been updated yet. Treat the current Planner due date as unchanged until I confirm.`
+      );
+      await context.sendActivity(
+        `⚠️ I couldn't update Planner for "${taskTitle}" (${r.error}). The request is still pending — click **Approve** again to retry, or edit the due date manually.` +
+          (dm.ok ? ` ${ownerName} was told the change isn't synced yet.` : '')
+      );
+      return { handled: true };
+    }
+
+    markResolved(target.followupId, { extendedTo: r.newDue });
+    setExtensionStatus(target.followupId, 'approved');
+
+    // 2) DM the owner deterministically — no LLM.
+    const dmText =
+      `✅ **Extension approved: ${taskTitle}**\n\n` +
+      `The leader approved your extension request. Your new due date is **${r.newDue.slice(0, 10)}**, and Planner has been updated.\n\n` +
+      `Reply here if anything else changes.`;
+    const dm = await sendPlainDmToUser(client.getPeopleOpts(), target.ownerAad, dmText);
+    const ownerNote = dm.ok
+      ? ` ${ownerName} has been notified via DM.`
+      : ` (Tried to DM ${ownerName} but hit an error: ${dm.error ?? 'unknown'}.)`;
+
+    await context.sendActivity(
+      `✅ Extension approved for "${taskTitle}". Planner updated: due date moved to ${r.newDue.slice(0, 10)}.${ownerNote}`
+    );
     return { handled: true };
   }
 
@@ -601,7 +753,8 @@ DM the leader via mcp_TeamsServer: ask them who to reassign to (reply with a nam
     const timeslot = typeof intent.data.timeslot === 'string' ? intent.data.timeslot : 'the proposed time';
     const timeslotIso =
       typeof intent.data.timeslotIso === 'string' ? intent.data.timeslotIso : undefined;
-    const ownerAad = (intent.data.ownerAad as string) ?? followup?.ownerAad;
+    const ownerAad =
+      followup?.ownerAad ?? (typeof intent.data.ownerAad === 'string' ? intent.data.ownerAad : undefined);
 
     // FIX: idempotency guard — Teams retries invokes on slow ack, which was
     // causing the whole flow to run twice (2 "Locked in…" messages, 2
@@ -625,7 +778,7 @@ DM the leader via mcp_TeamsServer: ask them who to reassign to (reply with a nam
       const ownerMsg =
         `📅 **Meeting scheduled to unblock: ${taskTitle}**\n\n` +
         `Time: ${timeslot}\n` +
-        `The leader (Mario) picked this slot. Calendar invite coming next.` +
+        `The leader (${process.env.LEADER_NAME?.trim() || 'the leader'}) picked this slot. Calendar invite coming next.` +
         (timeslotIso ? `\n\n_ISO start: ${timeslotIso}_` : '');
       const r = await sendPlainDmToUser(client.getPeopleOpts(), ownerAad, ownerMsg);
       ownerNotified = r.ok;
@@ -714,7 +867,9 @@ Steps:
         const bookResult = await client.invokeAgentWithScope(bookingPrompt);
         console.log('[book_meeting] mcp_CalendarTools raw result:', bookResult);
         const trimmed = (bookResult ?? '').trim();
-        const succeeded = /^ok\b/i.test(trimmed) || /booked/i.test(trimmed);
+        // The booking contract is exactly "OK" or "FAIL: <reason>"; anything
+        // else (including a failure that mentions "booked") is not success.
+        const succeeded = /^OK$/i.test(trimmed);
         const userMsg = succeeded
           ? `_📅 Calendar invite sent to ${ownerName} for ${timeslot}._`
           : `_Booking failed: ${trimmed || 'unknown error'}. You may need to create the invite manually._`;
@@ -795,6 +950,7 @@ async function handleActionForwardToExtendOffer(
     agentRationale: 'Auto-suggested after no reply to the follow-up.',
   });
   if (res.ok) {
+    if (followup) recordExtensionRequest(followup.followupId, suggestedNewDueDate);
     await context.sendActivity(
       `⏰ Extension offered. I've DM'd ${followup?.ownerName ?? 'the owner'} a card proposing a new due date of **${suggestedNewDueDate.slice(0, 10)}**.`
     );

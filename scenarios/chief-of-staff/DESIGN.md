@@ -49,10 +49,12 @@ below reflects one or more of them.
    cos-graph-worker application-permission token. No delegated /
    agentic-OBO Graph path exists — blueprint and agent-instance
    identities get no extra Graph scopes. See §7.
-5. **State is intentionally in-memory for the MVP.** All three stores
-   (`followupStore`, `pendingCaptureStore`, `conversationRefs`) are
-   `Map` instances. Fine for a demo; swap for persistent storage before
-   production (see §13).
+5. **State is file-persisted, single-instance.** The stores
+   (`followupStore`, `pendingCaptureStore`, `conversationRefs`, the Planner
+   progress baseline, and the scheduler's bootstrap reference) are
+   `PersistentMap`s backed by JSON files under `STATE_DIR`, so a restart
+   resumes where it left off. Swap for a shared backend before scaling out
+   (see §10.6 and §13).
 6. **The scheduler owns time. The agent owns turns.** Cron and pollers live
    in `scheduler.ts`. User-driven turns (message + Invoke) live in
    `agent.ts`. The two never share code paths — they only share the same
@@ -136,14 +138,12 @@ flowchart TB
   subgraph Scheduler
     CronB[CRON_BRIEF]
     CronF[CRON_FOLLOWUP + escalation sweep]
-    CronE[CRON_ESCALATE]
     PollM[POLL_MEETINGS_MS<br/>meetingWatcher + capturePoller]
     PollT[POLL_TASKS_MS<br/>plannerPoller]
   end
   CronB --> RunBrief[runBrief<br/>deterministic]
   CronF --> RunFollowup[runFollowup<br/>deterministic]
   CronF --> EscSweep[sweepStaleFollowupsAndEscalate]
-  CronE --> RunEscalate[runEscalate]
   PollM --> RunCapture[runCapture]
   PollT --> RunTaskComplete[runTaskComplete]
 
@@ -198,8 +198,10 @@ not code. They only touch each other through those stores.
    `agentApplication.run(context)`.
 4. The message handler (`handleUserMessage`) does two housekeeping steps
    before anything else:
-   - `cacheConversationReference(activity)` in `scheduler.ts` — this
-     unblocks all crons and pollers.
+   - `cacheConversationReference(activity)` in `scheduler.ts` — on a
+     brand-new deployment this unblocks all crons and pollers. The
+     reference is persisted (`scheduler-ref.json`) and restored at boot, so
+     later restarts don't need a new message.
    - `rememberConversationRef(activity)` in `state/conversationRefs.ts` —
      stores the sender's ref keyed by their AAD Object ID so future
      Adaptive Card DMs can reach them.
@@ -234,15 +236,28 @@ two-pass sweep inside `pollForNewTranscripts` (invoked by the meeting-poll
 setInterval, guarded by `meetingPollInFlight` — see §10.2):
 
 - **Pass 1 — discovery.** `discoverQualifyingMeetings` reads the calendar of
-  the graph-owner (CoS agent by default), filters to
-  `leader-organised AND CoS-invited`, resolves each event's `joinWebUrl` to
-  an `onlineMeetingId`, and adds any new ones to `pendingCaptureStore`.
+  the graph-owner (CoS agent by default) over a window that includes recent,
+  in-progress, and upcoming occurrences, and keeps Teams meetings where BOTH
+  the leader and the CoS agent are on the invite — regardless of who
+  organized them (delegates, other execs, and external organizers count).
+  It resolves each event's `joinWebUrl` to an `onlineMeetingId` and adds new
+  occurrences to `pendingCaptureStore`. An existing event whose start/end
+  moved is refreshed (`rescheduleCapture`), and a `gave-up` record is
+  reopened when the reschedule moves it into a new capture window.
 - **Pass 2 — retry sweep.** For each pending capture whose `nextCheckAt` has
-  arrived, `advanceCapture` tries to fetch the transcript and Copilot
-  insights, then decides one of three outcomes:
+  arrived, `advanceCapture` tries to fetch the transcript for **this
+  occurrence** (created between its scheduled start and its capture
+  deadline, and not already consumed by another capture — a recurring
+  meeting reuses its join URL) and the Copilot insights, then decides one
+  of three outcomes:
   1. **Ready** — transcript is here AND (insights arrived OR wait budget
      exhausted OR `attempts >= CAPTURE_MIN_ATTEMPTS_TRANSCRIPT_ONLY`).
-     Emits the capture to the scheduler, which fires `runCapture`.
+     The capture is marked `ready` (durably, with its artifacts) and emitted
+     to the scheduler, which fires `runCapture`. The scheduler marks it
+     `complete` only after `runCapture` succeeds; on failure it stays
+     `ready` and is retried (up to `CAPTURE_MAX_PROCESSING_FAILURES`,
+     default 3). `planner_create_task` skips titles that already exist, so a
+     retry doesn't duplicate tasks.
   2. **Give up** — no transcript after `CAPTURE_GIVE_UP_AFTER_HOURS`.
      Marks the capture `gave-up` and moves on.
   3. **Retry** — computes the next delay from a `[1, 3, 7, 15, 30]` minute
@@ -269,21 +284,22 @@ sequenceDiagram
   loop every POLL_MEETINGS_MS
     Watcher->>Cal: GET /users/{cos}/calendarView?…
     Cal-->>Watcher: 10 events
-    Watcher->>Watcher: filter leader-organised AND cos-invited
-    Watcher-->>Store: createPendingCapture per new eventId
+    Watcher->>Watcher: keep events with leader AND cos on the invite (any organizer)
+    Watcher-->>Store: createPendingCapture per new eventId (refresh if rescheduled)
     Store-->>Poller: findCapturesDueForCheck
     Poller->>Graph: GET /onlineMeetings/{id}/transcripts
-    Graph-->>Poller: transcript id
+    Graph-->>Poller: transcripts (pick the one for this occurrence)
     Poller->>Graph: GET transcript body (VTT)
     Graph-->>Poller: 1227 chars
-    Poller->>Graph: GET /copilot/…/aiInsights (v1.0 → beta)
+    Poller->>Graph: GET /copilot/…/aiInsights (v1.0, then beta)
     Graph-->>Poller: (empty or action items)
-    Poller->>Store: markCaptureComplete
+    Poller->>Store: markCaptureReady
     Poller-->>Cap: emit READY
     Cap->>LLM: dispatch prompt (transcript inlined)
-    LLM->>P: planner_create_task × N
+    LLM->>P: planner_create_task × N (with description; skips existing titles)
     LLM->>DM: send_task_assignment_card per owner
     LLM->>DM: post summary in meeting chat
+    Cap-->>Store: markCaptureComplete (only on success; else stays READY)
   end
 ```
 
@@ -628,7 +644,8 @@ Used for:
 - Verifying JWTs on `/api/messages` (the Bot Framework token).
 - Every `adapter.continueConversation(...)` call (proactive DMs).
 - Every `context.sendActivity(...)` reply.
-- The MCP tool servers (`ea9ffc3e-8a23-4a7d-836d-234d7c7565c1` audience).
+- The WorkIQ MCP tool servers — one agentic token per server audience with
+  `Tools.ListInvoke.All` (see Appendix B).
 - The Foundry client (`configureOpenAIClient` in `src/openai-config.ts`).
 
 ### 7.2 Graph identity (Graph API side)
@@ -639,12 +656,17 @@ Used for:
 `https://graph.microsoft.com/.default`). See
 [`src/graph/graphAppToken.ts`](src/graph/graphAppToken.ts).
 
-- Configured by three env vars: `GRAPH_APP_ID`, `GRAPH_APP_SECRET`,
-  `GRAPH_TENANT_ID` (see README §3b).
-- Application permissions granted on the worker app:
+- Configured by three **required** env vars: `GRAPH_APP_ID`,
+  `GRAPH_APP_SECRET`, `GRAPH_TENANT_ID` (see README §3b). There is no
+  delegated/OBO fallback; the startup banner reports ❌ and the first Graph
+  call fails with a descriptive error if any is missing.
+- Least-privilege application permissions granted on the worker app (eight):
   `Calendars.Read`, `OnlineMeetings.Read.All`,
   `OnlineMeetingTranscript.Read.All`, `OnlineMeetingAiInsight.Read.All`,
-  `Tasks.ReadWrite.All`, `User.Read.All`, `GroupMember.Read.All`.
+  `Tasks.ReadWrite.All`, `User.Read.All`, `GroupMember.Read.All`,
+  `ChatMember.Read.All` (read-only meeting-chat members for
+  `graph_list_meeting_attendees`). No chat create/write permission is
+  requested.
 - Meeting transcript / insight calls additionally require a Teams
   *application-access policy* granted to the CoS agent UPN (or
   tenant-wide).
@@ -669,10 +691,13 @@ OBO chain in demo tenants. The blueprint keeps only what
 
 **Adaptive Card DMs never use Graph.** They go through Bot Framework
 proactive messaging (`adapter.continueConversation`) using a cached
-`ConversationReference` for the recipient. If no reference is cached the
-card is skipped with a warning — the recipient must DM the agent (or
-install the app) at least once first. The reference store is persisted
-across restarts (`.cos-state/conversation-refs.json`).
+**personal (1:1)** `ConversationReference` for the recipient. Group-chat and
+channel references are never stored as DM destinations, and a non-personal
+reference is rejected at send time. If no reference is cached the send
+fails with a `no-conversation-ref` error and every caller reports `ok:false`
+(work stays retryable) — the recipient must DM the agent (or install the
+app) at least once first. The reference store is persisted across restarts
+(`.cos-state/conversation-refs.json`).
 
 
 ---
@@ -724,7 +749,7 @@ adapter.continueConversation(botAppId, ref, ctx => {
 });
 ```
 
-Requirements: `botAppId` (from `agent_id` env), a cached
+Requirements: `botAppId` (from `agent_id` env), a cached **personal**
 `ConversationReference` for the recipient (see §6.3), and a valid card
 object. The card builders live in `src/cards/briefTool.ts` and
 `src/cards/followupCards.ts`.
@@ -746,7 +771,12 @@ Two shapes, both handled:
 
 Both paths converge on `handleCardActionIfAny(context, client, leaderAad)`
 in `src/cards/actionRouter.ts`. That's the single entry point for every
-card-driven verb.
+card-driven verb. Before any verb runs, `authorizeIntent` checks the sender:
+leader-only verbs (`approve_extend`, `reject_extend`, `reassign`,
+`book_meeting`, `defer_blocker`, `esc_*`) require the configured leader;
+owner verbs must target a follow-up owned by the sender, and a `taskId`
+submitted in card data is honored only if it matches that follow-up or a
+Planner task assigned to the sender.
 
 ### 9.3 The verbs
 
@@ -868,21 +898,32 @@ debounced (200 ms) write on every mutation. This makes restarts safe:
 |---|---|---|---|
 | `pendingCaptureStore` | `pending-captures.json` | Terminal records older than `CAPTURE_STATE_RETENTION_DAYS` (30) | `transcriptContent`, insights arrays dropped for `complete`/`gave-up` records |
 | `followupStore` | `followups.json` | Terminal records older than `FOLLOWUP_STATE_RETENTION_HOURS` (72) | None |
-| `conversationRefs` | `conversation-refs.json` | None — refs are tiny and useful indefinitely | None |
+| `conversationRefs` | `conversation-refs.json` | None — refs are tiny and useful indefinitely | Only personal (1:1) references are stored |
 | `plannerPoller.lastProgress` | `planner-progress.json` | None — `{taskId: percent}` map | None |
+| `plannerPoller.pendingCompletions` | `planner-completions-pending.json` | Removed once every notification is delivered (or after `TASK_COMPLETE_MAX_ATTEMPTS`, default 12) | None |
+| scheduler bootstrap reference | `scheduler-ref.json` | None | None |
 
 **Guarantees:**
 
 - **No re-capture on restart.** `pendingCaptureStore.hasCaptureForEvent(eventId)`
   returns `true` for meetings captured in previous runs, so `runDiscoveryPass`
-  skips them.
+  doesn't create a second capture for them. A capture is marked `complete`
+  only after `runCapture` succeeds; a `ready` capture whose processing failed
+  or was interrupted is re-emitted on the next tick.
 - **No missed completions during downtime.** `plannerPoller` compares each
   poll against the last-known state from disk, so a `<100 → 100` transition
-  that happened while the process was down still fires on the next poll.
+  that happened while the process was down still fires on the next poll. A
+  transition is kept in `pendingCompletions` until its DMs are delivered;
+  recipients already notified are not messaged again on retry.
 - **No lost escalations across restart.** In-flight `pending`/`escalated`
   follow-ups are always kept (bypass TTL prune).
-- **No 're-DM the agent' friction.** Persisted `ConversationReference`s
-  let proactive cards fire immediately on boot.
+- **No 're-DM the agent' friction.** The scheduler's bootstrap
+  `ConversationReference` is persisted (`scheduler-ref.json`) and restored at
+  boot — or seeded from the leader's persisted personal chat — so crons and
+  pollers resume immediately after a restart, and persisted per-user
+  references let proactive cards reach recipients without a new "hi". Only a
+  brand-new deployment that has never received a message waits for the
+  first inbound message.
 
 **On-disk footprint:**
 
@@ -1009,8 +1050,10 @@ whenever something isn't working.
   `Agent` constructor in `src/client.ts` (spread it into `tools: [...]`).
   Use `additionalProperties: false` on every param schema — Azure OpenAI's
   strict validator requires it.
-- **MCP-backed**: add an entry to `ToolingManifest.json`. It'll be picked up
-  by `McpToolRegistrationService.addToolServersToAgent`.
+- **MCP-backed**: add the server with `a365 develop add-mcp-servers` (it
+  writes the catalog's `audience` and `scope` into `ToolingManifest.json`).
+  `addWorkIqServersToAgent` (`src/workiq.ts`) registers every manifest entry
+  with its own per-audience agentic token.
 
 ### 12.4 Add a new Adaptive Card
 
@@ -1023,13 +1066,18 @@ Copy the pattern in `src/cards/followupCards.ts`:
 
 ### 12.5 Change the leadership team gate
 
-`src/agent.ts` calls `client.isUserInTeam(senderAad, LEADERSHIP_TEAM_ID)`.
-`isUserInTeam` (in `src/graph/peopleTools.ts`) returns
-`true`/`false`/`null`. `null` means "no team configured, allow all". The LLM
-prompt (`buildUserTurnPrompt`) forwards the boolean into the system prompt
-so the LLM can refuse politely. To swap the gate for a Graph group
-membership check, an Entra dynamic group, or SharePoint list, just change
-that function.
+`src/agent.ts` calls `isUserInTeam(senderAad, LEADERSHIP_TEAM_ID, …)` before
+building the client. `isUserInTeam` (in `src/graph/peopleTools.ts`) returns
+`true`/`false`/`null`. `null` means only "no team configured". When a team
+IS configured, an unresolvable team id or a failed membership lookup returns
+`false` — the gate fails closed. The configured leader is always allowed.
+For `false`, the client is built with `restrictedAccess: true`, which omits
+the Planner, card, and WorkIQ MCP tools, so the restriction is enforced in
+the tool layer; the prompt (`buildUserTurnPrompt`) also tells the LLM to
+refuse politely. Card actions are authorized separately in
+`actionRouter.ts::authorizeIntent` (leader-only verbs, task ownership). To
+swap the gate for an Entra dynamic group or SharePoint list, change
+`isUserInTeam`.
 
 ---
 
@@ -1046,19 +1094,21 @@ prevent the demo. Address before pilot / production.
   wire it in `persistentMap.ts` (roughly a 90-minute lift).
 - **Escalation is best-effort during long downtimes.** If the process is
   down when a followup would have escalated, the escalation fires on the
-  next tick after boot (thanks to persistence) — delayed, not lost. If
-  you need real-time alerting during downtime, move followups to a
-  durable queue.
+  first follow-up tick after boot (the scheduler reference and follow-ups
+  are both persisted) — delayed, not lost. If the leader has no personal
+  chat reference yet, the escalation card fails with `no-conversation-ref`
+  and the follow-up stays pending for the next tick. If you need real-time
+  alerting during downtime, move followups to a durable queue.
 - **Card recipient must have DM'd the agent once.** Persisted, so this is
   a one-time cost per user — not per restart. But we still can't cold-start
   a card to a brand-new user. Fix: on first-time DM, use
   `mcp_TeamsServer.send_message` as a plain-text fallback that also
   establishes the ref.
-- **The Recall system prompt is best-effort.** The gate is enforced by the
-  LLM. A well-crafted prompt-injection could conceivably talk the LLM
-  around it. For production, refuse **before** the LLM turn if `inTeam=false`
-  and the message looks like a status query — server-side, not just via
-  system prompt.
+- **The Recall wording is LLM-generated.** Data access is enforced
+  server-side: senders outside the leadership team (or whose membership
+  can't be verified) get a client with no Planner, card, or WorkIQ MCP tools
+  (§12.5), so a prompt injection can't make the LLM read protected data. The
+  refusal *text* is still produced by the LLM.
 - **`transcriptContent` truncation.** Capped at `MAX_INLINE_TRANSCRIPT_CHARS`
   = 60 000 chars in `src/cos/capture.ts`. Very long meetings (> ~40 min of
   dense speech) may lose the tail. Fix: chunk + summarise, or upgrade to
@@ -1099,10 +1149,13 @@ cos-agent/
 │   ├── observability.ts                      # Shared A365 observability helpers (identity, token cache, baggage)
 │   ├── openai-config.ts                      # Azure OpenAI / Foundry client
 │   ├── startup-check.ts                      # Boot-time env validation banner
-│   ├── scheduler.ts                          # node-cron + polling + escalation sweep + meeting-poll dedup
+│   ├── security-policy.ts                    # ALLOW_DIRECT_USER_ACTIONS prompt policy
+│   ├── workiq.ts                             # WorkIQ MCP registration (manifest + per-audience agentic tokens)
+│   ├── scheduler.ts                          # node-cron + polling + escalation sweep + meeting-poll dedup + persisted bootstrap ref
 │   ├── util/
 │   │   ├── logger.ts                         # Level-based logger (LOG_LEVEL)
-│   │   └── httpLogger.ts                     # Global axios interceptor (LOG_HTTP)
+│   │   ├── httpLogger.ts                     # Global axios interceptor (LOG_HTTP)
+│   │   └── time.ts                           # BRIEF_DISPLAY_TZ formatting + DST-aware wall-clock → UTC
 │   ├── graph/
 │   │   ├── graphAppToken.ts                  # Standalone Graph worker (client_credentials via MSAL)
 │   │   ├── peopleTools.ts                    # graph_find_user + attendees + UPN↔AAD + isUserInTeam + acquireGraphToken
@@ -1126,10 +1179,10 @@ cos-agent/
 │       ├── brief.ts                          # deterministic Brief (no LLM)
 │       ├── capture.ts                        # LLM-driven action-item extraction
 │       ├── followup.ts                       # deterministic follow-up card fanout
-│       ├── escalate.ts                       # legacy standalone escalate (LLM, seldom used — CRON_ESCALATE)
-│       └── taskComplete.ts                   # deterministic task-complete DMs + followup cleanup
+│       └── taskComplete.ts                   # deterministic task-complete DMs (per-recipient delivery outcome) + followup cleanup
 ├── scripts/
-│   └── bootstrap-graph-app.ps1               # one-shot standalone Graph worker provisioning
+│   └── bootstrap-graph-app.ps1               # standalone Graph worker provisioning (exact lookup, verified consent, -RotateSecret)
+├── compare_grants.ps1                        # diagnostic: compare grants on two agent-instance SPs (pass your own app ids)
 ├── manifest/
 │   ├── manifest.json                         # Teams app manifest (Agent 365 shape)
 │   └── agenticUserTemplateManifest.json      # per-user template
@@ -1168,12 +1221,17 @@ Grouped by concern. Every var has a code default; only the ones marked
 
 | Env | Default | Notes |
 |---|---|---|
-| `NODE_ENV` | `production` | `development` binds to `127.0.0.1` and reads local `ToolingManifest.json` |
-| `HOST` | `0.0.0.0` in prod, `localhost` in dev | Express bind host |
-| `PORT` | `3978` | Express port |
+| `NODE_ENV` | `production` | Only changes the default bind host (`localhost` in `development`). Local-dev value — don't copy `development` to App Service |
+| `HOST` | `0.0.0.0` in prod, `localhost` in dev | Express bind host. `127.0.0.1` in `.env.template` is local-only; omit `HOST` on App Service |
+| `PORT` | `3978` | Express port (App Service supplies its own) |
 | `LOG_LEVEL` | `info` | `error`/`warn`/`info`/`debug`/`trace` |
 | `LOG_HTTP` | `false` | Log every axios call with status + latency (masked auth) |
 | `DEBUG` | — | Bot Framework SDK debug namespaces (`agents:*` prints a lot) |
+| `SKIP_TOOLING_ON_ERRORS` | `false` | `false`: a WorkIQ MCP registration failure fails the turn. `true`: continue without those tools |
+| `BEARER_TOKEN_<MCP_SERVER_NAME>` | — | Dev only, with `USE_AGENTIC_AUTH=false`: per-server MCP token for that server's audience (e.g. `BEARER_TOKEN_MCP_MAILTOOLS`) |
+
+WorkIQ MCP servers are always read from `ToolingManifest.json` (deploy it next
+to `dist/`); there is no Tooling Gateway discovery path.
 
 `ALLOW_DIRECT_USER_ACTIONS` defaults to `false`. Set it to `true` to allow
 authenticated direct requests to invoke action tools while keeping embedded
@@ -1221,8 +1279,7 @@ All **required**.
 
 | Env | Notes |
 |---|---|
-| `COS_AGENT_UPN` | **required** for capture — the agent's inviteable UPN |
-| `COS_AGENT_AAD_ID` | **required** for Adaptive Card DMs — the agent's user GUID |
+| `COS_AGENT_UPN` | **required** for capture — the agent's inviteable UPN. A meeting is captured when both the leader and this UPN are on the invite (any organizer) |
 | `CAPTURE_GRAPH_OWNER` | `cos-agent` (default) or `leader` — controls whose Graph paths we hit |
 | `TRANSCRIPT_WATCH_HOURS` | `4` |
 | `TRANSCRIPT_WATCH_FORWARD_HOURS` | `24` |
@@ -1231,10 +1288,12 @@ All **required**.
 | `INSIGHTS_MAX_WAIT_MINUTES` | `30` |
 | `CAPTURE_MIN_ATTEMPTS_TRANSCRIPT_ONLY` | `2` — attempt count after which we fire on transcript alone |
 | `CAPTURE_GIVE_UP_AFTER_HOURS` | `4` |
+| `CAPTURE_MAX_PROCESSING_FAILURES` | `3` — `runCapture` failures before a READY capture is abandoned |
 
-### A.6 Standalone Graph worker (path 1)
+### A.6 Standalone Graph worker (required)
 
-All three or none — set them together.
+All three are **required** — every Graph call uses this app; there is no
+OBO fallback.
 
 | Env |
 |---|
@@ -1275,8 +1334,7 @@ no TurnContext.
 | `SCHEDULER_ENABLED` | `true` |
 | `BRIEF_ENABLED` | `false` |
 | `CRON_BRIEF` | `0 8 * * 1-5` |
-| `CRON_FOLLOWUP` | `0 * * * *` |
-| `CRON_ESCALATE` | `0 */4 * * *` |
+| `CRON_FOLLOWUP` | `0 * * * *` (each tick also runs the deterministic escalation sweep) |
 | `CRON_TIMEZONE` | server-local (e.g. `Asia/Kolkata`) |
 | `POLL_MEETINGS_MS` | `60000` |
 | `POLL_TASKS_MS` | `300000` |
@@ -1309,22 +1367,24 @@ no TurnContext.
 
 ## Appendix B — MCP tools reference
 
-Registered by `McpToolRegistrationService.addToolServersToAgent` in
-`src/client.ts`, based on `ToolingManifest.json`.
+Registered by `addWorkIqServersToAgent` (`src/workiq.ts`), called from
+`getClient` in `src/client.ts`, based on `ToolingManifest.json`. Each server
+gets its own agentic token for `<audience>/Tools.ListInvoke.All`. Senders
+outside the leadership team get no MCP servers (see §12.5).
 
 | Tool server | Audience | Scope | What it exposes |
 |---|---|---|---|
-| `mcp_TeamsServer` | `ea9ffc3e-…` | `McpServers.Teams.All` | `get_meeting_transcript`, `send_message`, `create_chat`, meeting-chat listing |
-| `mcp_MailTools` | `ea9ffc3e-…` | `McpServers.Mail.All` | Mailbox read + send |
-| `mcp_CalendarTools` | `ea9ffc3e-…` | `McpServers.Calendar.All` | `book_meeting`, calendar listing/view |
+| `mcp_TeamsServer` | `ce5029ee-c1d3-45c0-bdcc-efb5a4245687` | `Tools.ListInvoke.All` | `get_meeting_transcript`, `send_message`, `create_chat`, meeting-chat listing |
+| `mcp_MailTools` | `16b1878d-62c7-4009-aa25-68989d63bbad` | `Tools.ListInvoke.All` | Mailbox read + send |
+| `mcp_CalendarTools` | `910333d2-47e9-43ca-981f-6df2f4531ef4` | `Tools.ListInvoke.All` | `book_meeting`, calendar listing/view |
 
 In-process (non-MCP) tools registered on the `Agent`:
 
 | Tool | Purpose |
 |---|---|
 | `planner_list_tasks` | List all tasks in the configured plan |
-| `planner_get_task` | Read one task |
-| `planner_create_task` | Create a task in the "New" bucket |
+| `planner_get_task` | Read one task, including its description |
+| `planner_create_task` | Create a task in the "New" bucket with an optional description (skips titles that already exist) |
 | `graph_find_user` | Directory search by name / email |
 | `graph_list_meeting_attendees` | For a chat, list attendees + AADs |
 | `send_brief_card` | Adaptive Card DM to leader (Brief) |

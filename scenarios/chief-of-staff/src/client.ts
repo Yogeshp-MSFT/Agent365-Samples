@@ -128,7 +128,18 @@ export interface ClientOptions {
    * run never reports the cached inbound caller as the human who ran it.
    */
   humanInitiated?: boolean;
+  /**
+   * True when the sender is outside the configured leadership team (or the
+   * membership check failed). The agent is then built WITHOUT Planner,
+   * calendar, mail, Teams, or card tools, so protected data can't be read
+   * regardless of what the prompt says.
+   */
+  restrictedAccess?: boolean;
 }
+
+// When false (default), a WorkIQ MCP registration failure fails the turn
+// instead of silently running without Teams/Mail/Calendar tools.
+const SKIP_TOOLING_ON_ERRORS = process.env.SKIP_TOOLING_ON_ERRORS?.trim().toLowerCase() === 'true';
 
 export async function getClient(
   authorization: Authorization,
@@ -148,32 +159,37 @@ export async function getClient(
     authHandlerName,
   };
   const humanInitiated = options.humanInitiated ?? true;
+  const restricted = options.restrictedAccess === true;
   // Groups every span this run emits (invoke_agent, chat, execute_tool).
   const runId = randomUUID();
   const scopeOptions = { sessionId: runId, humanInitiated, peopleOpts };
 
-  // Graph-backed Planner tools (mcp_PlannerServer isn't hosted in this tenant).
-  const plannerTools = createPlannerTools(peopleOpts);
-
   // Graph-backed people/directory tools: resolve display names to AAD Object IDs.
   const peopleTools = createPeopleTools(peopleOpts);
 
-  // Adaptive Card DM helper for the daily Brief.
-  const briefCardTool = createBriefCardTool(peopleOpts);
-
-  // Adaptive Card DM tools for the interactive Follow-up flow.
-  const followupCardTools = createFollowupCardTools(peopleOpts);
+  // Protected tools (Planner, cards) are only attached for authorized senders.
+  const protectedTools = restricted
+    ? []
+    : [
+        // Graph-backed Planner tools (mcp_PlannerServer isn't hosted in this tenant).
+        ...createPlannerTools(peopleOpts),
+        // Adaptive Card DM helper for the daily Brief.
+        createBriefCardTool(peopleOpts),
+        // Adaptive Card DM tools for the interactive Follow-up flow.
+        ...createFollowupCardTools(peopleOpts),
+      ];
 
   const agent = new Agent({
     name: 'Chief of Staff Agent',
     model: modelName,
     instructions: `${AGENT_INSTRUCTIONS}\n\nThe display name of the current user is "${displayName}".`,
-    tools: instrumentTools(
-      [...plannerTools, ...peopleTools, briefCardTool, ...followupCardTools],
-      turnContext,
-      scopeOptions
-    ),
+    tools: instrumentTools([...protectedTools, ...peopleTools], turnContext, scopeOptions),
   });
+
+  if (restricted) {
+    console.log('[client] restricted sender — Planner, card, and WorkIQ MCP tools not attached.');
+    return new CosAgentClient(agent, peopleOpts, humanInitiated, runId);
+  }
 
   try {
     await addWorkIqServersToAgent(
@@ -182,22 +198,21 @@ export async function getClient(
       authHandlerName,
       turnContext
     );
-    // Diagnostic — did MCP tool servers actually get attached?
     const attachedMcp = ((agent as any).mcpServers as any[] | undefined) ?? [];
-    if (attachedMcp.length === 0) {
-      console.warn(
-        '[client] MCP addToolServersToAgent returned no servers. ' +
-          'mcp_TeamsServer / mcp_MailTools / mcp_CalendarTools will be unavailable to the LLM.'
-      );
-    } else {
-      instrumentMcpServers(attachedMcp, turnContext, scopeOptions);
-      const names = attachedMcp.map((s: any) => s?.name ?? s?.serverName ?? '(unnamed)');
-      console.log(
-        `[client] MCP tool servers attached: ${attachedMcp.length} — ${names.join(', ')}`
+    instrumentMcpServers(attachedMcp, turnContext, scopeOptions);
+    const names = attachedMcp.map((s: any) => s?.name ?? s?.serverName ?? '(unnamed)');
+    console.log(
+      `[client] MCP tool servers attached: ${attachedMcp.length} — ${names.join(', ')}`
+    );
+  } catch (error) {
+    if (!SKIP_TOOLING_ON_ERRORS) {
+      throw new Error(
+        `WorkIQ MCP registration failed (set SKIP_TOOLING_ON_ERRORS=true to continue without these tools): ${
+          (error as Error)?.message ?? error
+        }`
       );
     }
-  } catch (error) {
-    console.warn('[client] Failed to register MCP tool servers:', error);
+    console.warn('[client] Failed to register MCP tool servers (SKIP_TOOLING_ON_ERRORS=true — continuing):', error);
   }
 
   return new CosAgentClient(agent, peopleOpts, humanInitiated, runId);

@@ -37,6 +37,9 @@ export interface PendingCapture {
   organizerAad?: string;
   ownerUpn: string; // whose Graph path to query — normally LEADER_UPN
   chatId?: string;
+  /** Scheduled start of THIS occurrence (epoch ms). Used to match transcripts
+   *  to the right occurrence of a recurring meeting. */
+  startTime?: number;
   endTime: number; // epoch ms
   durationMinutes: number;
   waitBudgetMinutes: number; // computed at creation
@@ -47,6 +50,8 @@ export interface PendingCapture {
   status: CaptureStatus;
   attempts: number;
   nextCheckAt: number; // epoch ms
+  /** Downstream (runCapture) failures for a READY capture. */
+  processingFailures?: number;
 
   // Fetched artifacts
   transcriptId?: string;
@@ -102,6 +107,19 @@ export function hasCaptureForEvent(eventId: string): boolean {
   return store.has(eventId);
 }
 
+export function getCapture(eventId: string): PendingCapture | undefined {
+  return store.get(eventId);
+}
+
+/** True when another capture already consumed this transcript — prevents a
+ *  later occurrence of a recurring meeting from re-processing it. */
+export function isTranscriptClaimed(transcriptId: string, exceptEventId: string): boolean {
+  for (const c of store.values()) {
+    if (c.eventId !== exceptEventId && c.transcriptId === transcriptId) return true;
+  }
+  return false;
+}
+
 export function createPendingCapture(
   input: Omit<
     PendingCapture,
@@ -125,11 +143,13 @@ export function createPendingCapture(
   return record;
 }
 
-/** Return all captures whose next-check time has arrived. */
+/** Return all captures whose next-check time has arrived: pending captures
+ *  to advance, plus READY captures whose processing still needs to run
+ *  (e.g. after a restart or a downstream failure). */
 export function findCapturesDueForCheck(now: number = Date.now()): PendingCapture[] {
   const due: PendingCapture[] = [];
   for (const c of store.values()) {
-    if (c.status !== 'pending') continue;
+    if (c.status !== 'pending' && c.status !== 'ready') continue;
     if (c.nextCheckAt <= now) due.push(c);
   }
   return due;
@@ -144,6 +164,64 @@ export function updateCapture(
   Object.assign(c, patch);
   store.set(eventId, c); // triggers debounced write
   return c;
+}
+
+/** Artifacts are collected; processing has not succeeded yet. The fat fields
+ *  stay (in memory and on disk) so a restart or retry can reprocess. */
+export function markCaptureReady(eventId: string): void {
+  const c = store.get(eventId);
+  if (!c) return;
+  c.status = 'ready';
+  c.nextCheckAt = Date.now();
+  store.set(eventId, c);
+}
+
+const MAX_PROCESSING_FAILURES = Number(process.env.CAPTURE_MAX_PROCESSING_FAILURES ?? '3');
+
+/** runCapture failed: keep the capture READY and retry later, or give up
+ *  after MAX_PROCESSING_FAILURES so a poison payload can't loop forever. */
+export function markCaptureProcessingFailed(eventId: string): 'retry' | 'gave-up' {
+  const c = store.get(eventId);
+  if (!c) return 'gave-up';
+  c.processingFailures = (c.processingFailures ?? 0) + 1;
+  if (c.processingFailures >= MAX_PROCESSING_FAILURES) {
+    store.set(eventId, c);
+    markCaptureGaveUp(eventId);
+    return 'gave-up';
+  }
+  c.status = 'ready';
+  c.nextCheckAt = Date.now() + pickNextRetryDelayMinutes(c.processingFailures, 30) * 60 * 1000;
+  store.set(eventId, c);
+  return 'retry';
+}
+
+/**
+ * The calendar event behind an existing capture moved. Refresh its timing and
+ * deadlines; reopen a gave-up record whose new window hasn't passed yet.
+ * Completed captures are left untouched (dedupe of processed occurrences).
+ */
+export function rescheduleCapture(
+  eventId: string,
+  timing: { startTime?: number; endTime: number; durationMinutes: number; waitBudgetMinutes: number; giveUpAfter: number }
+): 'updated' | 'reopened' | 'unchanged' {
+  const c = store.get(eventId);
+  if (!c || c.status === 'complete') return 'unchanged';
+  const moved = c.endTime !== timing.endTime || (timing.startTime !== undefined && c.startTime !== timing.startTime);
+  if (!moved) return 'unchanged';
+  Object.assign(c, timing);
+  let result: 'updated' | 'reopened' = 'updated';
+  if (c.status === 'gave-up' && timing.giveUpAfter > Date.now()) {
+    c.status = 'pending';
+    c.attempts = 0;
+    c.processingFailures = 0;
+    c.transcriptId = undefined;
+    c.transcriptFetchedAt = undefined;
+    c.insightsFetched = false;
+    result = 'reopened';
+  }
+  if (c.status === 'pending') c.nextCheckAt = Date.now();
+  store.set(eventId, c);
+  return result;
 }
 
 export function markCaptureComplete(eventId: string): void {

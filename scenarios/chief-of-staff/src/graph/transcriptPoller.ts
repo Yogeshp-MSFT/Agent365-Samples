@@ -4,14 +4,16 @@
 // Meeting capture orchestrator. Replaces the old tenant-wide getAllTranscripts
 // polling. Every tick it does two passes:
 //
-//   1. DISCOVERY — calendar-view over the leader's recent meetings, filtered
-//      to (leader-organized + CoS agent invited + already ended). New ones
-//      become pending captures with a wait budget scaled to meeting length.
+//   1. DISCOVERY — calendar-view over recent + upcoming meetings where BOTH
+//      the leader and the CoS agent are on the invite (any organizer). New
+//      occurrences become pending captures with a wait budget scaled to
+//      meeting length; existing ones are refreshed if they were rescheduled.
 //
 //   2. RETRY SWEEP — for each pending capture whose next-check has arrived,
-//      fetch its transcript + AI insights. When either "transcript + insights"
-//      or "transcript + wait budget exhausted" is true, mark it READY. If the
-//      transcript still isn't there past giveUpAfter, give up.
+//      fetch the transcript that belongs to THIS occurrence + AI insights.
+//      When ready, the capture is marked READY (not complete) and returned.
+//      The scheduler acknowledges it as complete only after runCapture
+//      succeeds; a failure leaves it READY for a later retry.
 //
 // Returns the READY captures so the scheduler can fire runCapture on each.
 
@@ -22,17 +24,20 @@ import {
   fetchTranscriptContent,
   fetchTranscriptsForMeeting,
   InsightsResult,
+  TranscriptSummary,
 } from './meetingArtifactsFetch';
 import {
   computeWaitBudget,
   createPendingCapture,
   findCapturesDueForCheck,
   hasCaptureForEvent,
+  isTranscriptClaimed,
   listAll,
-  markCaptureComplete,
   markCaptureGaveUp,
+  markCaptureReady,
   PendingCapture,
   pickNextRetryDelayMinutes,
+  rescheduleCapture,
   SimpleActionItem,
   SimpleMeetingNote,
   updateCapture,
@@ -41,6 +46,8 @@ import { log } from '../util/logger';
 
 // Kept the exported name so scheduler.ts doesn't need a diff for the import.
 export interface DetectedTranscript {
+  /** Calendar event id — the scheduler acknowledges completion with it. */
+  eventId: string;
   meetingId: string;
   transcriptId: string;
   organizerId: string;
@@ -147,12 +154,27 @@ async function runDiscoveryPass(
 
   let newlyTracked = 0;
   for (const m of meetings) {
-    if (hasCaptureForEvent(m.eventId)) continue;
     const budget = computeWaitBudget(m.durationMinutes, {
       multiplier: cfg.insightsMultiplier,
       minMinutes: cfg.insightsMinMinutes,
       maxMinutes: cfg.insightsMaxMinutes,
     });
+    const giveUpAfter = m.endTime + cfg.giveUpAfterHours * 60 * 60 * 1000;
+    if (hasCaptureForEvent(m.eventId)) {
+      // The same event id can move (reschedule). Refresh its deadlines so it
+      // isn't abandoned before the meeting happens.
+      const outcome = rescheduleCapture(m.eventId, {
+        startTime: m.startTime,
+        endTime: m.endTime,
+        durationMinutes: m.durationMinutes,
+        waitBudgetMinutes: budget,
+        giveUpAfter,
+      });
+      if (outcome !== 'unchanged') {
+        log.info('capturePoller', `meeting "${m.subject}" was rescheduled — capture ${outcome}`);
+      }
+      continue;
+    }
     createPendingCapture({
       eventId: m.eventId,
       meetingId: m.meetingId,
@@ -160,10 +182,11 @@ async function runDiscoveryPass(
       organizerAad: m.organizerAad,
       ownerUpn: cfg.graphOwnerUpn,
       chatId: undefined,
+      startTime: m.startTime,
       endTime: m.endTime,
       durationMinutes: m.durationMinutes,
       waitBudgetMinutes: budget,
-      giveUpAfter: m.endTime + cfg.giveUpAfterHours * 60 * 60 * 1000,
+      giveUpAfter,
     });
     log.debug(
       'capturePoller',
@@ -204,6 +227,13 @@ async function advanceCapture(
   cap: PendingCapture,
   now: number
 ): Promise<DetectedTranscript | undefined> {
+  // Already READY (restart, or an earlier runCapture failed): re-emit the
+  // stored payload without refetching. It is acknowledged only on success.
+  if (cap.status === 'ready' && cap.transcriptId) {
+    log.info('capturePoller', `re-emitting READY capture "${cap.subject}" for processing`);
+    return toDetectedTranscript(cap);
+  }
+
   // Bump attempts up front so the retry ladder advances even on failures.
   cap.attempts += 1;
 
@@ -225,20 +255,29 @@ async function advanceCapture(
     return undefined;
   }
 
-  // 1) Ensure we have the transcript.
+  // 1) Ensure we have the transcript for THIS occurrence. A recurring meeting
+  //    reuses its join URL, so the list can contain earlier occurrences'
+  //    transcripts — pick only one created during this occurrence that no
+  //    other capture has already consumed.
   if (!cap.transcriptId) {
     const transcripts = await fetchTranscriptsForMeeting(
       opts,
       cap.ownerUpn,
       cap.meetingId
     );
-    if (transcripts.length > 0) {
+    const match = selectTranscriptForOccurrence(transcripts, cap, now);
+    if (match) {
       updateCapture(cap.eventId, {
-        transcriptId: transcripts[0].transcriptId,
+        transcriptId: match.transcriptId,
         transcriptFetchedAt: now,
       });
-      cap.transcriptId = transcripts[0].transcriptId;
+      cap.transcriptId = match.transcriptId;
       cap.transcriptFetchedAt = now;
+    } else if (transcripts.length > 0) {
+      log.debug(
+        'capturePoller',
+        `"${cap.subject}": ${transcripts.length} transcript(s) found, none belong to this occurrence yet`
+      );
     }
   }
 
@@ -323,25 +362,11 @@ async function advanceCapture(
       )} transcript=✓ content=${cap.transcriptContent ? `✓ (${cap.transcriptContent.length}ch)` : '✗'} insights=${insightsCount > 0 ? `✓ (${insightsCount})` : '✗'} after ${cap.attempts} attempt(s)`
     );
 
-    // Snapshot the fat fields BEFORE markCaptureComplete() runs. That
-    // helper strips transcriptContent / insightsActionItems /
-    // insightsMeetingNotes in place (same object reference as `cap`), so
-    // reading them AFTER the mark-complete call yields undefined and the
-    // downstream LLM gets an empty transcript → hallucinates a fetch
-    // error. See pendingCaptureStore.markCaptureComplete().
-    const result = {
-      meetingId: cap.meetingId,
-      transcriptId: cap.transcriptId!,
-      organizerId: cap.organizerAad ?? '',
-      chatId: cap.chatId,
-      subject: cap.subject,
-      transcriptContent: cap.transcriptContent,
-      insightsAvailable: insightsCount > 0,
-      actionItems: cap.insightsActionItems,
-      meetingNotes: cap.insightsMeetingNotes,
-    };
-    markCaptureComplete(cap.eventId);
-    return result;
+    // Durably READY — NOT complete. The scheduler acknowledges completion
+    // only after runCapture succeeds, so a downstream failure or a restart
+    // re-emits this capture instead of silently dropping the meeting.
+    markCaptureReady(cap.eventId);
+    return toDetectedTranscript(cap);
   }
 
   // 4) Schedule next retry.
@@ -352,4 +377,51 @@ async function advanceCapture(
     `not ready — next check for "${cap.subject}" in ${delayMin} min (waitBudget=${cap.waitBudgetMinutes} min, waitedSoFar=${((now - (cap.transcriptFetchedAt ?? cap.endTime)) / 60000).toFixed(1)} min)`
   );
   return undefined;
+}
+
+/** Build the scheduler payload from a capture's stored artifacts. */
+function toDetectedTranscript(cap: PendingCapture): DetectedTranscript {
+  const insightsCount =
+    (cap.insightsActionItems?.length ?? 0) + (cap.insightsMeetingNotes?.length ?? 0);
+  return {
+    eventId: cap.eventId,
+    meetingId: cap.meetingId,
+    transcriptId: cap.transcriptId!,
+    organizerId: cap.organizerAad ?? '',
+    chatId: cap.chatId,
+    subject: cap.subject,
+    transcriptContent: cap.transcriptContent,
+    insightsAvailable: insightsCount > 0,
+    actionItems: cap.insightsActionItems,
+    meetingNotes: cap.insightsMeetingNotes,
+  };
+}
+
+// Transcripts are created when recording starts, so allow a little slack
+// before the scheduled start for meetings that begin early.
+const OCCURRENCE_EARLY_SLACK_MS = 15 * 60 * 1000;
+
+/**
+ * Pick the transcript that belongs to this calendar occurrence: created
+ * between (scheduled start - slack) and the capture deadline, and not
+ * already consumed by another capture. Upcoming occurrences never match
+ * an earlier occurrence's transcript.
+ */
+export function selectTranscriptForOccurrence(
+  transcripts: TranscriptSummary[],
+  cap: Pick<PendingCapture, 'eventId' | 'startTime' | 'endTime' | 'durationMinutes' | 'giveUpAfter'>,
+  now: number
+): TranscriptSummary | undefined {
+  const start = cap.startTime ?? cap.endTime - cap.durationMinutes * 60 * 1000;
+  if (now < start - OCCURRENCE_EARLY_SLACK_MS) return undefined;
+  const windowStart = start - OCCURRENCE_EARLY_SLACK_MS;
+  const windowEnd = Math.max(cap.giveUpAfter, now);
+  const candidates = transcripts
+    .filter((t) => !isTranscriptClaimed(t.transcriptId, cap.eventId))
+    .filter((t) => {
+      const created = t.createdDateTime ? Date.parse(t.createdDateTime) : NaN;
+      return Number.isFinite(created) && created >= windowStart && created <= windowEnd;
+    })
+    .sort((a, b) => Date.parse(a.createdDateTime!) - Date.parse(b.createdDateTime!));
+  return candidates[0];
 }

@@ -31,7 +31,7 @@ import {
 } from '../cards/followupCards';
 import { getBotAppId, sendCardProactively } from '../cards/proactiveSend';
 import { hasConversationRef } from '../state/conversationRefs';
-import { createFollowup, listAll, markResolved } from '../state/followupStore';
+import { createFollowup, deleteFollowup, listAll, markResolved } from '../state/followupStore';
 import { getPlannerPlanId } from '../graph/plannerConfig';
 
 const GRAPH_BASE = 'https://graph.microsoft.com/v1.0';
@@ -283,8 +283,11 @@ export async function runFollowup(
         `[followup] ✔ sent check-in to ${ownerName} (${ownerAad}) for "${t.title}" (due ${t.dueDateTime?.slice(0, 10)})`
       );
     } catch (err) {
+      // The owner never received this reminder: drop the record so the next
+      // tick retries and the escalation sweep can't report it as ignored.
+      deleteFollowup(record.followupId);
       skipped.push(`"${t.title}" send failed: ${(err as Error)?.message}`);
-      console.error(`[followup] send failed for "${t.title}":`, (err as Error)?.message);
+      console.error(`[followup] send failed for "${t.title}" — will retry next tick:`, (err as Error)?.message);
     }
   }
 

@@ -21,9 +21,10 @@
 
 import { tool } from '@openai/agents';
 import { Authorization, CloudAdapter, TurnContext } from '@microsoft/agents-hosting';
-import { createFollowup, PendingFollowup } from '../state/followupStore';
+import { createFollowup, deleteFollowup, PendingFollowup } from '../state/followupStore';
 import { getBotAppId, sendCardProactively } from './proactiveSend';
 import { hasConversationRef } from '../state/conversationRefs';
+import { formatDisplayDate } from '../util/time';
 
 export interface CardToolOptions {
   authorization: Authorization;
@@ -33,13 +34,14 @@ export interface CardToolOptions {
 
 // ─── Shared card-send helper ───────────────────────────────────────────────
 // Delivery: Bot Framework proactive send only
-// (adapter.continueConversation). Requires a cached ConversationReference
-// for the recipient — created the first time they DM the agent or install
-// the app. Sub-second latency, no Graph call, no blueprint permissions.
+// (adapter.continueConversation). Requires a cached personal
+// ConversationReference for the recipient — created the first time they DM
+// the agent or install the app. Sub-second latency, no Graph call, no
+// blueprint permissions.
 //
-// If no ref is cached we log a clear warning and return conversationId=undefined.
-// The caller (LLM) will see `ok:false` and can surface the bootstrap ask
-// ("please DM me once first") to the leader.
+// If no reference is cached this THROWS a `no-conversation-ref` error so every
+// caller reports ok:false and keeps its work retryable. It never reports a
+// delivery that did not happen.
 async function sendCardToUser(
   opts: CardToolOptions,
   recipientAad: string,
@@ -47,12 +49,10 @@ async function sendCardToUser(
   _attachmentId: string
 ): Promise<{ conversationId: string | undefined }> {
   if (!hasConversationRef(recipientAad)) {
-    console.warn(
-      `[cards/sendCardToUser] No cached ConversationReference for aad=${recipientAad} — ` +
-        `recipient must DM the Chief of Staff agent (or install the app) at least once ` +
-        `before we can DM them a card. Skipping delivery.`
+    throw new Error(
+      `no-conversation-ref: recipient aad=${recipientAad} has not DM'd the Chief of Staff agent ` +
+        `(or installed the app) yet, so there is no personal chat to deliver the card to.`
     );
-    return { conversationId: undefined };
   }
   const adapter = (opts.context as any).adapter as CloudAdapter;
   const result = await sendCardProactively({
@@ -207,13 +207,7 @@ export interface FollowupCheckInArgs {
 }
 
 export function buildFollowupCheckInCard(args: FollowupCheckInArgs, followupId: string): object {
-  const dueLabel = args.dueDate
-    ? new Date(args.dueDate).toLocaleDateString(undefined, {
-        weekday: 'short',
-        month: 'short',
-        day: 'numeric',
-      })
-    : 'No due date';
+  const dueLabel = args.dueDate ? formatDisplayDate(args.dueDate) : 'No due date';
   const firstName = args.ownerName?.split(' ')[0] ?? 'there';
   return {
     type: 'AdaptiveCard',
@@ -269,8 +263,9 @@ export function createFollowupCheckInTool(opts: CardToolOptions) {
     } as any,
     execute: async (rawArgs: unknown) => {
       const args = (rawArgs ?? {}) as FollowupCheckInArgs;
+      let record: PendingFollowup | undefined;
       try {
-        const record: PendingFollowup = createFollowup({
+        record = createFollowup({
           taskId: args.taskId,
           taskTitle: args.taskTitle,
           ownerAad: args.ownerAadObjectId,
@@ -285,6 +280,9 @@ export function createFollowupCheckInTool(opts: CardToolOptions) {
           conversationId,
         });
       } catch (err) {
+        // An undelivered check-in must not suppress the next reminder or be
+        // escalated as "ignored".
+        if (record) deleteFollowup(record.followupId);
         return toolFail('send_followup_check_in_card', err);
       }
     },
@@ -304,12 +302,7 @@ export interface ExtensionRequestArgs {
 }
 
 function buildExtensionRequestCard(args: ExtensionRequestArgs): object {
-  const fmt = (iso: string) =>
-    new Date(iso).toLocaleDateString(undefined, {
-      weekday: 'short',
-      month: 'short',
-      day: 'numeric',
-    });
+  const fmt = (iso: string) => formatDisplayDate(iso);
   const current = args.currentDueDate ? fmt(args.currentDueDate) : 'unknown';
   const newDate = fmt(args.suggestedNewDueDate);
   const body: any[] = [
@@ -410,14 +403,31 @@ export interface BlockerMeetingArgs {
   ownerAadObjectId: string;
   blockerSummary: string;
   proposedTimes: string[]; // human strings, e.g. ["Tue 2 PM", "Wed 10 AM"]
-  /** Optional parallel array of ISO strings for each proposedTimes slot.
-   *  When provided, the "Book …" buttons carry the ISO in data.timeslotIso so
-   *  the book_meeting handler doesn't have to ask the LLM to parse the human
-   *  string. */
-  proposedTimesIso?: string[];
+  /** Parallel array of ISO strings, one per proposedTimes slot. Every
+   *  "Book …" button carries its ISO in data.timeslotIso so the book_meeting
+   *  handler never has to parse the human string. */
+  proposedTimesIso: string[];
+}
+
+/** Every booking button must carry a valid, future ISO start time. */
+export function validateProposedTimes(args: Pick<BlockerMeetingArgs, 'proposedTimes' | 'proposedTimesIso'>): string | undefined {
+  const times = args.proposedTimes ?? [];
+  const isos = args.proposedTimesIso ?? [];
+  if (times.length === 0) return 'proposedTimes must contain at least one slot';
+  if (isos.length !== times.length) {
+    return 'proposedTimesIso must have one ISO start time for each proposedTimes entry';
+  }
+  for (const iso of isos.slice(0, 3)) {
+    const ms = Date.parse(iso);
+    if (Number.isNaN(ms)) return `proposedTimesIso contains an invalid ISO timestamp: ${iso}`;
+    if (ms < Date.now()) return `proposedTimesIso contains a time in the past: ${iso}`;
+  }
+  return undefined;
 }
 
 export function buildBlockerMeetingCard(args: BlockerMeetingArgs): object {
+  const invalid = validateProposedTimes(args);
+  if (invalid) throw new Error(invalid);
   const timeActions = args.proposedTimes.slice(0, 3).map((t, i) =>
     actionButton(`📅 Book ${t}`, 'book_meeting', {
       followupId: args.followupId,
@@ -491,6 +501,12 @@ export function createBlockerMeetingTool(opts: CardToolOptions) {
           items: { type: 'string' },
           description: 'Human-readable time slots — e.g. ["Tue 2 PM", "Wed 10 AM"]. Max 3.',
         },
+        proposedTimesIso: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'ISO 8601 UTC start time for each entry in proposedTimes, in the same order and of the same length. Each booking button uses this value.',
+        },
       },
       required: [
         'leaderAadObjectId',
@@ -501,11 +517,14 @@ export function createBlockerMeetingTool(opts: CardToolOptions) {
         'ownerAadObjectId',
         'blockerSummary',
         'proposedTimes',
+        'proposedTimesIso',
       ],
     } as any,
     execute: async (rawArgs: unknown) => {
       const args = (rawArgs ?? {}) as BlockerMeetingArgs;
       try {
+        const invalid = validateProposedTimes(args);
+        if (invalid) return toolFail('send_blocker_meeting_card', invalid);
         const card = buildBlockerMeetingCard(args);
         const { conversationId } = await sendCardToUser(opts, args.leaderAadObjectId, card, 'blocker-meeting');
         return JSON.stringify({ ok: true, conversationId });
@@ -528,7 +547,9 @@ interface EscalationArgs {
 }
 
 function buildEscalationCard(args: EscalationArgs): object {
-  const dueLabel = args.dueDate ? `Due ${new Date(args.dueDate).toLocaleDateString()}` : 'No due date';
+  const dueLabel = args.dueDate
+    ? `Due ${formatDisplayDate(args.dueDate, { year: 'numeric', month: 'numeric', day: 'numeric' })}`
+    : 'No due date';
   return {
     type: 'AdaptiveCard',
     $schema: 'http://adaptivecards.io/schemas/adaptive-card.json',
@@ -669,11 +690,7 @@ function buildPlannerTaskLink(taskId: string): string | undefined {
 function buildTaskAssignmentCard(args: TaskAssignmentArgs): object {
   const firstName = args.ownerName?.split(' ')[0] ?? 'there';
   const dueLabel = args.dueDate
-    ? `Due ${new Date(args.dueDate).toLocaleDateString(undefined, {
-        weekday: 'short',
-        month: 'short',
-        day: 'numeric',
-      })}`
+    ? `Due ${formatDisplayDate(args.dueDate)}`
     : 'No due date set';
   const link = buildPlannerTaskLink(args.taskId);
 
@@ -798,7 +815,7 @@ export function createTaskAssignmentTool(opts: CardToolOptions) {
         return toolFail(
           'send_task_assignment_card',
           err,
-          'Delivery attempted both Bot Framework proactive and Graph POST /chats as the agent user. If both failed, the recipient AAD is invalid OR the agent app is missing Chat.Create / Chat.ReadWrite delegated permissions (admin-consented).'
+          'Delivery uses Bot Framework proactive messaging only. A "no-conversation-ref" error means the assignee has not DM\'d the Chief of Staff agent (or installed the app) yet, so there is no personal chat to post into. The Planner task still exists; ask the assignee to message the agent once.'
         );
       }
     },
@@ -880,7 +897,7 @@ export async function sendBlockerMeetingCardDirect(
   }
 }
 
-/** Send a plain-text DM to a user via the same proactive/Graph fallback path
+/** Send a plain-text DM to a user via the same Bot Framework proactive path
  *  the card tools use. Handy when we want to notify without a card. */
 export async function sendPlainDmToUser(
   opts: CardToolOptions,
@@ -888,8 +905,7 @@ export async function sendPlainDmToUser(
   text: string
 ): Promise<{ ok: boolean; error?: string }> {
   try {
-    // Minimal card: single TextBlock. Cheaper than a full Adaptive Card but
-    // still routes through the same proactive/Graph fallback.
+    // Minimal card: single TextBlock, routed through the same proactive send.
     const card = {
       type: 'AdaptiveCard',
       $schema: 'http://adaptivecards.io/schemas/adaptive-card.json',

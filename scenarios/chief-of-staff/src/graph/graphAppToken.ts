@@ -2,9 +2,8 @@
 // Licensed under the MIT License.
 //
 // Standalone Graph worker: acquire application-permission tokens for
-// Microsoft Graph via client credentials. Used by acquireGraphToken() in
-// peopleTools.ts when GRAPH_APP_ID / GRAPH_APP_SECRET / GRAPH_TENANT_ID
-// are set.
+// Microsoft Graph via client credentials. This is the ONLY Graph identity the
+// sample uses — GRAPH_APP_ID / GRAPH_APP_SECRET / GRAPH_TENANT_ID are required.
 //
 // Why: the agentic OBO chain (blueprint → instance app → user OBO → Graph)
 // is powerful but painful to consent in demo tenants (AADSTS82007 etc). A
@@ -21,8 +20,8 @@ import { log } from '../util/logger';
 let cachedClient: ConfidentialClientApplication | null = null;
 
 /**
- * Are the env vars set to enable the standalone Graph worker?
- * If false, callers fall back to the agentic OBO exchange.
+ * Are the env vars set for the standalone Graph worker? Every Graph call in
+ * this sample uses this worker; there is no agentic OBO fallback.
  */
 export function isGraphAppConfigured(): boolean {
   return (
@@ -35,9 +34,22 @@ export function isGraphAppConfigured(): boolean {
 function getClient(): ConfidentialClientApplication {
   if (cachedClient) return cachedClient;
 
-  const clientId = process.env.GRAPH_APP_ID!.trim();
-  const clientSecret = process.env.GRAPH_APP_SECRET!.trim();
-  const tenantId = process.env.GRAPH_TENANT_ID!.trim();
+  const clientId = process.env.GRAPH_APP_ID?.trim();
+  const clientSecret = process.env.GRAPH_APP_SECRET?.trim();
+  const tenantId = process.env.GRAPH_TENANT_ID?.trim();
+  if (!clientId || !clientSecret || !tenantId) {
+    const missing = [
+      !clientId && 'GRAPH_APP_ID',
+      !clientSecret && 'GRAPH_APP_SECRET',
+      !tenantId && 'GRAPH_TENANT_ID',
+    ]
+      .filter(Boolean)
+      .join(', ');
+    throw new Error(
+      `[graphAppToken] The standalone Graph worker app is required but ${missing} is not set. ` +
+        'Run scripts/bootstrap-graph-app.ps1 and paste its output into .env (see README §3b).'
+    );
+  }
 
   cachedClient = new ConfidentialClientApplication({
     auth: {

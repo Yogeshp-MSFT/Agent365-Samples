@@ -70,6 +70,7 @@ interface GetTaskArgs {
 
 interface CreateTaskArgs {
   title: string;
+  description?: string | null;
   planId?: string | null;
   bucketId?: string | null;
   assigneeAadIds?: string[] | null;
@@ -126,7 +127,7 @@ function createGetTaskTool(opts: PlannerToolOptions) {
   return tool({
     name: 'planner_get_task',
     description:
-      'Read a single Planner task with all fields (title, dueDateTime, assignments, percentComplete, bucketId, priority).',
+      'Read a single Planner task with all fields (title, description, dueDateTime, assignments, percentComplete, bucketId, priority).',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -147,6 +148,18 @@ function createGetTaskTool(opts: PlannerToolOptions) {
           headers: { Authorization: `Bearer ${token}` },
         });
         const t = res.data;
+        let description: string | undefined;
+        if (t.hasDescription) {
+          try {
+            const details = await axios.get(
+              `${GRAPH_BASE}/planner/tasks/${encodeURIComponent(args.taskId)}/details?$select=description`,
+              { headers: { Authorization: `Bearer ${token}` } }
+            );
+            description = details.data?.description || undefined;
+          } catch (err) {
+            console.warn('[plannerTools] planner_get_task could not read description:', (err as Error)?.message);
+          }
+        }
         return JSON.stringify({
           ok: true,
           task: {
@@ -161,6 +174,7 @@ function createGetTaskTool(opts: PlannerToolOptions) {
             assignments: Object.keys(t.assignments ?? {}),
             createdDateTime: t.createdDateTime,
             hasDescription: !!t.hasDescription,
+            description,
           },
         });
       } catch (err) {
@@ -175,7 +189,8 @@ function createCreateTaskTool(opts: PlannerToolOptions) {
   return tool({
     name: 'planner_create_task',
     description:
-      'Create a new Planner task in a plan+bucket, optionally with assignees and a due date.',
+      'Create a new Planner task in a plan+bucket, optionally with assignees, a due date, and a description. ' +
+      'Idempotent: if an open task with the same title already exists in the plan, it is returned instead of creating a duplicate.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -183,6 +198,11 @@ function createCreateTaskTool(opts: PlannerToolOptions) {
         title: {
           type: 'string',
           description: 'Task title. Keep it short and action-oriented.',
+        },
+        description: {
+          type: ['string', 'null'],
+          description:
+            'Decision context, rationale, or instructions. Stored in the Planner task details so it can be recalled later.',
         },
         planId: {
           type: ['string', 'null'],
@@ -207,7 +227,7 @@ function createCreateTaskTool(opts: PlannerToolOptions) {
           description: '0=urgent, 3=important, 5=medium, 9=low. Defaults to 5.',
         },
       },
-      required: ['title', 'planId', 'bucketId', 'assigneeAadIds', 'dueDateTime', 'priority'],
+      required: ['title', 'description', 'planId', 'bucketId', 'assigneeAadIds', 'dueDateTime', 'priority'],
     } as any,
     execute: async (rawArgs: unknown) => {
       const args = (rawArgs ?? {}) as CreateTaskArgs;
@@ -241,18 +261,50 @@ function createCreateTaskTool(opts: PlannerToolOptions) {
         if (typeof args.priority === 'number') body.priority = args.priority;
 
         const token = await acquireGraphToken(opts);
+
+        // Retry safety: a capture re-run after a partial failure must not
+        // duplicate tasks that were already created on the earlier attempt.
+        const titleKey = args.title.trim().toLowerCase();
+        const existingRes = await axios.get(
+          `${GRAPH_BASE}/planner/plans/${encodeURIComponent(planId)}/tasks?$select=id,title,bucketId,percentComplete,assignments&$top=200`,
+          { headers: { Authorization: `Bearer ${token}` } }
+        );
+        const existing = ((existingRes.data?.value ?? []) as any[]).find(
+          (t) => (t.percentComplete ?? 0) < 100 && String(t.title ?? '').trim().toLowerCase() === titleKey
+        );
+        if (existing) {
+          return JSON.stringify({
+            ok: true,
+            alreadyExisted: true,
+            taskId: existing.id,
+            title: existing.title,
+            bucketId: existing.bucketId,
+            assignees: Object.keys(existing.assignments ?? {}),
+          });
+        }
+
         const res = await axios.post(`${GRAPH_BASE}/planner/tasks`, body, {
           headers: {
             Authorization: `Bearer ${token}`,
             'Content-Type': 'application/json',
           },
         });
+
+        let descriptionSaved: boolean | undefined;
+        if (args.description?.trim()) {
+          const saved = await setPlannerTaskDescription(res.data.id, args.description.trim(), token);
+          descriptionSaved = saved.ok;
+          if (!saved.ok) {
+            console.warn(`[plannerTools] task created but description was not saved: ${saved.error}`);
+          }
+        }
         return JSON.stringify({
           ok: true,
           taskId: res.data.id,
           title: res.data.title,
           bucketId: res.data.bucketId,
           assignees,
+          ...(descriptionSaved === undefined ? {} : { descriptionSaved }),
         });
       } catch (err) {
         return toolError('planner_create_task', err);
@@ -438,6 +490,48 @@ export async function updatePlannerTaskTitle(
   }
 }
 
+// ─── Programmatic helper: write a Planner task description ────────────────
+// Planner stores the description on the separate /details resource, which
+// needs its own ETag. Called right after task creation so decision context
+// from a captured meeting survives in Planner (the source of truth).
+export async function setPlannerTaskDescription(
+  taskId: string,
+  description: string,
+  token?: string
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  try {
+    const bearer = token ?? (await acquireAppOnlyGraphToken());
+    const url = `${GRAPH_BASE}/planner/tasks/${encodeURIComponent(taskId)}/details`;
+    // Details are created asynchronously after the task; retry briefly.
+    let etag: string | undefined;
+    for (let attempt = 0; attempt < 3 && !etag; attempt++) {
+      try {
+        const getRes = await axios.get(url, { headers: { Authorization: `Bearer ${bearer}` } });
+        etag = getRes.data?.['@odata.etag'];
+      } catch (err) {
+        if ((err as any)?.response?.status !== 404 || attempt === 2) throw err;
+      }
+      if (!etag) await new Promise((r) => setTimeout(r, 500 * (attempt + 1)));
+    }
+    if (!etag) return { ok: false, error: 'Planner task details response missing @odata.etag' };
+    await axios.patch(
+      url,
+      { description, previewType: 'description' },
+      {
+        headers: {
+          Authorization: `Bearer ${bearer}`,
+          'Content-Type': 'application/json',
+          'If-Match': etag,
+        },
+      }
+    );
+    return { ok: true };
+  } catch (err) {
+    const msg = (err as any)?.response?.data ?? (err as any)?.message ?? String(err);
+    return { ok: false, error: typeof msg === 'string' ? msg : JSON.stringify(msg) };
+  }
+}
+
 // ─── Programmatic helper: get full Planner task details ────────────────────
 // Used by runTaskComplete to fetch title + assignees for the completion DMs.
 export async function getPlannerTaskDetails(
@@ -527,7 +621,7 @@ export async function completePlannerTask(
 // match among their tasks we use that even when other candidates exist.
 export async function findOpenTaskByTitle(
   titleHint: string,
-  opts?: { assigneeAad?: string; planId?: string }
+  opts?: { assigneeAad?: string; planId?: string; onlyAssignedTo?: string }
 ): Promise<
   | { ok: true; taskId: string; title: string; percentComplete: number; matchType: 'exact' | 'substring' | 'wordset' }
   | { ok: false; reason: 'not_found' | 'ambiguous' | 'no_plan_id' | 'graph_error'; candidates?: Array<{ taskId: string; title: string }>; error?: string }
@@ -546,7 +640,11 @@ export async function findOpenTaskByTitle(
 
   const queryNorm = normalize(titleHint);
   if (!queryNorm) return { ok: false, reason: 'not_found' };
-  const queryWords = queryNorm.split(' ').filter((w) => w.length >= 3);
+  // Keep every identifying token (Q2, v1, 12…). Only drop filler words that
+  // never distinguish one task from another.
+  const FILLER = new Set(['a', 'an', 'the', 'to', 'for', 'of', 'and', 'on', 'in']);
+  const queryWords = queryNorm.split(' ').filter((w) => w && !FILLER.has(w));
+  const restrictTo = opts?.onlyAssignedTo?.toLowerCase();
 
   try {
     const token = await acquireAppOnlyGraphToken();
@@ -559,7 +657,12 @@ export async function findOpenTaskByTitle(
       title: string;
       percentComplete: number;
       assignments?: Record<string, unknown>;
-    }>).filter((t) => (t?.percentComplete ?? 0) < 100);
+    }>).filter((t) => (t?.percentComplete ?? 0) < 100)
+      .filter(
+        (t) =>
+          !restrictTo ||
+          Object.keys(t.assignments ?? {}).some((aad) => aad.toLowerCase() === restrictTo)
+      );
 
     if (tasks.length === 0) return { ok: false, reason: 'not_found' };
 
@@ -569,13 +672,14 @@ export async function findOpenTaskByTitle(
     for (const t of tasks) {
       const titleNorm = normalize(t.title ?? '');
       if (!titleNorm) continue;
+      const titleTokens = new Set(titleNorm.split(' '));
       const assignedToUser =
         !!opts?.assigneeAad && !!t.assignments && Object.keys(t.assignments).some((aad) => aad.toLowerCase() === opts.assigneeAad!.toLowerCase());
 
       let matchType: Candidate['matchType'] | null = null;
       if (titleNorm === queryNorm) matchType = 'exact';
-      else if (titleNorm.includes(queryNorm) || queryNorm.includes(titleNorm)) matchType = 'substring';
-      else if (queryWords.length > 0 && queryWords.every((w) => titleNorm.includes(w))) matchType = 'wordset';
+      else if (` ${titleNorm} `.includes(` ${queryNorm} `) || ` ${queryNorm} `.includes(` ${titleNorm} `)) matchType = 'substring';
+      else if (queryWords.length > 0 && queryWords.every((w) => titleTokens.has(w))) matchType = 'wordset';
 
       if (matchType) {
         candidates.push({ taskId: t.id, title: t.title, percentComplete: t.percentComplete, matchType, assignedToUser });

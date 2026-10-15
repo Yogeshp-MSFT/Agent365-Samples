@@ -22,6 +22,7 @@ import {
 } from '@microsoft/agents-a365-notifications';
 
 import { getClient } from './client';
+import { isUserInTeam, resolveUpnToAad } from './graph/peopleTools';
 import {
   ensureObservabilityToken,
   runWithInvokeAgentScope,
@@ -34,6 +35,12 @@ import { rememberConversationRef } from './state/conversationRefs';
 import { directUserMessageLabel } from './security-policy';
 
 const AUTH_HANDLER_NAME = 'agentic';
+
+/** Log-safe identifier: enough to correlate, never the full id or address. */
+function redactId(id: string | undefined | null): string {
+  if (!id) return '-';
+  return id.length > 8 ? `${id.slice(0, 8)}…` : id;
+}
 
 // ─── Agent ─────────────────────────────────────────────────────────────────
 export class CosAgent extends AgentApplication<TurnState> {
@@ -152,7 +159,7 @@ export class CosAgent extends AgentApplication<TurnState> {
     const isSystemSender = systemSenderPatterns.some((p) => senderId.includes(p));
     if (isSystemSender) {
       console.log(
-        `[agent] skipping system email from ${senderId || '(no id)'} — no reply will be sent`
+        `[agent] skipping system email from ${redactId(senderId)} — no reply will be sent`
       );
       return;
     }
@@ -173,14 +180,14 @@ export class CosAgent extends AgentApplication<TurnState> {
           // propagate into onTurnError -> another failing sendActivity ->
           // unhandled rejection -> process crash.
           console.warn(
-            `[agent] email reply to ${senderId || displayName} failed — dropping: ${(sendErr as Error)?.message ?? sendErr}`
+            `[agent] email reply to ${redactId(senderId)} failed — dropping: ${(sendErr as Error)?.message ?? sendErr}`
           );
         }
         return response;
       });
     } catch (err) {
       console.warn(
-        `[agent] handleUserEmail from ${senderId || displayName} failed — dropping: ${(err as Error)?.message ?? err}`
+        `[agent] handleUserEmail from ${redactId(senderId)} failed — dropping: ${(err as Error)?.message ?? err}`
       );
     }
   }
@@ -204,7 +211,7 @@ export class CosAgent extends AgentApplication<TurnState> {
     const isCardSubmit = !!(cardValue && typeof cardValue === 'object' && typeof (cardValue as any).verb === 'string');
 
     console.log(
-      `[agent] Message from ${displayName} (aad=${from?.aadObjectId ?? '-'}) text="${text.slice(0, 120)}"${
+      `[agent] Message received (aad=${redactId(from?.aadObjectId)} chars=${text.length})${
         isCardSubmit ? ` (cardSubmit verb=${(cardValue as any).verb})` : ''
       }`
     );
@@ -306,22 +313,39 @@ export class CosAgent extends AgentApplication<TurnState> {
     await context.sendActivity({ type: 'typing' } as Activity);
 
     await runWithInvokeAgentScope(context, this.scopeOptions(context, text), async () => {
-      const client = await getClient(this.authorization as any, AUTH_HANDLER_NAME, context, displayName);
+      const peopleOpts = {
+        authorization: this.authorization as any,
+        context,
+        authHandlerName: AUTH_HANDLER_NAME,
+      };
 
-      // Resolve the leader once — needed both by the card action router (below)
-      // and by the LLM prompt.
-      const teamId = process.env.LEADERSHIP_TEAM_ID?.trim();
-      const inTeam = await client.isUserInTeam(from?.aadObjectId, teamId);
-      console.log(
-        `[agent] Recall gate — user=${displayName} aad=${from?.aadObjectId?.slice(0, 8) ?? '-'} inTeam=${
-          inTeam === null ? 'unknown/allow-all' : inTeam
-        }`
-      );
+      // Resolve the leader once — needed by the access gate, the card action
+      // router (below), and the LLM prompt.
       const leaderAad =
         process.env.LEADER_AAD_ID?.trim() ||
-        (await client.resolveUpnToAad(process.env.LEADER_UPN)) ||
+        (await resolveUpnToAad(process.env.LEADER_UPN, peopleOpts)) ||
         '<LEADER_AAD_ID missing>';
       const leaderUpn = process.env.LEADER_UPN ?? '<LEADER_UPN missing>';
+
+      // Leadership-team gate. `null` means LEADERSHIP_TEAM_ID is not
+      // configured; a lookup failure returns false (fail closed). The
+      // configured leader is always allowed.
+      const teamId = process.env.LEADERSHIP_TEAM_ID?.trim();
+      const senderIsLeader =
+        !!from?.aadObjectId && from.aadObjectId.toLowerCase() === leaderAad.toLowerCase();
+      const inTeam = senderIsLeader ? true : await isUserInTeam(from?.aadObjectId, teamId, peopleOpts);
+      console.log(
+        `[agent] Recall gate — aad=${redactId(from?.aadObjectId)} inTeam=${
+          inTeam === null ? 'no-team-configured' : inTeam
+        }`
+      );
+
+      // Non-members get a client without Planner, calendar, mail, or Teams
+      // tools, so the restriction is enforced in the tool layer — not only
+      // by the prompt.
+      const client = await getClient(this.authorization as any, AUTH_HANDLER_NAME, context, displayName, {
+        restrictedAccess: inTeam === false,
+      });
 
       // Card-action / keyword-fallback router. If the message is a follow-up
       // reply (button click OR keyword text), handle it here and bypass the
@@ -354,7 +378,7 @@ export class CosAgent extends AgentApplication<TurnState> {
     const from = context.activity.from;
     const value = (context.activity as any).value;
     console.log(
-      `[agent] Invoke name=${invokeName ?? '<none>'} from=${from?.name ?? 'unknown'} (aad=${from?.aadObjectId ?? '-'}) valueKeys=${
+      `[agent] Invoke name=${invokeName ?? '<none>'} (aad=${redactId(from?.aadObjectId)}) valueKeys=${
         value && typeof value === 'object' ? Object.keys(value).join(',') : typeof value
       }`
     );
@@ -469,7 +493,7 @@ export class CosAgent extends AgentApplication<TurnState> {
     const action = context.activity.action;
     const from = context.activity.from;
     console.log(
-      `[agent] InstallationUpdate action=${action} from=${from?.name ?? 'unknown'}`
+      `[agent] InstallationUpdate action=${action} (aad=${redactId(from?.aadObjectId)})`
     );
     if (action === 'add') {
       await context.sendActivity(
@@ -494,10 +518,10 @@ function buildUserTurnPrompt(ctx: {
 }): string {
   const inTeamLabel =
     ctx.inTeam === null
-      ? 'unknown (LEADERSHIP_TEAM_ID not configured — no access restriction)'
+      ? 'not restricted (LEADERSHIP_TEAM_ID is not configured)'
       : ctx.inTeam
       ? 'YES (may hear task titles, meeting names, plan details)'
-      : 'NO (do NOT reveal Planner task titles, meeting names, or leader calendar contents)';
+      : 'NO, or membership could not be verified (do NOT reveal Planner task titles, meeting names, or leader calendar contents)';
 
   return `User context:
 - Sender display name: ${ctx.displayName}

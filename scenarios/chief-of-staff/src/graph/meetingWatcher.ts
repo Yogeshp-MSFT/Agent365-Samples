@@ -5,9 +5,10 @@
 // GRAPH_OWNER (either the leader or the CoS agent — see CAPTURE_GRAPH_OWNER
 // env), keep only events that are:
 //   - Teams online meetings (isOnlineMeeting = true)
-//   - organized by the leader (organizer.emailAddress.address == LEADER_UPN)
-//   - CoS agent is an invited attendee
-//   - already ended
+//   - attended by BOTH the leader and the CoS agent (as organizer or
+//     attendee) — regardless of who organized the meeting
+//   - inside the watch window, including in-progress and upcoming
+//     occurrences (the transcript retry loop waits for the transcript)
 // Then resolve each event's joinWebUrl -> onlineMeeting.id so downstream code
 // can fetch transcripts + insights for that specific meeting.
 //
@@ -30,6 +31,8 @@ export interface QualifyingMeeting {
   organizerAad?: string;
   organizerUpn?: string;
   chatId?: string;
+  /** Scheduled start of this occurrence (epoch ms), when known. */
+  startTime?: number;
   endTime: number; // epoch ms
   durationMinutes: number;
   joinWebUrl: string;
@@ -41,7 +44,7 @@ export interface MeetingWatcherOptions {
   authHandlerName: string;
   /** UPN whose calendar we read + whose /users/{}/onlineMeetings we hit. */
   graphOwnerUpn: string;
-  /** UPN who must be the event organizer for it to qualify. */
+  /** UPN who must be on the invite (organizer or attendee) — the leader. */
   leaderUpn: string;
   /** UPN who must be in event attendees for it to qualify (the CoS agent). */
   cosAgentUpn: string;
@@ -70,7 +73,7 @@ export async function discoverQualifyingMeetings(
 
     // calendarView is the correct endpoint for expanded recurring events.
     // We read the CALENDAR of graphOwnerUpn (leader or cos-agent, per env)
-    // and FILTER events where organizer == leader AND CoS is invited.
+    // and keep events where BOTH the leader and the CoS are on the invite.
     const url =
       `${GRAPH_BASE}/users/${encodeURIComponent(graphOwnerUpn)}/calendarView` +
       `?startDateTime=${start}&endDateTime=${end}` +
@@ -180,6 +183,7 @@ export async function discoverQualifyingMeetings(
         subject,
         organizerAad: ev.organizer?.emailAddress?.address ? undefined : undefined, // resolved elsewhere if needed
         organizerUpn: organizerAddr,
+        startTime: isFinite(startMs) ? startMs : undefined,
         endTime: endMs,
         durationMinutes: isFinite(startMs)
           ? Math.max(1, Math.round((endMs - startMs) / 60000))

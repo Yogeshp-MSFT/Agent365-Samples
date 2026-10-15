@@ -27,6 +27,8 @@ const GRAPH_BASE = 'https://graph.microsoft.com/v1.0';
 export interface CompletedTask {
   taskId: string;
   planId: string;
+  /** Recipients (AAD ids) already notified on an earlier attempt. */
+  alreadyDelivered: string[];
 }
 
 // taskId → last-known percentComplete (persisted between restarts)
@@ -34,6 +36,55 @@ const lastProgress = new PersistentMap<number>({
   file: 'planner-progress.json',
   // No TTL — task IDs are stable; entries are 8 bytes each.
 });
+
+// Completion transitions that still need their notifications delivered.
+// Kept separate from the progress baseline so a failed delivery is retried
+// on the next poll instead of being lost once the baseline reads 100%.
+interface PendingCompletion {
+  planId: string;
+  detectedAt: number;
+  attempts: number;
+  delivered: string[];
+}
+const pendingCompletions = new PersistentMap<PendingCompletion>({
+  file: 'planner-completions-pending.json',
+});
+const MAX_COMPLETION_ATTEMPTS = Number(process.env.TASK_COMPLETE_MAX_ATTEMPTS ?? '12');
+
+/**
+ * Record the outcome of a completion run. Fully delivered (or no longer
+ * applicable) transitions are removed; partial deliveries keep the
+ * recipients already notified so they aren't messaged twice on retry.
+ */
+export function acknowledgeCompletion(
+  taskId: string,
+  outcome: { complete: boolean; delivered: string[] }
+): void {
+  const entry = pendingCompletions.get(taskId);
+  if (!entry) return;
+  if (outcome.complete) {
+    pendingCompletions.delete(taskId);
+    return;
+  }
+  entry.attempts += 1;
+  entry.delivered = Array.from(new Set([...entry.delivered, ...outcome.delivered]));
+  if (entry.attempts >= MAX_COMPLETION_ATTEMPTS) {
+    console.warn(
+      `[plannerPoller] giving up on completion notifications for task ${taskId.slice(0, 8)} after ${entry.attempts} attempt(s).`
+    );
+    pendingCompletions.delete(taskId);
+    return;
+  }
+  pendingCompletions.set(taskId, entry);
+}
+
+function pendingAsCompletedTasks(): CompletedTask[] {
+  return Array.from(pendingCompletions.entries()).map(([taskId, p]) => ({
+    taskId,
+    planId: p.planId,
+    alreadyDelivered: p.delivered,
+  }));
+}
 
 // If we hydrated a baseline from disk, treat the first poll as a normal
 // comparison (transitions that happened during downtime WILL fire). Only
@@ -56,7 +107,7 @@ export async function pollForCompletedTasks(opts: {
   authHandlerName: string;
 }): Promise<CompletedTask[]> {
   const planId = await getPlannerPlanId();
-  if (!planId) return [];
+  if (!planId) return pendingAsCompletedTasks();
 
   try {
     const token = await acquireGraphToken(opts);
@@ -65,13 +116,16 @@ export async function pollForCompletedTasks(opts: {
       { headers: { Authorization: `Bearer ${token}` } }
     );
 
-    const completedNow: CompletedTask[] = [];
+    const completedNow: string[] = [];
     for (const t of res.data?.value ?? []) {
       const prev = lastProgress.get(t.id);
       const curr = typeof t.percentComplete === 'number' ? t.percentComplete : 0;
       // Only fire on transition to 100 that we actually witnessed happening.
       if (firstPollDone && prev !== undefined && prev < 100 && curr === 100) {
-        completedNow.push({ taskId: t.id, planId: t.planId });
+        completedNow.push(t.id);
+        if (!pendingCompletions.has(t.id)) {
+          pendingCompletions.set(t.id, { planId: t.planId, detectedAt: Date.now(), attempts: 0, delivered: [] });
+        }
       }
       lastProgress.set(t.id, curr);
     }
@@ -79,7 +133,7 @@ export async function pollForCompletedTasks(opts: {
     if (completedNow.length > 0) {
       console.log(
         `[plannerPoller] detected ${completedNow.length} newly-completed task(s): ${completedNow
-          .map((t) => t.taskId.slice(0, 8))
+          .map((id) => id.slice(0, 8))
           .join(', ')}`
       );
     }
@@ -89,10 +143,13 @@ export async function pollForCompletedTasks(opts: {
         `[plannerPoller] baseline seeded with ${lastProgress.size} tasks — future completions will fire runTaskComplete.`
       );
     }
-    return completedNow;
+    // New transitions plus any earlier ones whose notifications haven't
+    // been fully delivered yet.
+    return pendingAsCompletedTasks();
   } catch (err) {
     const e = err as any;
     console.warn('[plannerPoller] failed:', e?.response?.data ?? e?.message ?? String(e));
-    return [];
+    // Still retry undelivered notifications from earlier polls.
+    return pendingAsCompletedTasks();
   }
 }

@@ -32,12 +32,14 @@ const refsByAad = new PersistentMap<Partial<ConversationReference>>({
 
 /**
  * Capture the ConversationReference from an inbound Activity and remember it
- * against the sender's AAD Object ID. Idempotent — refreshes on every call so
- * we always have the most recent conversation/service URL.
+ * against the sender's AAD Object ID. Only personal (1:1) conversations are
+ * stored: a group chat or channel reference must never become someone's DM
+ * destination, or private briefs and cards would post into a shared thread.
  */
 export function rememberConversationRef(activity: Activity): void {
   const aad = activity.from?.aadObjectId;
   if (!aad) return;
+  if (!isPersonalConversation(activity.conversation)) return;
   const a = activity as any;
   const ref: Partial<ConversationReference> | undefined =
     typeof a.getConversationReference === 'function'
@@ -49,20 +51,29 @@ export function rememberConversationRef(activity: Activity): void {
           bot: activity.recipient,
           user: activity.from,
         };
-  if (ref) {
+  if (ref && isPersonalConversation(ref.conversation)) {
     refsByAad.set(aad, ref);
   }
 }
 
+/** True only for a Teams personal (1:1) conversation. */
+export function isPersonalConversation(conversation: unknown): boolean {
+  const c = conversation as { conversationType?: string; isGroup?: boolean } | undefined;
+  return !!c && c.conversationType === 'personal' && c.isGroup !== true;
+}
+
+/** Returns a stored reference only when it is a personal conversation, so
+ *  entries persisted before this check existed can't leak content. */
 export function lookupConversationRef(
   aadObjectId: string | undefined | null
 ): Partial<ConversationReference> | undefined {
   if (!aadObjectId) return undefined;
-  return refsByAad.get(aadObjectId);
+  const ref = refsByAad.get(aadObjectId);
+  return ref && isPersonalConversation(ref.conversation) ? ref : undefined;
 }
 
 export function hasConversationRef(aadObjectId: string | undefined | null): boolean {
-  return !!aadObjectId && refsByAad.has(aadObjectId);
+  return !!lookupConversationRef(aadObjectId);
 }
 
 /** Diagnostics only — returns the set of AAD IDs we've seen. */

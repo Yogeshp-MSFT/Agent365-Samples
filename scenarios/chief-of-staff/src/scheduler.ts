@@ -2,14 +2,18 @@
 // Licensed under the MIT License.
 //
 // In-process scheduler. Replaces the Power Automate mail-bus with:
-//   - cron (npm) for Brief / Follow-up / Escalate (scheduled)
+//   - cron (npm) for Brief / Follow-up (scheduled). Escalation is the
+//     deterministic stale-follow-up sweep that runs after each follow-up tick.
 //   - polling loops for Capture (new transcripts) and Task Complete (Planner)
 //
 // Design constraints:
-//   - Agentic auth needs a real TurnContext to exchange tokens. We cache the
-//     first inbound conversation reference and use adapter.continueConversation
-//     to reconstitute a valid context for every scheduled fire.
-//   - Handlers use mcp_TeamsServer to DM the leader / owners, so
+//   - Agentic auth needs a real TurnContext to exchange tokens. We cache a
+//     conversation reference (persisted to disk) and use
+//     adapter.continueConversation to reconstitute a valid context for every
+//     scheduled fire. After a restart the persisted reference — or the
+//     leader's persisted personal chat — is restored at boot, so scheduled
+//     work resumes without waiting for a new inbound message.
+//   - Handlers DM people through Bot Framework proactive sends, so
 //     ctx.sendActivity is never called from cron paths. The context is only
 //     needed for auth.
 //
@@ -28,12 +32,14 @@ import { getClient, Client } from './client';
 import { runWithObservabilityContext } from './observability';
 import { runBrief } from './cos/brief';
 import { runFollowup } from './cos/followup';
-import { runEscalate } from './cos/escalate';
 import { runCapture } from './cos/capture';
 import { runTaskComplete } from './cos/taskComplete';
 import { pollForNewTranscripts } from './graph/transcriptPoller';
-import { pollForCompletedTasks } from './graph/plannerPoller';
+import { acknowledgeCompletion, pollForCompletedTasks } from './graph/plannerPoller';
 import { findStaleForEscalation, markEscalated, markResolved } from './state/followupStore';
+import { markCaptureComplete, markCaptureProcessingFailed } from './state/pendingCaptureStore';
+import { lookupConversationRef } from './state/conversationRefs';
+import { PersistentMap } from './state/persistentMap';
 import { sendEscalationCardDirect } from './cards/followupCards';
 import { getPlannerTaskDetails } from './graph/plannerTools';
 
@@ -41,7 +47,6 @@ import { getPlannerTaskDetails } from './graph/plannerTools';
 const SCHEDULER_ENABLED = process.env.SCHEDULER_ENABLED !== 'false';
 const BRIEF_CRON = process.env.CRON_BRIEF ?? '0 8 * * 1-5'; // 8 AM weekdays
 const FOLLOWUP_CRON = process.env.CRON_FOLLOWUP ?? '0 * * * *'; // top of every hour
-const ESCALATE_CRON = process.env.CRON_ESCALATE ?? '0 */4 * * *'; // every 4h
 // IANA time zone for the CRON_* patterns above (e.g. 'America/Los_Angeles',
 // 'Asia/Kolkata', 'UTC'). If blank/unset, cron patterns are interpreted in
 // the SERVER's local time — which differs between local dev and Azure App
@@ -59,14 +64,20 @@ const FOLLOWUP_ESCALATE_AFTER_HOURS = Number(process.env.FOLLOWUP_ESCALATE_AFTER
 const LEADER_UPN = process.env.LEADER_UPN ?? '';
 
 // ─── State ─────────────────────────────────────────────────────────────────
-let cachedRef: Partial<ConversationReference> | null = null;
+// Persisted so a restart (App Service recycle, deploy, crash) can resume
+// scheduled work immediately instead of waiting for a new inbound message.
+const schedulerRefStore = new PersistentMap<Partial<ConversationReference>>({
+  file: 'scheduler-ref.json',
+});
+const SCHEDULER_REF_KEY = 'bootstrap';
+let cachedRef: Partial<ConversationReference> | null = schedulerRefStore.get(SCHEDULER_REF_KEY) ?? null;
 let started = false;
 const scheduledTasks: CronJob[] = [];
 const intervalIds: NodeJS.Timeout[] = [];
 
 /**
  * Called from agent.ts on every inbound user turn so we can reproduce a valid
- * TurnContext later for scheduled work.
+ * TurnContext later for scheduled work. The first reference is persisted.
  *
  * Uses the SDK-provided activity.getConversationReference() helper so all
  * fields (channelId, serviceUrl, conversation, agent, user, locale) are set
@@ -87,10 +98,34 @@ export function cacheConversationReference(activity: Activity): void {
           serviceUrl: a.serviceUrl,
           locale: a.locale,
         }) as Partial<ConversationReference>;
+  schedulerRefStore.set(SCHEDULER_REF_KEY, cachedRef);
   console.log(
     `[scheduler] cached conversation reference — cron/pollers can now fire (tenant=${
       (cachedRef as any).conversation?.tenantId ?? '?'
     })`
+  );
+}
+
+/**
+ * Boot-time recovery: if no scheduler reference was persisted (e.g. a
+ * deployment from before persistence existed), seed it from the configured
+ * leader's persisted personal chat. Only a genuinely uninitialized deployment
+ * still needs a first inbound message.
+ */
+function restoreSchedulerReference(): void {
+  if (cachedRef) {
+    console.log('[scheduler] restored persisted conversation reference — scheduled work resumes immediately.');
+    return;
+  }
+  const leaderRef = lookupConversationRef(process.env.LEADER_AAD_ID?.trim());
+  if (leaderRef) {
+    cachedRef = leaderRef;
+    schedulerRefStore.set(SCHEDULER_REF_KEY, leaderRef);
+    console.log("[scheduler] seeded conversation reference from the leader's persisted personal chat.");
+    return;
+  }
+  console.log(
+    '[scheduler] no conversation reference yet — scheduled work starts after the first message to the agent.'
   );
 }
 
@@ -115,10 +150,11 @@ export function startScheduler(deps: SchedulerDeps): void {
     return;
   }
   started = true;
+  restoreSchedulerReference();
 
   console.log(
     `[scheduler] starting — brief="${BRIEF_CRON}" followup="${FOLLOWUP_CRON}" ` +
-      `escalate="${ESCALATE_CRON}" tz=${CRON_TIMEZONE ?? 'server-local'} ` +
+      `tz=${CRON_TIMEZONE ?? 'server-local'} ` +
       `meetingPoll=${POLL_MEETINGS_MS / 1000}s tasksPoll=${POLL_TASKS_MS / 1000}s`
   );
 
@@ -144,7 +180,7 @@ export function startScheduler(deps: SchedulerDeps): void {
     console.log('[scheduler] brief cron DISABLED (set BRIEF_ENABLED=true in .env to re-enable).');
   }
 
-  // ── Cron: Follow-up ──
+  // ── Cron: Follow-up (+ deterministic stale-follow-up escalation sweep) ──
   scheduledTasks.push(
     CronJob.from({
       cronTime: FOLLOWUP_CRON,
@@ -156,20 +192,6 @@ export function startScheduler(deps: SchedulerDeps): void {
           await sweepStaleFollowupsAndEscalate(deps, ctx, client);
         }),
       errorHandler: (err) => console.error('[scheduler] followup cron error:', err),
-    })
-  );
-
-  // ── Cron: Escalate ──
-  scheduledTasks.push(
-    CronJob.from({
-      cronTime: ESCALATE_CRON,
-      start: true,
-      timeZone: CRON_TIMEZONE,
-      onTick: () =>
-        fireInAuthedContext(deps, 'escalate', async (ctx, state, client) => {
-          await runEscalate({}, ctx, state, client);
-        }),
-      errorHandler: (err) => console.error('[scheduler] escalate cron error:', err),
     })
   );
 
@@ -211,8 +233,16 @@ export function startScheduler(deps: SchedulerDeps): void {
                 state,
                 client
               );
+              // Acknowledge only after processing succeeded.
+              markCaptureComplete(t.eventId);
             } catch (err) {
-              console.error(`[scheduler] runCapture(${t.transcriptId}) failed:`, err);
+              const next = markCaptureProcessingFailed(t.eventId);
+              console.error(
+                `[scheduler] runCapture(${t.transcriptId.slice(0, 8)}…) failed — ${
+                  next === 'retry' ? 'kept READY for retry' : 'giving up after repeated failures'
+                }:`,
+                err
+              );
             }
           }
         });
@@ -233,14 +263,16 @@ export function startScheduler(deps: SchedulerDeps): void {
         });
         for (const t of done) {
           try {
-            await runTaskComplete(
-              { taskId: t.taskId, planId: t.planId },
+            const outcome = await runTaskComplete(
+              { taskId: t.taskId, planId: t.planId, alreadyDelivered: t.alreadyDelivered },
               ctx,
               state,
               client
             );
+            acknowledgeCompletion(t.taskId, outcome);
           } catch (err) {
-            console.error(`[scheduler] runTaskComplete(${t.taskId}) failed:`, err);
+            acknowledgeCompletion(t.taskId, { complete: false, delivered: [] });
+            console.error(`[scheduler] runTaskComplete(${t.taskId.slice(0, 8)}…) failed — will retry:`, err);
           }
         }
       });

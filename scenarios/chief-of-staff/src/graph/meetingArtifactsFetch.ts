@@ -225,23 +225,28 @@ export async function fetchAiInsightsForMeeting(
     return normalise(v1.data);
   }
   if (v1.status === 'unsupported') {
-    log.debug('insightsFetch', `v1.0 unsupported for meeting=${meetingId.slice(0, 8)}… (403/404) — tenant may lack Copilot licence`);
+    log.debug('insightsFetch', `v1.0 forbidden for meeting=${meetingId.slice(0, 8)}… (403) — tenant may lack Copilot licence`);
     return { available: false, unsupported: true };
   }
 
-  // Fall back to beta if v1.0 was 404 (endpoint not enabled in this tenant).
-  log.debug('insightsFetch', `v1.0 not-ready, trying /beta ${GRAPH_BETA}${path}`);
+  // Fall back to /beta when v1.0 is empty or returns 404 (the endpoint may
+  // only exist on beta in this tenant).
+  log.debug('insightsFetch', `v1.0 ${v1.status}, trying /beta ${GRAPH_BETA}${path}`);
   const beta = await tryFetchInsights(token, `${GRAPH_BETA}${path}`);
   if (beta.status === 'ok') {
     log.debug('insightsFetch', `beta returned ${beta.data.length} insight object(s) for meeting=${meetingId.slice(0, 8)}…`);
     return normalise(beta.data);
   }
-  if (beta.status === 'unsupported') {
-    log.debug('insightsFetch', `beta unsupported for meeting=${meetingId.slice(0, 8)}…`);
+  // Only declare insights unavailable when BOTH versions say so.
+  if (
+    beta.status === 'unsupported' ||
+    (v1.status === 'not-found' && beta.status === 'not-found')
+  ) {
+    log.debug('insightsFetch', `insights unsupported for meeting=${meetingId.slice(0, 8)}… on v1.0 and beta`);
     return { available: false, unsupported: true };
   }
 
-  log.debug('insightsFetch', `insights not ready yet for meeting=${meetingId.slice(0, 8)}… (empty response on both v1.0 and beta)`);
+  log.debug('insightsFetch', `insights not ready yet for meeting=${meetingId.slice(0, 8)}… (no insights on v1.0 or beta yet)`);
   return { available: false };
 }
 
@@ -251,6 +256,7 @@ async function tryFetchInsights(
 ): Promise<
   | { status: 'ok'; data: any[] }
   | { status: 'not-ready' }
+  | { status: 'not-found' }
   | { status: 'unsupported' }
 > {
   try {
@@ -263,7 +269,10 @@ async function tryFetchInsights(
   } catch (err) {
     const e = err as any;
     const status = e?.response?.status;
-    if (status === 404 || status === 403) return { status: 'unsupported' };
+    // A 404 can be version-specific (endpoint only on beta); the caller
+    // decides. 403 means the tenant/app genuinely can't read insights.
+    if (status === 404) return { status: 'not-found' };
+    if (status === 403) return { status: 'unsupported' };
     log.warn('insightsFetch', `${url} failed`, {
       status,
       body: e?.response?.data ?? e?.message ?? String(e),

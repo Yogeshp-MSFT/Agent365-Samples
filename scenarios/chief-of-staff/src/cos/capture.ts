@@ -57,8 +57,9 @@ export async function runCapture(
   });
 
   if (!payload.meetingId || !payload.transcriptId) {
-    log.warn('capture', 'missing meetingId or transcriptId — cannot proceed');
-    return;
+    // Thrown so the scheduler keeps the capture retryable instead of
+    // acknowledging a meeting that was never processed.
+    throw new Error('runCapture: missing meetingId or transcriptId');
   }
 
   const planId = (await getPlannerPlanId()) ?? '<PLANNER_PLAN_ID missing>';
@@ -132,6 +133,7 @@ Steps:
    - bucketId: ${bucketNew}
    - assigneeAadIds: [resolved aadObjectId from step 4]
    - title: from step 3
+   - description: the short description / decision context from step 3 (or null). This is saved in Planner so the context can be recalled later.
    - dueDateTime: MANDATORY. Resolve any date/weekday reference in dueDateHint to a concrete ISO date on or after ${todayIso}. If no due date is mentioned at all, use ${defaultDueIso}. NEVER emit a date earlier than ${todayIso} and NEVER leave dueDateTime null.
    IMMEDIATELY AFTER each successful planner_create_task, call send_task_assignment_card with:
      - ownerAadObjectId: same aadObjectId you assigned to
@@ -144,7 +146,7 @@ Steps:
      - meetingSubject: "${payload.subject ?? ''}" (or null if empty)
    This DMs the assignee an Adaptive Card so they learn about the task in Teams, not just via Planner.
    If send_task_assignment_card returns a "no-conversation-ref" error for someone, just note it in your summary — do NOT retry, and do NOT block the rest of the flow. The task is still created in Planner; the DM just needs that user to have said hi to the agent once.
-6. For each decision from step 3, create a Planner task via planner_create_task with title prefixed "[DECISION] <one-line summary>", assigneeAadIds=[${leaderAad}], and the decision context in the description.
+6. For each decision from step 3, create a Planner task via planner_create_task with title prefixed "[DECISION] <one-line summary>", assigneeAadIds=[${leaderAad}], and the decision context and rationale in the description argument.
    IMMEDIATELY AFTER each decision task is created, also call send_task_assignment_card so the Leader gets notified about the logged decision. Use:
      - ownerAadObjectId: ${leaderAad}
      - ownerName: "${process.env.LEADER_NAME?.trim() || 'the Leader'}"
@@ -166,6 +168,12 @@ Return a concise summary of what you did (tasks created, decisions logged, any e
   );
   const result = await client.invokeAgentWithScope(prompt);
   log.info('capture', 'result', { summary: result });
+  // invokeAgent reports model/tool failures as an "Error: …" string. Treat it
+  // as a failure so the capture stays retryable; planner_create_task is
+  // idempotent by title, so a retry won't duplicate tasks already created.
+  if (/^\s*error:/i.test(result ?? '')) {
+    throw new Error(`runCapture: extraction failed — ${result}`);
+  }
 }
 
 function buildTranscriptBlock(payload: TranscriptPayload): string {

@@ -152,27 +152,12 @@ export function printStartupBanner(): void {
     ok(
       'COS_AGENT_UPN',
       cosAgentUpn,
-      'meetings captured only when leader-organized AND CoS-invited'
+      'meetings captured whenever BOTH the leader and this UPN are on the invite (any organizer, including in-progress/upcoming meetings)'
     );
   } else {
     warn(
       'COS_AGENT_UPN',
       'meeting-capture poller will no-op — set the CoS agent\'s inviteable UPN to enable'
-    );
-  }
-
-  // ── CoS agent AAD Object ID (required for Adaptive Card DMs) ──
-  const cosAgentAadId = process.env.COS_AGENT_AAD_ID?.trim();
-  if (cosAgentAadId) {
-    ok(
-      'COS_AGENT_AAD_ID',
-      maskGuid(cosAgentAadId),
-      'Adaptive Card 1:1 chats can be created (both members listed explicitly)'
-    );
-  } else {
-    warn(
-      'COS_AGENT_AAD_ID',
-      'Adaptive Card DMs will FAIL with 400 "Creation of \'OneOnOne\' chat requires 2 members" — set to the CoS agent\'s AAD Object ID (GUID)'
     );
   }
 
@@ -204,8 +189,9 @@ export function printStartupBanner(): void {
       'Graph calls use standalone worker app (application permissions)'
     );
   } else {
-    info(
-      'GRAPH_APP_* not set — Graph calls will use agentic OBO exchange (blueprint → instance app → user). Requires consent on the instance app (see README §2b for the simpler standalone-worker path).'
+    err(
+      'GRAPH_APP_ID / GRAPH_APP_SECRET / GRAPH_TENANT_ID',
+      'required — every Graph call (Planner, people, calendar, transcripts) uses the standalone worker app. Run scripts/bootstrap-graph-app.ps1 (README §3b).'
     );
   }
 
@@ -218,12 +204,13 @@ export function printStartupBanner(): void {
   // ── State persistence ──
   info(describePersistence());
 
-  // ── Runtime mode ──
-  const isDev = process.env.NODE_ENV === 'development';
+  // ── Runtime mode / WorkIQ MCP ──
+  info(`NODE_ENV=${process.env.NODE_ENV ?? '<unset>'}`);
   info(
-    `NODE_ENV=${process.env.NODE_ENV ?? '<unset>'} → ${
-      isDev ? 'reads ToolingManifest.json' : 'discovers MCP servers from Tooling Gateway'
-    }`
+    'WorkIQ MCP servers are read from ToolingManifest.json (deploy it next to dist/) with a per-server agentic token. ' +
+      (process.env.SKIP_TOOLING_ON_ERRORS?.trim().toLowerCase() === 'true'
+        ? 'SKIP_TOOLING_ON_ERRORS=true — registration failures are logged and the turn continues without those tools.'
+        : 'SKIP_TOOLING_ON_ERRORS=false — a registration failure fails the turn.')
   );
 
   line('─────────────────────────────────────────────');

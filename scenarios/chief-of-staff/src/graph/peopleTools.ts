@@ -13,16 +13,15 @@
 //     message ("finance lead", "Sam Chen") to AAD Object IDs so the agent
 //     can invite them to the unblock meeting.
 //
-// Both use the agent's agentic-user Graph token. Required Graph scopes
-// (already granted on this app): Chat.ReadWrite, User.Read.All.
+// Both use the standalone Graph worker app (application permissions):
+// ChatMember.Read.All for meeting-chat members and User.Read.All for users.
 
 import axios from 'axios';
 import { tool } from '@openai/agents';
 import { Authorization, TurnContext } from '@microsoft/agents-hosting';
-import { acquireAppOnlyGraphToken, isGraphAppConfigured } from './graphAppToken';
+import { acquireAppOnlyGraphToken } from './graphAppToken';
 
 const GRAPH_BASE = 'https://graph.microsoft.com/v1.0';
-const GRAPH_SCOPE = 'https://graph.microsoft.com/.default';
 
 export interface PeopleToolOptions {
   authorization: Authorization;
@@ -254,8 +253,10 @@ async function fetchTeamMemberAads(
  * Check whether a user (by AAD Object ID) is a member of a given Team.
  * `teamIdOrIdentifier` may be a GUID, a channel email, or a display name —
  * resolved once and cached.
- * Returns null when teamId is not set or cannot be resolved (caller should
- * treat as "allow all" / "unknown").
+ *
+ * Returns null ONLY when no team is configured (no access restriction).
+ * When a team IS configured, an unresolvable team id or a failed membership
+ * lookup returns false — the gate fails closed instead of disclosing data.
  */
 export async function isUserInTeam(
   aadObjectId: string | undefined,
@@ -268,41 +269,27 @@ export async function isUserInTeam(
   if (!aad) return false;
   try {
     const tid = await resolveTeamIdentifier(raw, opts);
-    if (!tid) return null; // couldn't resolve → treat as "allow all"
+    if (!tid) {
+      console.warn(`[isUserInTeam] LEADERSHIP_TEAM_ID "${raw}" could not be resolved — denying access.`);
+      return false;
+    }
     const members = await fetchTeamMemberAads(tid, opts);
     return members.has(aad);
   } catch (err) {
     const e = err as any;
     console.warn(
-      `[isUserInTeam] Failed for input="${raw}":`,
+      `[isUserInTeam] membership lookup failed for input="${raw}" — denying access:`,
       e?.response?.data ?? e?.message ?? String(e)
     );
-    return null;
+    return false;
   }
 }
 
-async function acquireGraphToken(opts: PeopleToolOptions): Promise<string> {
-  // Preferred path: if a standalone Graph worker app is configured, use
-  // application-permission client credentials. Simpler consent, cleaner
-  // repro, no dependence on the agentic OBO chain being consented.
-  if (isGraphAppConfigured()) {
-    return acquireAppOnlyGraphToken();
-  }
-
-  // Fallback: agentic on-behalf-of exchange through the blueprint + instance
-  // apps. Requires TurnContext + user consent on the instance app.
-  const { authorization, context, authHandlerName } = opts;
-  if (!authorization || !authHandlerName) {
-    throw new Error(
-      'No Graph credentials available. Either set GRAPH_APP_ID/GRAPH_APP_SECRET/GRAPH_TENANT_ID for the standalone worker, or provide an agentic auth handler.'
-    );
-  }
-  const tokenObj = await (authorization as any).exchangeToken(context, authHandlerName, {
-    scopes: [GRAPH_SCOPE],
-  });
-  const token = tokenObj?.token;
-  if (!token) throw new Error('Graph token exchange returned empty token');
-  return token;
+async function acquireGraphToken(_opts: PeopleToolOptions): Promise<string> {
+  // Every Graph call uses the standalone worker app (application
+  // permissions). acquireAppOnlyGraphToken throws a descriptive error when
+  // GRAPH_APP_* is not configured — there is intentionally no OBO fallback.
+  return acquireAppOnlyGraphToken();
 }
 
 // Re-exported for pollers / other Graph modules that need a token in the same
