@@ -171,7 +171,7 @@ async function runDiscoveryPass(
         giveUpAfter,
       });
       if (outcome !== 'unchanged') {
-        log.info('capturePoller', `meeting "${m.subject}" was rescheduled — capture ${outcome}`);
+        log.info('capturePoller', `${eventRef(m.eventId)} was rescheduled — capture ${outcome}`);
       }
       continue;
     }
@@ -190,7 +190,7 @@ async function runDiscoveryPass(
     });
     log.debug(
       'capturePoller',
-      `added pending capture "${m.subject}" durationMin=${m.durationMinutes} waitBudgetMin=${budget}`
+      `added pending capture ${eventRef(m.eventId)} durationMin=${m.durationMinutes} waitBudgetMin=${budget}`
     );
     newlyTracked++;
   }
@@ -230,7 +230,7 @@ async function advanceCapture(
   // Already READY (restart, or an earlier runCapture failed): re-emit the
   // stored payload without refetching. It is acknowledged only on success.
   if (cap.status === 'ready' && cap.transcriptId) {
-    log.info('capturePoller', `re-emitting READY capture "${cap.subject}" for processing`);
+    log.info('capturePoller', `re-emitting READY capture ${eventRef(cap.eventId)} for processing`);
     return toDetectedTranscript(cap);
   }
 
@@ -239,14 +239,14 @@ async function advanceCapture(
 
   log.debug(
     'capturePoller',
-    `advance "${cap.subject}" attempt=${cap.attempts} transcriptId=${cap.transcriptId ? cap.transcriptId.slice(0, 8) + '…' : '∅'} insightsFetched=${cap.insightsFetched}`
+    `advance ${eventRef(cap.eventId)} attempt=${cap.attempts} transcriptId=${cap.transcriptId ? cap.transcriptId.slice(0, 8) + '…' : '∅'} insightsFetched=${cap.insightsFetched}`
   );
 
   // Give-up guard: too much time has passed with no transcript.
   if (now > cap.giveUpAfter && !cap.transcriptId) {
     log.warn(
       'capturePoller',
-      `giving up on meeting "${cap.subject}" — no transcript after ${(
+      `giving up on ${eventRef(cap.eventId)} — no transcript after ${(
         (now - cap.endTime) /
         (60 * 60 * 1000)
       ).toFixed(1)}h`
@@ -276,7 +276,7 @@ async function advanceCapture(
     } else if (transcripts.length > 0) {
       log.debug(
         'capturePoller',
-        `"${cap.subject}": ${transcripts.length} transcript(s) found, none belong to this occurrence yet`
+        `${eventRef(cap.eventId)}: ${transcripts.length} transcript(s) found, none belong to this occurrence yet`
       );
     }
   }
@@ -356,7 +356,7 @@ async function advanceCapture(
       (cap.insightsMeetingNotes?.length ?? 0);
     log.info(
       'capturePoller',
-      `READY: "${cap.subject}" meeting=${cap.meetingId.slice(
+      `READY: ${eventRef(cap.eventId)} meeting=${cap.meetingId.slice(
         0,
         8
       )} transcript=✓ content=${cap.transcriptContent ? `✓ (${cap.transcriptContent.length}ch)` : '✗'} insights=${insightsCount > 0 ? `✓ (${insightsCount})` : '✗'} after ${cap.attempts} attempt(s)`
@@ -374,7 +374,7 @@ async function advanceCapture(
   updateCapture(cap.eventId, { nextCheckAt: now + delayMin * 60 * 1000 });
   log.debug(
     'capturePoller',
-    `not ready — next check for "${cap.subject}" in ${delayMin} min (waitBudget=${cap.waitBudgetMinutes} min, waitedSoFar=${((now - (cap.transcriptFetchedAt ?? cap.endTime)) / 60000).toFixed(1)} min)`
+    `not ready — next check for ${eventRef(cap.eventId)} in ${delayMin} min (waitBudget=${cap.waitBudgetMinutes} min, waitedSoFar=${((now - (cap.transcriptFetchedAt ?? cap.endTime)) / 60000).toFixed(1)} min)`
   );
   return undefined;
 }
@@ -399,30 +399,67 @@ function toDetectedTranscript(cap: PendingCapture): DetectedTranscript {
 
 // Transcripts are created when transcription starts, which happens during
 // the meeting. Allow a little slack on both sides for meetings that start
-// early or run over, but never reach into a later meeting on the same join URL.
+// early or run over, but never reach into another occurrence on the same
+// online meeting (recurring series and back-to-back meetings reuse one join
+// URL): next to a neighbouring occurrence the slack stops at the midpoint of
+// the gap, and the boundary belongs to the later occurrence.
 const OCCURRENCE_EARLY_SLACK_MS = 15 * 60 * 1000;
 const OCCURRENCE_LATE_SLACK_MS = 15 * 60 * 1000;
 
+type OccurrenceSpan = { startTime?: number; endTime: number; durationMinutes: number };
+
+function occurrenceStart(o: OccurrenceSpan): number {
+  return o.startTime ?? o.endTime - o.durationMinutes * 60 * 1000;
+}
+
+/** Other tracked occurrences of the same online meeting. */
+function sameMeetingNeighbors(cap: Pick<PendingCapture, 'eventId' | 'meetingId'>): OccurrenceSpan[] {
+  if (!cap.meetingId) return [];
+  return listAll().filter((c) => c.meetingId === cap.meetingId && c.eventId !== cap.eventId);
+}
+
+/** Log-safe event reference — event ids share a mailbox prefix, so use the tail. */
+function eventRef(eventId: string | undefined): string {
+  return `event=…${String(eventId ?? '?').slice(-8)}`;
+}
+
 /**
  * Pick the transcript that belongs to this calendar occurrence: created
- * between (scheduled start - slack) and (scheduled end + slack), and not
- * already consumed by another capture. Transcripts from earlier or later
- * meetings that reuse the same join URL never match.
+ * between (scheduled start - slack) and (scheduled end + slack), with the
+ * slack capped so it never overlaps a neighbouring occurrence of the same
+ * online meeting, and not already consumed by another capture.
  */
 export function selectTranscriptForOccurrence(
   transcripts: TranscriptSummary[],
-  cap: Pick<PendingCapture, 'eventId' | 'startTime' | 'endTime' | 'durationMinutes'>,
-  now: number
+  cap: Pick<PendingCapture, 'eventId' | 'meetingId' | 'startTime' | 'endTime' | 'durationMinutes'>,
+  now: number,
+  neighbors: OccurrenceSpan[] = sameMeetingNeighbors(cap)
 ): TranscriptSummary | undefined {
-  const start = cap.startTime ?? cap.endTime - cap.durationMinutes * 60 * 1000;
-  if (now < start - OCCURRENCE_EARLY_SLACK_MS) return undefined;
-  const windowStart = start - OCCURRENCE_EARLY_SLACK_MS;
-  const windowEnd = cap.endTime + OCCURRENCE_LATE_SLACK_MS;
+  const start = occurrenceStart(cap);
+  let windowStart = start - OCCURRENCE_EARLY_SLACK_MS;
+  let windowEnd = cap.endTime + OCCURRENCE_LATE_SLACK_MS;
+  let endExclusive = false;
+  for (const n of neighbors) {
+    const nStart = occurrenceStart(n);
+    if (n.endTime <= start) {
+      // Earlier occurrence: start no earlier than the midpoint of the gap.
+      windowStart = Math.max(windowStart, Math.min(start, (n.endTime + start) / 2));
+    } else if (nStart >= cap.endTime) {
+      // Later occurrence: stop at the midpoint; the boundary belongs to it.
+      const limit = Math.max(cap.endTime, (cap.endTime + nStart) / 2);
+      if (limit <= windowEnd) {
+        windowEnd = limit;
+        endExclusive = true;
+      }
+    }
+  }
+  if (now < windowStart) return undefined;
   const candidates = transcripts
     .filter((t) => !isTranscriptClaimed(t.transcriptId, cap.eventId))
     .filter((t) => {
       const created = t.createdDateTime ? Date.parse(t.createdDateTime) : NaN;
-      return Number.isFinite(created) && created >= windowStart && created <= windowEnd;
+      if (!Number.isFinite(created) || created < windowStart) return false;
+      return endExclusive ? created < windowEnd : created <= windowEnd;
     })
     .sort((a, b) => Date.parse(a.createdDateTime!) - Date.parse(b.createdDateTime!));
   return candidates[0];

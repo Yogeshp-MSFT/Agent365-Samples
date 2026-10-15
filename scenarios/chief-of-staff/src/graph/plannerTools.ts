@@ -308,6 +308,14 @@ function createCreateTaskTool(opts: PlannerToolOptions) {
                 assignees: live.assigneeAads,
               });
             }
+            if (!live.notFound) {
+              // Can't confirm the earlier task is gone — fail this attempt
+              // (the capture stays retryable) rather than risk a duplicate.
+              return toolError(
+                'planner_create_task',
+                `could not verify the task created on an earlier attempt (${live.error}); retry later`
+              );
+            }
             createdTaskIndex.delete(dedupeKey);
           }
         }
@@ -566,9 +574,12 @@ export async function setPlannerTaskDescription(
 // Used by runTaskComplete to fetch title + assignees for the completion DMs.
 export async function getPlannerTaskDetails(
   taskId: string
-): Promise<{ ok: true; title: string; assigneeAads: string[]; percentComplete: number } | { ok: false; error: string }> {
+): Promise<
+  | { ok: true; title: string; assigneeAads: string[]; percentComplete: number }
+  | { ok: false; error: string; notFound: boolean }
+> {
   try {
-    if (!taskId) return { ok: false, error: 'taskId is empty' };
+    if (!taskId) return { ok: false, error: 'taskId is empty', notFound: false };
     const token = await acquireAppOnlyGraphToken();
     const res = await axios.get(
       `${GRAPH_BASE}/planner/tasks/${encodeURIComponent(taskId)}`,
@@ -581,8 +592,11 @@ export async function getPlannerTaskDetails(
     return { ok: true, title, assigneeAads, percentComplete: pct };
   } catch (err) {
     const msg = (err as any)?.response?.data ?? (err as any)?.message ?? String(err);
-    console.error(`[plannerTools] getPlannerTaskDetails failed for task=${taskId}:`, msg);
-    return { ok: false, error: typeof msg === 'string' ? msg : JSON.stringify(msg) };
+    // Only a 404 proves the task is gone; throttling, 5xx, and transport
+    // errors are indeterminate.
+    const notFound = (err as any)?.response?.status === 404;
+    console.error(`[plannerTools] getPlannerTaskDetails failed for task=${taskId.slice(0, 8)}… (status=${(err as any)?.response?.status ?? 'n/a'}):`, msg);
+    return { ok: false, error: typeof msg === 'string' ? msg : JSON.stringify(msg), notFound };
   }
 }
 

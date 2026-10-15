@@ -247,9 +247,12 @@ setInterval, guarded by `meetingPollInFlight` — see §10.2):
 - **Pass 2 — retry sweep.** For each pending capture whose `nextCheckAt` has
   arrived, `advanceCapture` tries to fetch the transcript for **this
   occurrence** (created between 15 minutes before its scheduled start and
-  its scheduled end, and not already consumed by another capture — a
-  recurring meeting reuses its join URL) and the Copilot insights, then
-  decides one of three outcomes:
+  15 minutes after its scheduled end, and not already consumed by another
+  capture). Recurring and back-to-back meetings reuse one join URL, so next
+  to another tracked occurrence of the same online meeting the slack stops at
+  the midpoint of the gap and the shared boundary belongs to the later
+  occurrence. It also fetches the Copilot insights, then decides one of three
+  outcomes:
   1. **Ready** — transcript is here AND (insights arrived OR wait budget
      exhausted OR `attempts >= CAPTURE_MIN_ATTEMPTS_TRANSCRIPT_ONLY`).
      The capture is marked `ready` (durably, with its artifacts) and emitted
@@ -510,7 +513,8 @@ sequenceDiagram
 The completion detection lives in `extractIntent` and
 `isAffirmativeCompletion`. It accepts only statements that the work is
 already done ("is done", "I've finished", "completed …"), with quoted titles
-masked out before classifying. Questions, negations, and future or
+masked out before classifying. Questions, negations, requests ("Please
+check whether … is done", "can you confirm …"), and future or
 conditional phrasing ("I will finish …", "almost done", "done once Bob
 replies") are rejected. A quoted title (straight/curly quotes, backticks) is
 the primary hint. Only when the message names **no** task at all (a short
@@ -828,10 +832,10 @@ All card verbs are strings in `activity.value.verb`:
 | `extend` | Follow-up check-in | Compute new date, queue + send extension request card to leader (retried by the scheduler if delivery fails) |
 | `blocked` | Follow-up check-in | Propose 3 slots, queue + send blocker meeting card to leader (retried likewise) |
 | `complete` | (also matched via chat regex) | `findOpenTaskByTitle` → `completePlannerTask` (100%) |
-| `approve_extend` | Extension request card | `updatePlannerTaskDueDate` + DM owner |
-| `reject_extend` | Extension request card | Deterministic DM to owner "not approved" |
+| `approve_extend` | Extension request card | Only while the request is still `pending` (old cards for decided/cancelled requests are refused): `updatePlannerTaskDueDate` + DM owner |
+| `reject_extend` | Extension request card | Only while `pending`: deterministic DM to owner "not approved" |
 | `reassign` | Extension request card | Manual handoff: closes the check-in and tells the leader to change the assignee in Planner |
-| `book_meeting` | Blocker meeting card | LLM + `mcp_CalendarTools.book_meeting` first; on exact `OK` → resolve, PATCH `[BLOCKER]` title prefix, DM owner; on failure → DM owner "not booked", keep the check-in open |
+| `book_meeting` | Blocker meeting card | One booking at a time per follow-up (in-flight lock across all slots). LLM + `mcp_CalendarTools.book_meeting` first; on exact `OK` → resolve, PATCH `[BLOCKER]` title prefix, DM owner; on failure → DM owner "not booked", keep the check-in open |
 | `defer_blocker` | Blocker meeting card | Snooze — resolves the followup with a note |
 | `esc_reassign` | Escalation card | Same manual handoff as `reassign` |
 | `esc_extend` | Escalation card | Sends the leader an extension approval card |
@@ -1120,9 +1124,11 @@ unresolvable team id — including a display name or channel-email prefix that
 matches more than one group — or a failed membership lookup returns `false`:
 the gate fails closed. `plannerConfig.ts` applies the same ambiguity rule
 when it resolves the plan's group. The configured leader is always allowed.
-For `false`, the client is built with `restrictedAccess: true`, which omits
-the Planner, card, and WorkIQ MCP tools, so the restriction is enforced in
-the tool layer; the prompt (`buildUserTurnPrompt`, which also labels the
+For `false`, the client is built with `restrictedAccess: true`, which
+attaches no tools at all — no Planner, card, people/directory
+(`graph_find_user`, `graph_list_meeting_attendees`), or WorkIQ MCP tools,
+since every one of them reads with tenant-wide application permissions — so
+the restriction is enforced in the tool layer; the prompt (`buildUserTurnPrompt`, which also labels the
 channel) tells the LLM to refuse politely. Card actions are authorized
 separately in `actionRouter.ts::authorizeIntent` (leader-only verbs, open
 check-ins, live Planner assignment). To swap the gate for an Entra dynamic
@@ -1156,12 +1162,15 @@ prevent the demo. Address before pilot / production.
 - **The Recall wording is LLM-generated.** Data access is enforced
   server-side for Teams messages **and** email: senders outside the
   leadership team (or whose identity or membership can't be verified) get a
-  client with no Planner, card, or WorkIQ MCP tools (§12.5), so a prompt
+  client with no tools — no Planner, card, people/directory, or WorkIQ MCP
+  tools (§12.5) — so a prompt
   injection can't make the LLM read protected data. The refusal *text* is
   still produced by the LLM.
-- **Logs carry no Planner content.** Follow-up, task-complete, Planner, and
-  capture logs record task-id prefixes, counts, and reason codes — never
-  task titles, meeting subjects, recipient names, or full AAD ids.
+- **Logs carry no Planner or meeting content.** Follow-up, task-complete,
+  Planner, brief, and capture/meeting-discovery logs record id fragments
+  (task-id prefixes, calendar event-id tails), counts, and reason codes —
+  never task titles, meeting subjects, brief contents, attendee addresses,
+  recipient names, or full AAD ids, at any log level.
 - **`transcriptContent` truncation.** Capped at `MAX_INLINE_TRANSCRIPT_CHARS`
   = 60 000 chars in `src/cos/capture.ts`. Very long meetings (> ~40 min of
   dense speech) may lose the tail. Fix: chunk + summarise, or upgrade to
@@ -1275,14 +1284,14 @@ Grouped by concern. Every var has a code default; only the ones marked
 
 | Env | Default | Notes |
 |---|---|---|
-| `NODE_ENV` | `production` | Only changes the default bind host (`localhost` in `development`). Local-dev value — don't copy `development` to App Service |
+| `NODE_ENV` | — (set `production` on App Service) | `development` binds to `localhost` and is the only value that accepts static `BEARER_TOKEN_*` WorkIQ auth. Set `production` on App Service — don't copy `development` |
 | `HOST` | `0.0.0.0` in prod, `localhost` in dev | Express bind host. `127.0.0.1` in `.env.template` is local-only; omit `HOST` on App Service |
 | `PORT` | `3978` | Express port (App Service supplies its own) |
 | `LOG_LEVEL` | `info` | `error`/`warn`/`info`/`debug`/`trace` |
 | `LOG_HTTP` | `false` | Log every axios call with status + latency (masked auth) |
 | `DEBUG` | — | Bot Framework SDK debug namespaces (`agents:*` prints a lot) |
 | `SKIP_TOOLING_ON_ERRORS` | `false` | `false`: a WorkIQ MCP registration failure fails the turn. `true`: continue without those tools |
-| `BEARER_TOKEN_<MCP_SERVER_NAME>` | — | Dev only, with `USE_AGENTIC_AUTH=false` and `NODE_ENV` ≠ `production`: per-server MCP token for that server's audience (e.g. `BEARER_TOKEN_MCP_MAILTOOLS`). Set while `USE_AGENTIC_AUTH` is not `false`, it is rejected as a configuration error |
+| `BEARER_TOKEN_<MCP_SERVER_NAME>` | — | Dev only, with `USE_AGENTIC_AUTH=false` and `NODE_ENV=development`: per-server MCP token for that server's audience (e.g. `BEARER_TOKEN_MCP_MAILTOOLS`). Set while `USE_AGENTIC_AUTH` is not `false`, it is rejected as a configuration error |
 
 WorkIQ MCP servers are always read from `ToolingManifest.json` (deploy it next
 to `dist/`); there is no Tooling Gateway discovery path.

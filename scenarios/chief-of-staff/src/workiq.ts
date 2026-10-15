@@ -68,10 +68,13 @@ async function getServerToken(
   const devAuth = process.env.USE_AGENTIC_AUTH?.trim().toLowerCase() === 'false';
 
   if (devAuth) {
-    // Static tokens are development-only and must never replace the agentic
-    // exchange in a production deployment.
-    if (process.env.NODE_ENV?.trim().toLowerCase() === 'production') {
-      throw new Error('USE_AGENTIC_AUTH=false (static WorkIQ bearer tokens) is not allowed when NODE_ENV=production');
+    // Static tokens are development-only. Require an explicit
+    // NODE_ENV=development (index.ts treats anything else, including unset,
+    // as non-dev) so a deployment can never fall back to copied dev tokens.
+    if (process.env.NODE_ENV?.trim().toLowerCase() !== 'development') {
+      throw new Error(
+        'USE_AGENTIC_AUTH=false (static WorkIQ bearer tokens) is only allowed when NODE_ENV=development'
+      );
     }
     if (configuredToken) return configuredToken;
     if (sharedToken) return sharedToken;

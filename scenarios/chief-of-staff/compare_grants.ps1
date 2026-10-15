@@ -14,8 +14,12 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-function Show-Grants($label, $clientId) {
-  Write-Host "=== $label (clientId=$clientId) ==="
+function Show-Grants($label, $appId) {
+  # oauth2PermissionGrant.clientId is the client SP's OBJECT id, not its appId.
+  $spObj = az ad sp list --filter "appId eq '$appId'" -o json | ConvertFrom-Json | Select-Object -First 1
+  if (-not $spObj) { Write-Host "=== $label (appId=$appId) === SP not found"; Write-Host ""; return }
+  $clientId = $spObj.id
+  Write-Host "=== $label (appId=$appId, spObjectId=$clientId) ==="
   $grants = az rest --method GET --uri "https://graph.microsoft.com/v1.0/oauth2PermissionGrants?`$filter=clientId eq '$clientId'" -o json | ConvertFrom-Json
   if ($grants.value.Count -eq 0) { Write-Host "  (no grants)" }
   foreach ($g in $grants.value) {

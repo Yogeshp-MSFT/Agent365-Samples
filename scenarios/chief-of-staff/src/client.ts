@@ -130,9 +130,9 @@ export interface ClientOptions {
   humanInitiated?: boolean;
   /**
    * True when the sender is outside the configured leadership team (or the
-   * membership check failed). The agent is then built WITHOUT Planner,
-   * calendar, mail, Teams, or card tools, so protected data can't be read
-   * regardless of what the prompt says.
+   * membership check failed). The agent is then built with NO tools — no
+   * Planner, calendar, mail, Teams, card, or directory/people lookups — so
+   * protected data can't be read regardless of what the prompt says.
    */
   restrictedAccess?: boolean;
 }
@@ -164,11 +164,10 @@ export async function getClient(
   const runId = randomUUID();
   const scopeOptions = { sessionId: runId, humanInitiated, peopleOpts };
 
-  // Graph-backed people/directory tools: resolve display names to AAD Object IDs.
-  const peopleTools = createPeopleTools(peopleOpts);
-
-  // Protected tools (Planner, cards) are only attached for authorized senders.
-  const protectedTools = restricted
+  // Every tool reads through the worker app's tenant-wide application
+  // permissions, so a restricted sender gets NO tools — including the
+  // directory and chat-membership lookups.
+  const tools = restricted
     ? []
     : [
         // Graph-backed Planner tools (mcp_PlannerServer isn't hosted in this tenant).
@@ -177,17 +176,19 @@ export async function getClient(
         createBriefCardTool(peopleOpts),
         // Adaptive Card DM tools for the interactive Follow-up flow.
         ...createFollowupCardTools(peopleOpts),
+        // Graph-backed people/directory tools: resolve display names to AAD Object IDs.
+        ...createPeopleTools(peopleOpts),
       ];
 
   const agent = new Agent({
     name: 'Chief of Staff Agent',
     model: modelName,
     instructions: `${AGENT_INSTRUCTIONS}\n\nThe display name of the current user is "${displayName}".`,
-    tools: instrumentTools([...protectedTools, ...peopleTools], turnContext, scopeOptions),
+    tools: instrumentTools(tools, turnContext, scopeOptions),
   });
 
   if (restricted) {
-    console.log('[client] restricted sender — Planner, card, and WorkIQ MCP tools not attached.');
+    console.log('[client] restricted sender — no tools attached (Planner, card, people, WorkIQ MCP).');
     return new CosAgentClient(agent, peopleOpts, humanInitiated, runId);
   }
 

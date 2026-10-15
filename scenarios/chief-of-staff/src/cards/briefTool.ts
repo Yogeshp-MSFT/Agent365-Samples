@@ -422,7 +422,6 @@ export function createBriefCardTool(opts: BriefToolOptions) {
         if (!args.leaderAadObjectId) {
           return JSON.stringify({ ok: false, error: 'leaderAadObjectId is required' });
         }
-        // Sanitize once and log what the LLM actually decided to send.
         const cleanPriorities = (args.priorities ?? [])
           .map(sanitizeBriefLine)
           .filter((s): s is string => !!s);
@@ -432,20 +431,10 @@ export function createBriefCardTool(opts: BriefToolOptions) {
         const cleanCalendar = (args.calendar ?? [])
           .map(sanitizeBriefLine)
           .filter((s): s is string => !!s);
+        // Log only section counts — brief content is confidential leadership
+        // data and never goes to application logs.
         console.log(
-          '[send_brief_card] args:',
-          JSON.stringify({
-            leader: args.leaderAadObjectId,
-            headline: args.headline ?? null,
-            counts: {
-              priorities: cleanPriorities.length,
-              watch: cleanWatch.length,
-              calendar: cleanCalendar.length,
-            },
-            priorities: cleanPriorities,
-            watchList: cleanWatch,
-            calendar: cleanCalendar,
-          })
+          `[send_brief_card] sections priorities=${cleanPriorities.length} watch=${cleanWatch.length} calendar=${cleanCalendar.length} headline=${args.headline ? 'yes' : 'no'}`
         );
         // Guard: if everything is empty, don't DM an empty card — that just
         // looks broken. Return so the next cron can try again.

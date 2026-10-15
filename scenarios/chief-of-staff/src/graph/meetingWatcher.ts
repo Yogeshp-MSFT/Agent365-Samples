@@ -78,18 +78,29 @@ export async function discoverQualifyingMeetings(
       `${GRAPH_BASE}/users/${encodeURIComponent(graphOwnerUpn)}/calendarView` +
       `?startDateTime=${start}&endDateTime=${end}` +
       `&$select=id,subject,start,end,isOnlineMeeting,onlineMeeting,organizer,attendees` +
-      `&$top=50`;
+      `&$top=100`;
 
     log.debug(
       'meetingWatcher',
-      `reading calendar as ${graphOwnerUpn} (window=[-${watchHours}h, +${forwardHours}h])`
+      `reading watched calendar (window=[-${watchHours}h, +${forwardHours}h])`
     );
 
-    const res = await axios.get(url, {
-      headers: { Authorization: `Bearer ${token}` },
-    });
-
-    const events = (res.data?.value ?? []) as any[];
+    // calendarView is paged (expanded recurrences count individually) — follow
+    // @odata.nextLink until exhausted so busy calendars aren't truncated.
+    const events: any[] = [];
+    let pageUrl: string | null = url;
+    let pages = 0;
+    while (pageUrl) {
+      const res: any = await axios.get(pageUrl, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      events.push(...((res.data?.value ?? []) as any[]));
+      pageUrl = res.data?.['@odata.nextLink'] ?? null;
+      pages++;
+    }
+    if (pages > 1) {
+      log.info('meetingWatcher', `calendarView returned ${events.length} event(s) across ${pages} pages`);
+    }
     const now = Date.now();
     const cosUpnLower = cosAgentUpn.toLowerCase();
     const leaderUpnLower = leaderUpn.toLowerCase();
@@ -102,13 +113,16 @@ export async function discoverQualifyingMeetings(
     const qualifying: QualifyingMeeting[] = [];
     for (const ev of events) {
       const subject = String(ev.subject ?? '(untitled)');
+      // Log-safe reference: never the meeting subject or attendee addresses.
+      // Event ids share a mailbox prefix, so the tail is what distinguishes them.
+      const ref = `event=…${String(ev.id ?? '?').slice(-8)}`;
       if (!ev.isOnlineMeeting) {
-        log.debug('meetingWatcher', `skip "${subject}" — not a Teams online meeting`);
+        log.debug('meetingWatcher', `skip ${ref} — not a Teams online meeting`);
         continue;
       }
       const joinUrl: string | undefined = ev.onlineMeeting?.joinUrl;
       if (!joinUrl) {
-        log.debug('meetingWatcher', `skip "${subject}" — no onlineMeeting.joinUrl on event`);
+        log.debug('meetingWatcher', `skip ${ref} — no onlineMeeting.joinUrl on event`);
         continue;
       }
 
@@ -131,16 +145,14 @@ export async function discoverQualifyingMeetings(
       if (!leaderInvolved) {
         log.debug(
           'meetingWatcher',
-          `skip "${subject}" — leader (${leaderUpnLower}) not on invite (organizer=${organizerAddr})`,
-          { attendees: attendeeAddrs }
+          `skip ${ref} — leader not on invite (attendees=${attendeeAddrs.length})`
         );
         continue;
       }
       if (!cosInvolved) {
         log.debug(
           'meetingWatcher',
-          `skip "${subject}" — CoS (${cosUpnLower}) not on invite`,
-          { attendees: attendeeAddrs }
+          `skip ${ref} — CoS not on invite (attendees=${attendeeAddrs.length})`
         );
         continue;
       }
@@ -153,14 +165,14 @@ export async function discoverQualifyingMeetings(
       // sits on a 404 and re-checks until Teams publishes the transcript, and
       // gives up after CAPTURE_GIVE_UP_AFTER_HOURS if nothing appears.
       if (!isFinite(endMs)) {
-        log.debug('meetingWatcher', `skip "${subject}" — missing end.dateTime`);
+        log.debug('meetingWatcher', `skip ${ref} — missing end.dateTime`);
         continue;
       }
       const endedAlready = endMs < now;
       const startedAlready = isFinite(startMs) && startMs < now;
       log.debug(
         'meetingWatcher',
-        `candidate "${subject}" start=${ev.start?.dateTime ?? '?'} end=${ev.end?.dateTime ?? '?'} startedAlready=${startedAlready} endedAlready=${endedAlready}`
+        `candidate ${ref} start=${ev.start?.dateTime ?? '?'} end=${ev.end?.dateTime ?? '?'} startedAlready=${startedAlready} endedAlready=${endedAlready}`
       );
 
       // Resolve joinWebUrl → onlineMeetingId (still queried as graphOwnerUpn).
@@ -168,14 +180,14 @@ export async function discoverQualifyingMeetings(
       if (!meetingId) {
         log.warn(
           'meetingWatcher',
-          `could not resolve onlineMeetingId for event "${subject}" — skipping`
+          `could not resolve onlineMeetingId for ${ref} — skipping`
         );
         continue;
       }
 
       log.info(
         'meetingWatcher',
-        `✓ QUALIFIED "${subject}" (${endedAlready ? 'ended' : 'in-progress/upcoming'}) meetingId=${meetingId.slice(0, 12)}…`
+        `✓ QUALIFIED ${ref} (${endedAlready ? 'ended' : 'in-progress/upcoming'}) meetingId=${meetingId.slice(0, 12)}…`
       );
       qualifying.push({
         eventId: String(ev.id),

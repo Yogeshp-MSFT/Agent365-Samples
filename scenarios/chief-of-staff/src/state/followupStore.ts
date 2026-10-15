@@ -34,7 +34,7 @@ export interface PendingFollowup {
   extendedTo?: string; // ISO — new due date if extension approved
   /** Due date proposed to the leader for approval. Authoritative for approval. */
   extensionRequestedTo?: string;
-  extensionStatus?: 'pending' | 'approved' | 'rejected';
+  extensionStatus?: 'pending' | 'approved' | 'rejected' | 'cancelled';
   /** Owner request (extension / blocker) that still has to reach the leader.
    *  Written BEFORE the send and cleared only after delivery, so a failed
    *  send is retried by the scheduler instead of being lost. */
@@ -237,6 +237,32 @@ export function findOpenFollowupsForTask(taskId: string): PendingFollowup[] {
     if (f.status === 'pending' || f.status === 'escalated') out.push(f);
   }
   return out;
+}
+
+/**
+ * The task is complete: resolve every follow-up for it and cancel any owner
+ * request still waiting for delivery or for the leader's decision, so neither
+ * the retry pass nor a typed/old-card approval can revive it.
+ * Returns the number of records changed.
+ */
+export function cancelOutstandingRequestsForTask(taskId: string): number {
+  let changed = 0;
+  for (const f of store.values()) {
+    if (f.taskId !== taskId) continue;
+    const outstanding =
+      f.status === 'pending' ||
+      f.status === 'escalated' ||
+      f.status === 'responded' ||
+      !!f.pendingLeaderDelivery ||
+      f.extensionStatus === 'pending';
+    if (!outstanding) continue;
+    f.status = 'resolved';
+    delete f.pendingLeaderDelivery;
+    if (f.extensionStatus === 'pending') f.extensionStatus = 'cancelled';
+    store.set(f.followupId, f);
+    changed++;
+  }
+  return changed;
 }
 
 export function listAll(): PendingFollowup[] {

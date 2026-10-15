@@ -18,7 +18,7 @@ import type { Client } from '../client';
 import { acquireAppOnlyGraphToken } from '../graph/graphAppToken';
 import { getPlannerTaskDetails } from '../graph/plannerTools';
 import { sendPlainDmToUser } from '../cards/followupCards';
-import { findOpenFollowupsForTask, markResolved } from '../state/followupStore';
+import { cancelOutstandingRequestsForTask } from '../state/followupStore';
 
 export interface TaskCompletePayload {
   taskId?: string;
@@ -88,16 +88,14 @@ export async function runTaskComplete(
     return { complete: true, delivered };
   }
 
-  // Clear any outstanding follow-ups for this task so the escalation sweep
-  // doesn't fire an "Escalation — no reply" card AFTER we've already
-  // confirmed completion. Cheap, in-memory — safe to call every time.
-  const openFollowups = findOpenFollowupsForTask(payload.taskId);
-  if (openFollowups.length > 0) {
-    for (const f of openFollowups) markResolved(f.followupId);
+  // Clear everything outstanding for this task: open check-ins (so the
+  // escalation sweep doesn't fire after completion) AND owner requests still
+  // waiting for delivery or a leader decision (so no obsolete extension or
+  // blocker card reaches the leader). Cheap, in-memory — safe every time.
+  const cancelled = cancelOutstandingRequestsForTask(payload.taskId);
+  if (cancelled > 0) {
     console.log(
-      `[taskComplete] resolved ${openFollowups.length} open follow-up(s) for task ${payload.taskId} (was ${openFollowups
-        .map((f) => f.status)
-        .join(', ')}).`
+      `[taskComplete] cancelled ${cancelled} outstanding follow-up/request record(s) for task=${payload.taskId.slice(0, 8)}…`
     );
   }
 

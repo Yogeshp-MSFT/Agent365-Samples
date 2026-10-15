@@ -473,8 +473,8 @@ acceptance test — if all pass, someone else can reproduce your setup.
 **Success signals in the log:**
 
 ```text
-[meetingWatcher] ✓ QUALIFIED "…" (ended) meetingId=…
-[capturePoller] READY: "…" transcript=✓ content=✓ (N ch) insights=…
+[meetingWatcher] ✓ QUALIFIED event=…<id-tail> (ended) meetingId=…
+[capturePoller] READY: event=…<id-tail> transcript=✓ content=✓ (N ch) insights=…
 [capture] trigger received {…transcriptContentChars:…}
 [capture] DEBUG dispatching prompt to LLM (…)
 POST /planner/tasks   × N
@@ -501,18 +501,23 @@ POST /planner/tasks   × N
     approval card. Leader clicks **Approve new date** → agent PATCHes the
     Planner due date and, only once that succeeds, confirms to the leader
     and DMs the owner. If the PATCH fails, both are told it isn't synced
-    yet and the request stays pending for a retry.
+    yet and the request stays pending for a retry. Once a request is
+    approved, rejected, or cancelled, its old card can't change Planner
+    again.
   - **I'm blocked** → agent proposes 3 slots (10:00 / 14:00 / 16:00 in
     `BRIEF_DISPLAY_TZ`) and DMs the leader a meeting picker. Leader clicks a
     slot → agent books the calendar invite first; only when the booking
     returns `OK` does it close the check-in and DM the owner that the meeting
     is scheduled. A failed booking leaves the check-in open, tells the owner
-    nothing was booked, and lets the leader pick another slot.
+    nothing was booked, and lets the leader pick another slot. Only one
+    booking runs at a time per card, so clicking a second slot while the
+    first is booking doesn't create a second meeting.
   - If the leader's card can't be delivered (e.g. the leader hasn't messaged
     the agent yet), the extension/blocker request is saved and retried on
     every follow-up cycle (up to `LEADER_DELIVERY_MAX_ATTEMPTS`, default 24);
     the owner is DM'd once it's delivered, or told to contact the leader
-    directly if it never is.
+    directly if it never is. If the task is completed in the meantime, the
+    queued request is dropped instead of being sent.
 
 Every card also accepts a plain-text keyword reply. Owners can reply
 `ontrack`, `extend`, or `blocked`. The leader can reply `approve` or
@@ -564,7 +569,8 @@ the in-memory resolve fired by `runTaskComplete`).
   ```
 - Agent recognises only an affirmative statement that the work is already
   done (e.g. "is done", "I've finished", "completed"). Negations ("I have
-  not completed…"), questions ("Is … done?"), and future or conditional
+  not completed…"), questions ("Is … done?"), requests ("Please check
+  whether … is done", "can you confirm …"), and future or conditional
   phrasing ("I will finish …", "almost done", "done once Bob replies") are
   never treated as completion. Quoted titles are ignored when classifying
   the sentence.
@@ -589,8 +595,8 @@ the in-memory resolve fired by `runTaskComplete`).
 - Agent runs a single LLM turn with `planner_list_tasks` +
   `mcp_CalendarTools` to compose a bulleted answer.
 - Non-leadership-team members get a polite refusal instead of leaking any
-  task titles — and their turn runs without Planner, calendar, mail, Teams,
-  or card tools attached. The same gate applies to **email**: the sender is
+  task titles — and their turn runs with no tools at all (no Planner,
+  calendar, mail, Teams, card, or directory/people lookups). The same gate applies to **email**: the sender is
   resolved to an Entra user (the channel's AAD id, or a lookup of the sender
   address), and a sender who isn't a member — or can't be identified, such
   as an external address — gets the restricted toolset. If
@@ -612,7 +618,7 @@ the in-memory resolve fired by `runTaskComplete`).
 - Within one meeting-poll tick (≤ 60 s), the log should show:
   ```
   [persistentMap] hydrated …/pending-captures.json: kept=N pruned=0
-  [meetingWatcher] ✓ QUALIFIED "…" (ended) …
+  [meetingWatcher] ✓ QUALIFIED event=…<id-tail> (ended) …
   ```
   and **no** `[capturePoller] discovery: added …` line for that meeting —
   it is discovered again, but its capture is already recorded as complete,
@@ -666,10 +672,12 @@ The same code runs on Azure App Service (Linux, Node 20):
 - Deploy `ToolingManifest.json` next to `dist/` — the WorkIQ MCP servers are
   read from it at runtime (there is no gateway discovery).
 - Set the env vars from §5 in App Service Configuration, **except the
-  local-only values**: omit `HOST` and `NODE_ENV` (or set `HOST=0.0.0.0`
-  and `NODE_ENV=production`), and let App Service supply `PORT`. Copying
+  local-only values**: set `NODE_ENV=production`, omit `HOST` (or set
+  `HOST=0.0.0.0`), and let App Service supply `PORT`. Copying
   `HOST=127.0.0.1` or `NODE_ENV=development` binds the server to loopback
-  and App Service can't reach it.
+  and App Service can't reach it. Keep `USE_AGENTIC_AUTH=true` and don't copy
+  any `BEARER_TOKEN_*` values — static WorkIQ tokens are accepted only when
+  `NODE_ENV=development`.
 - Register App Service's `https://…/api/messages` URL as the messaging
   endpoint of your agent's bot channel
 
