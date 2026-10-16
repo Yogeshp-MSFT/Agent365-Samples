@@ -36,6 +36,24 @@ Set up the Python virtual environment manually before running the agent or deplo
 	- Windows PowerShell: `.venv\Scripts\Activate.ps1`
 	- macOS/Linux: `source .venv/bin/activate`
 
+## Observability S2S export
+
+A365 export is disabled by default. To send traces to Agent 365, set the dedicated OBS credentials and enable the exporter:
+
+```dotenv
+ENABLE_A365_OBSERVABILITY_EXPORTER=true
+AGENT365_OBS_TENANT_ID=<<YOUR_TENANT_ID>>
+AGENT365_OBS_AGENT_ID=<<YOUR_AGENT_INSTANCE_CLIENT_ID>>
+AGENT365_OBS_BLUEPRINT_CLIENT_ID=<<YOUR_BLUEPRINT_CLIENT_ID>>
+AGENT365_OBS_BLUEPRINT_CLIENT_SECRET=<<YOUR_BLUEPRINT_CLIENT_SECRET>>
+```
+
+`AGENT365_OBS_AGENT_ID` is the actual runtime agent instance client ID, not the blueprint ID, service-principal object ID, or agent-user ID. `ENABLE_A365_OBSERVABILITY_EXPORTER=false` disables A365 HTTP export; samples using the Microsoft OpenTelemetry distro can still enrich spans for other exporters.
+
+The sample-local provider is single-instance: one configured tenant and agent instance, plus a separate blueprint secret. It has no managed-identity option and requests tokens from `login.microsoftonline.com`, so sovereign clouds need provider changes. Multi-instance or multi-tenant deployments should cache per agent/tenant and reuse the hosting connection credential.
+
+Accepted OBS tokens are app-only tokens with `idtyp=app`, valid nonempty `roles`, or absent `idtyp` with nonempty `oid == sub`; any `scp` claim is rejected. See [Agent 365 observability S2S export](../../../docs/observability-s2s.md) for route details and validation commands.
+
 ## Working with User Identity
 
 On every incoming message, the A365 platform populates `activity.from_property` with basic user

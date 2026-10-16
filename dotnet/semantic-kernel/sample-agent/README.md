@@ -48,6 +48,20 @@ Simplified profile for early local development using bearer token authentication
 
 > **Note**: Bearer tokens are for development only and expire regularly. Refresh with `a365 develop get-token`.
 
+## Observability
+
+A365 export is disabled by default. To send traces to Agent 365, set `EnableAgent365Exporter=true` and configure the separate `Agent365Observability` values: `TenantId` (agent home tenant GUID), `AgentId` (actual agent instance client ID), and `BlueprintClientId`. For Azure, set `UseManagedIdentity=true`; optional `ManagedIdentityClientId` selects a user-assigned identity, otherwise the system-assigned identity is used. The blueprint federation must already exist. For local development, set `UseManagedIdentity=false` and supply `BlueprintClientSecret` through user secrets or the `Agent365Observability__BlueprintClientSecret` environment variable.
+
+The provider in `Observability/` obtains a blueprint T1 using `client_credentials`, `fmi_path=AgentId`, and `api://AzureADTokenExchange/.default`, then uses T1 as the agent's client assertion for `api://9b975845-388f-4429-889e-eab1ef63949c/.default`. This is the documented app-only protocol, not OBO or `user_fic`. Existing business MCP/Graph tokens, auth handlers, and original turn baggage remain unchanged; a developer bearer token cannot authenticate S2S OBS.
+
+This sample provider is single-instance: one configured tenant and agent instance. Multi-instance or multi-tenant deployments should cache per agent/tenant and reuse the hosting connection credential. The provider requests tokens from `login.microsoftonline.com`; sovereign clouds need provider changes.
+
+An app-only OBS token with `idtyp=app`, or without `idtyp` but with `oid` equal to `sub`, may omit `roles` or have `roles: []`. Valid nonempty application roles also remain supported when `idtyp` is absent. Any `scp` claim is rejected. For registered blueprint agents, do not add an `Agent365.Observability.OtelWrite` grant solely to populate `roles`. For AI Teammates, complete the OtelWrite application-role step printed by `a365 setup all --aiteammate`; AI Teammate S2S without that step has not been validated.
+
+Missing/placeholder settings or using the blueprint as `AgentId` fail when export is enabled; with export disabled, placeholders do not block local/Playground startup. Export tenant/agent mismatches, delegated `scp`, explicit non-app/null `idtyp`, malformed `roles`, invalid responses, and expired tokens fail closed. The isolated cache refreshes 60 seconds before the earliest expiry.
+
+Microsoft.OpenTelemetry 1.0.1 is configured with `o.Agent365.Exporter.UseS2SEndpoint = true` and the dedicated provider's `TokenResolver` only when export is enabled. See [Agent 365 observability S2S export](../../../docs/observability-s2s.md) for the route finding and token contract.
+
 ## Working with User Identity
 
 On every incoming message, the A365 platform populates `Activity.From` with basic user information — always available with no API calls or token acquisition:
