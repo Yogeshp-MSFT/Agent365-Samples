@@ -48,8 +48,8 @@ export async function runCapture(
     (payload.actionItems?.length ?? 0) + (payload.meetingNotes?.length ?? 0);
   const transcriptChars = payload.transcriptContent?.length ?? 0;
   log.info('capture', 'trigger received', {
-    meetingId: payload.meetingId,
-    transcriptId: payload.transcriptId,
+    meetingId: payload.meetingId ? `${payload.meetingId.slice(0, 8)}…` : undefined,
+    transcriptId: payload.transcriptId ? `${payload.transcriptId.slice(0, 8)}…` : undefined,
     hasSubject: !!payload.subject,
     hasInsights: insightsCount > 0,
     actionItemCount: payload.actionItems?.length ?? 0,
@@ -61,6 +61,10 @@ export async function runCapture(
     // Thrown so the scheduler keeps the capture retryable instead of
     // acknowledging a meeting that was never processed.
     throw new Error('runCapture: missing meetingId or transcriptId');
+  }
+  if (!payload.transcriptContent && insightsCount === 0) {
+    // No readable content: never acknowledge a meeting the model can't read.
+    throw new Error('runCapture: no transcript body or Copilot insights available yet');
   }
 
   const planId = (await getPlannerPlanId()) ?? '<PLANNER_PLAN_ID missing>';

@@ -15,6 +15,7 @@ import { TurnContext } from '@microsoft/agents-hosting';
 import type { Client } from '../client';
 import {
   cancelOutstandingRequestsForTask,
+  cancelOwnerRequest,
   findLatestOpenFollowupForOwner,
   findOpenFollowupForOwnerTask,
   findPendingExtensionRequests,
@@ -43,7 +44,7 @@ import {
   sendPlainDmToUser,
   type CardToolOptions,
 } from './followupCards';
-import { civilDateInZone, DISPLAY_TZ, zonedWallTimeToUtc } from '../util/time';
+import { civilDateInZone, DISPLAY_TZ, formatDisplayDate, zonedWallTimeToUtc } from '../util/time';
 
 export interface CardActionResult {
   handled: boolean;
@@ -169,31 +170,37 @@ export function proposeMeetingSlots(now = new Date()): Array<{ label: string; is
 
 /**
  * Compute a sensible new due date for an extension request — 5 business days
- * from `max(today, currentDue)`. Deterministic; the LLM used to hallucinate
- * this and picked dates from its training-cutoff era (e.g. "2023-10-05"),
- * which Planner then rejected because the past date was before startDate.
+ * after `max(today, currentDue)`, counted on the BRIEF_DISPLAY_TZ calendar so
+ * the date shown on cards and confirmations is the date that was computed.
+ * Deterministic; the LLM used to hallucinate this and picked dates from its
+ * training-cutoff era (e.g. "2023-10-05"), which Planner then rejected.
  *
- * Returns an ISO 8601 string like "2026-07-21T00:00:00.000Z".
+ * Returns the UTC instant of 17:00 (end of business day) on the target local
+ * date, so the date never shifts when rendered in DISPLAY_TZ.
  */
-function computeNextDueDateIso(currentDueIso?: string | null): string {
-  const now = Date.now();
+export function computeNextDueDateIso(currentDueIso?: string | null, now: number = Date.now()): string {
   let base = now;
   if (currentDueIso) {
     const parsed = Date.parse(currentDueIso);
     if (!Number.isNaN(parsed) && parsed > now) base = parsed;
   }
-  // Anchor at midnight UTC to keep the value tidy in cards and Planner.
-  const d = new Date(base);
-  d.setUTCHours(0, 0, 0, 0);
+  // Civil date in the display timezone; calendar arithmetic on a UTC carrier.
+  const { year, month, day } = civilDateInZone(new Date(base), DISPLAY_TZ);
+  const d = new Date(Date.UTC(year, month - 1, day));
 
   // Add 5 business days (skip Sat=6, Sun=0).
   let added = 0;
   while (added < 5) {
     d.setUTCDate(d.getUTCDate() + 1);
-    const day = d.getUTCDay();
-    if (day !== 0 && day !== 6) added++;
+    const dow = d.getUTCDay();
+    if (dow !== 0 && dow !== 6) added++;
   }
-  return d.toISOString();
+  return zonedWallTimeToUtc(d.getUTCFullYear(), d.getUTCMonth() + 1, d.getUTCDate(), 17, 0, DISPLAY_TZ).toISOString();
+}
+
+/** Due-date label for chat confirmations, in BRIEF_DISPLAY_TZ (matches cards). */
+function dueLabel(iso: string): string {
+  return formatDisplayDate(iso, { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' });
 }
 
 /**
@@ -312,7 +319,7 @@ export function isAffirmativeCompletion(rawText: string): boolean {
     /\b(not|never|no longer|nothing|yet to|still working|still in progress|not yet|cannot|can't|won't|isn't|aren't|wasn't|weren't|haven't|hasn't|hadn't|didn't|doesn't|don't)\b|n't\b/;
   if (negation.test(text)) return false;
   const nonFactual =
-    /\b(will|shall|going to|gonna|plan(?:ning)? to|about to|need to|needs to|have to|has to|want to|wants to|trying to|try to|hope to|hoping to|should|would|could|might|may|almost|nearly|soon|later|tomorrow|next week|once|after|before|until|unless|if|when|whether)\b|'ll\b/;
+    /\b(will|shall|going to|gonna|plan(?:ning)? to|about to|need to|needs to|have to|has to|want to|wants to|wanted|trying to|try to|hope|hopes|hoped|hoping|wish|wishes|wished|if only|should|would|could|might|may|maybe|perhaps|probably|possibly|apparently|supposedly|ideally|supposed to|meant to|expect|expects|expected|assume|assumed|think|thought|believe|guess|imagine|pretend|almost|nearly|soon|later|tomorrow|next week|once|after|before|until|unless|if|when|whether)\b|'ll\b|'d\b/;
   if (nonFactual.test(text)) return false;
   // Requests and imperatives ("please check …", "can you confirm …", "let me
   // know …", "make sure X is done") ask about status — they don't report it.
@@ -712,7 +719,7 @@ async function routeIntent(
       : { ok: false, error: 'follow-up record missing' };
     if (res.ok) {
       await context.sendActivity(
-        `Thanks — I\'ve asked the leader to approve an extension to **${suggestedNewDueDate.slice(0, 10)}**. I\'ll DM you as soon as they decide.`
+        `Thanks — I\'ve asked the leader to approve an extension to **${dueLabel(suggestedNewDueDate)}**. I\'ll DM you as soon as they decide.`
       );
     } else {
       await context.sendActivity(
@@ -784,7 +791,7 @@ async function routeIntent(
       if (pending.length > 1) {
         const list = pending
           .slice(0, 5)
-          .map((p) => `• "${p.taskTitle}" (${p.ownerName}) → ${p.extensionRequestedTo?.slice(0, 10) ?? '?'}`)
+          .map((p) => `• "${p.taskTitle}" (${p.ownerName}) → ${p.extensionRequestedTo ? dueLabel(p.extensionRequestedTo) : '?'}`)
           .join('\n');
         await context.sendActivity(
           `Several extension requests are waiting:\n${list}\n\nPlease use the buttons on the matching card so I update the right task.`
@@ -879,6 +886,34 @@ async function routeIntent(
           `An unblock meeting for "${taskTitle}" was already booked from this card, so I didn't book another one.`
         );
         return { handled: true };
+      }
+      // A card already delivered stays clickable after the request closes
+      // (task completed, deferred, reassigned) — re-validate before booking.
+      const current = followup ? getFollowup(followup.followupId) : undefined;
+      if (current?.status === 'resolved') {
+        bookMeetingSeen.delete(dedupeKey);
+        await context.sendActivity(
+          `That blocker request for "${taskTitle}" is already closed, so I didn't book a meeting.`
+        );
+        return { handled: true };
+      }
+      const taskIdToCheck = followup?.taskId;
+      if (taskIdToCheck) {
+        const live = await getPlannerTaskDetails(taskIdToCheck);
+        if ((live.ok && live.percentComplete >= 100) || (!live.ok && live.notFound)) {
+          if (followup) cancelOwnerRequest(followup.followupId);
+          await context.sendActivity(
+            `"${taskTitle}" is ${live.ok ? 'already complete' : 'no longer in Planner'}, so I didn't book an unblock meeting.`
+          );
+          return { handled: true };
+        }
+        if (!live.ok) {
+          bookMeetingSeen.delete(dedupeKey);
+          await context.sendActivity(
+            `I couldn't confirm "${taskTitle}" is still open in Planner, so I didn't book anything. Please click the slot again in a minute.`
+          );
+          return { handled: true };
+        }
       }
       // Book FIRST. The follow-up is resolved and the owner is told the meeting
       // is scheduled only after the calendar tool returns exactly "OK".
@@ -1083,7 +1118,7 @@ async function decideExtension(
       client.getPeopleOpts(),
       target.ownerAad,
       `⏳ **Extension approved, not yet synced: ${taskTitle}**\n\n` +
-        `The leader approved your extension to **${newDueDate.slice(0, 10)}**, but Planner hasn't been updated yet. Treat the current Planner due date as unchanged until I confirm.`
+        `The leader approved your extension to **${dueLabel(newDueDate)}**, but Planner hasn't been updated yet. Treat the current Planner due date as unchanged until I confirm.`
     );
     await context.sendActivity(
       `⚠️ I couldn't update Planner for "${taskTitle}" (${r.error}). The request is still pending — click **Approve** again to retry, or edit the due date manually.` +
@@ -1098,7 +1133,7 @@ async function decideExtension(
   // 2) DM the owner deterministically — no LLM.
   const dmText =
     `✅ **Extension approved: ${taskTitle}**\n\n` +
-    `The leader approved your extension request. Your new due date is **${r.newDue.slice(0, 10)}**, and Planner has been updated.\n\n` +
+    `The leader approved your extension request. Your new due date is **${dueLabel(r.newDue)}**, and Planner has been updated.\n\n` +
     `Reply here if anything else changes.`;
   const dm = await sendPlainDmToUser(client.getPeopleOpts(), target.ownerAad, dmText);
   const ownerNote = dm.ok
@@ -1106,7 +1141,7 @@ async function decideExtension(
     : ` (Tried to DM ${ownerName} but hit an error: ${dm.error ?? 'unknown'}.)`;
 
   await context.sendActivity(
-    `✅ Extension approved for "${taskTitle}". Planner updated: due date moved to ${r.newDue.slice(0, 10)}.${ownerNote}`
+    `✅ Extension approved for "${taskTitle}". Planner updated: due date moved to ${dueLabel(r.newDue)}.${ownerNote}`
   );
   return { handled: true };
 }
@@ -1135,7 +1170,9 @@ async function handleManualReassign(
   context: TurnContext,
   followup: PendingFollowup | undefined
 ): Promise<CardActionResult> {
-  if (followup) markResolved(followup.followupId);
+  // Reassigning closes the owner's request too: a pending extension or a
+  // queued leader card for this check-in must not be approvable later.
+  if (followup) cancelOwnerRequest(followup.followupId);
   const taskTitle = followup?.taskTitle ?? 'this task';
   await context.sendActivity(
     `🔀 To reassign **"${taskTitle}"**, change its assignee in Planner. ` +
@@ -1169,7 +1206,7 @@ async function handleActionForwardToExtendOffer(
   if (res.ok) {
     if (followup) recordExtensionRequest(followup.followupId, suggestedNewDueDate);
     await context.sendActivity(
-      `⏰ Extension proposed. I've sent you an approval card for "${followup?.taskTitle ?? 'the task'}" with a new due date of **${suggestedNewDueDate.slice(0, 10)}** — approve it to update Planner and notify ${followup?.ownerName ?? 'the owner'}.`
+      `⏰ Extension proposed. I've sent you an approval card for "${followup?.taskTitle ?? 'the task'}" with a new due date of **${dueLabel(suggestedNewDueDate)}** — approve it to update Planner and notify ${followup?.ownerName ?? 'the owner'}.`
     );
   } else {
     await context.sendActivity(

@@ -33,6 +33,8 @@ export interface SimpleMeetingNote {
 export interface PendingCapture {
   eventId: string; // calendar event id — primary dedupe key
   meetingId: string; // Graph onlineMeeting id
+  /** Teams join URL — shared by every occurrence of a recurring meeting. */
+  joinWebUrl?: string;
   subject: string;
   organizerAad?: string;
   ownerUpn: string; // whose Graph path to query — normally LEADER_UPN

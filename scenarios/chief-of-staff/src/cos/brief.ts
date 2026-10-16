@@ -66,11 +66,22 @@ async function fetchLeaderCalendar(
   const url =
     `${GRAPH_BASE}/users/${encodeURIComponent(leaderUpn)}/calendarView` +
     `?startDateTime=${now.toISOString()}&endDateTime=${end.toISOString()}` +
-    `&$select=subject,start,end&$orderby=start/dateTime&$top=25`;
-  const res = await axios.get(url, {
-    headers: { Authorization: `Bearer ${token}`, Prefer: 'outlook.timezone="UTC"' },
-  });
-  return (res.data?.value ?? []) as CalEvent[];
+    `&$select=subject,start,end&$orderby=start/dateTime&$top=50`;
+  // calendarView is paged — follow @odata.nextLink so a busy day isn't
+  // silently cut off at the first page.
+  const events: CalEvent[] = [];
+  let pageUrl: string | null = url;
+  let pages = 0;
+  while (pageUrl) {
+    const res: any = await axios.get(pageUrl, {
+      headers: { Authorization: `Bearer ${token}`, Prefer: 'outlook.timezone="UTC"' },
+    });
+    events.push(...((res.data?.value ?? []) as CalEvent[]));
+    pageUrl = res.data?.['@odata.nextLink'] ?? null;
+    pages++;
+  }
+  if (pages > 1) console.log(`[brief] calendarView returned ${events.length} event(s) across ${pages} pages`);
+  return events;
 }
 
 // Demo tenant runs in UTC, but the leader is in India — always render
@@ -146,7 +157,7 @@ async function resolveDisplayName(token: string, aad: string): Promise<string> {
     briefNameCache.set(aad, value);
     return value;
   } catch (err) {
-    console.warn(`[brief] resolveDisplayName failed for aad=${aad}:`, (err as Error)?.message);
+    console.warn(`[brief] resolveDisplayName failed for aad=${aad.slice(0, 8)}…:`, (err as Error)?.message);
     const fallback = aad.slice(0, 8);
     briefNameCache.set(aad, fallback);
     return fallback;
@@ -224,7 +235,7 @@ export async function runBrief(
   const leaderAad =
     process.env.LEADER_AAD_ID?.trim() || (await client.resolveUpnToAad(leaderUpn));
   if (!leaderAad) {
-    console.warn(`[brief] Could not resolve LEADER_UPN=${leaderUpn} to an AAD — skipping.`);
+    console.warn(`[brief] Could not resolve LEADER_UPN to an AAD — skipping.`);
     return;
   }
 
@@ -395,7 +406,7 @@ export async function runBrief(
   const adapter = (ctx as any).adapter as CloudAdapter | undefined;
   if (!adapter || !hasConversationRef(leaderAad)) {
     console.warn(
-      `[brief] No ConversationReference for leader aad=${leaderAad} — leader must DM the agent once.`
+      `[brief] No ConversationReference for leader aad=${leaderAad.slice(0, 8)}… — leader must DM the agent once.`
     );
     return;
   }

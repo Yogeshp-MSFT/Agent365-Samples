@@ -98,14 +98,28 @@ async function resolveDisplayName(token: string, aad: string): Promise<string | 
  * IMPORTANT: cooldowns are per-owner. If the task was reassigned (e.g.
  * Mario clicked "On track" and then the leader reassigned to Peyton),
  * the NEW owner deserves a fresh check-in — the old cooldown doesn't
- * apply to them.
- *
- * As a side-effect, if there's a pending/escalated followup for a
- * DIFFERENT owner, we mark it resolved (cleanup) since that owner is no
- * longer responsible.
+ * apply to them. Co-assignees each have their own cooldown; check-ins for
+ * people no longer assigned are cleaned up by resolveOrphanedFollowups.
  */
 const FOLLOWUP_COOLDOWN_HOURS = Number(process.env.FOLLOWUP_COOLDOWN_HOURS ?? '4');
 const MEETING_SCHEDULED_COOLDOWN_HOURS = 24;
+
+/**
+ * Resolve open check-ins for people who are no longer assigned to the task.
+ * Co-owners who are still assigned keep their own check-ins.
+ */
+function resolveOrphanedFollowups(taskId: string, currentAssignees: Set<string>): void {
+  for (const f of listAll()) {
+    if (f.taskId !== taskId) continue;
+    if (currentAssignees.has(f.ownerAad.toLowerCase())) continue;
+    if (f.status === 'pending' || f.status === 'escalated') {
+      markResolved(f.followupId, { meetingScheduledAt: undefined });
+      console.log(
+        `[followup] auto-resolving orphaned followup ${f.followupId.slice(0, 8)}… — owner ${f.ownerAad.slice(0, 8)}… is no longer assigned`
+      );
+    }
+  }
+}
 
 function hasBlockingFollowupForTask(
   taskId: string,
@@ -116,20 +130,10 @@ function hasBlockingFollowupForTask(
   const meetingCutoff = now - MEETING_SCHEDULED_COOLDOWN_HOURS * 60 * 60 * 1000;
   const currentOwnerLc = currentOwnerAad.toLowerCase();
 
+  // Cooldowns are per owner: each co-assignee has their own history.
   for (const f of listAll()) {
     if (f.taskId !== taskId) continue;
-    const sameOwner = f.ownerAad.toLowerCase() === currentOwnerLc;
-
-    // Task was reassigned since this followup was created — clean up any
-    // orphaned pending/escalated cards for the OLD owner and continue.
-    if (!sameOwner && (f.status === 'pending' || f.status === 'escalated')) {
-      markResolved(f.followupId, { meetingScheduledAt: undefined });
-      console.log(
-        `[followup] auto-resolving orphaned followup ${f.followupId.slice(0, 8)}… — task reassigned from ${f.ownerAad.slice(0, 8)}… to ${currentOwnerAad.slice(0, 8)}…`
-      );
-      continue;
-    }
-    if (!sameOwner) continue;
+    if (f.ownerAad.toLowerCase() !== currentOwnerLc) continue;
 
     if (f.status === 'pending' || f.status === 'escalated') {
       return { blocked: true, reason: `open followup ${f.followupId.slice(0, 8)}…` };
@@ -236,50 +240,56 @@ export async function runFollowup(
       skip(t, 'no-assignee');
       continue;
     }
-    const ownerAad = assigneeAads[0];
-    const block = hasBlockingFollowupForTask(t.id, ownerAad);
-    if (block.blocked) {
-      skip(t, block.reason);
-      continue;
-    }
+    resolveOrphanedFollowups(t.id, new Set(assigneeAads.map((a) => a.toLowerCase())));
 
-    const ownerName = await resolveDisplayName(token, ownerAad);
-    if (!ownerName) {
-      skip(t, 'owner-name-unresolved');
-      continue;
-    }
-    if (!adapter || !hasConversationRef(ownerAad)) {
-      skip(t, 'no-conversation-ref (owner has not messaged the agent yet)');
-      continue;
-    }
+    // Every current assignee gets their own check-in, cooldown, and delivery
+    // result — one co-owner without a chat reference doesn't block the others.
+    for (const ownerAad of assigneeAads) {
+      const owner = `owner=${ownerAad.slice(0, 8)}…`;
+      const block = hasBlockingFollowupForTask(t.id, ownerAad);
+      if (block.blocked) {
+        skip(t, `${owner} ${block.reason}`);
+        continue;
+      }
 
-    const record = createFollowup({
-      taskId: t.id,
-      taskTitle: t.title,
-      ownerAad,
-      ownerName,
-      dueDate: t.dueDateTime ?? undefined,
-    });
+      const ownerName = await resolveDisplayName(token, ownerAad);
+      if (!ownerName) {
+        skip(t, `${owner} owner-name-unresolved`);
+        continue;
+      }
+      if (!adapter || !hasConversationRef(ownerAad)) {
+        skip(t, `${owner} no-conversation-ref (owner has not messaged the agent yet)`);
+        continue;
+      }
 
-    const cardArgs: FollowupCheckInArgs = {
-      taskId: t.id,
-      taskTitle: t.title,
-      ownerAadObjectId: ownerAad,
-      ownerName,
-      dueDate: t.dueDateTime ?? null,
-    };
-    const card = buildFollowupCheckInCard(cardArgs, record.followupId);
+      const record = createFollowup({
+        taskId: t.id,
+        taskTitle: t.title,
+        ownerAad,
+        ownerName,
+        dueDate: t.dueDateTime ?? undefined,
+      });
 
-    try {
-      await sendCardProactively({ adapter, botAppId, recipientAad: ownerAad, card });
-      cardsSent++;
-      console.log(`[followup] ✔ sent check-in for ${ref(t.id)} to owner=${ownerAad.slice(0, 8)}…`);
-    } catch (err) {
-      // The owner never received this reminder: drop the record so the next
-      // tick retries and the escalation sweep can't report it as ignored.
-      deleteFollowup(record.followupId);
-      skipped.push(`${ref(t.id)} send failed: ${(err as Error)?.message}`);
-      console.error(`[followup] send failed for ${ref(t.id)} — will retry next tick:`, (err as Error)?.message);
+      const cardArgs: FollowupCheckInArgs = {
+        taskId: t.id,
+        taskTitle: t.title,
+        ownerAadObjectId: ownerAad,
+        ownerName,
+        dueDate: t.dueDateTime ?? null,
+      };
+      const card = buildFollowupCheckInCard(cardArgs, record.followupId);
+
+      try {
+        await sendCardProactively({ adapter, botAppId, recipientAad: ownerAad, card });
+        cardsSent++;
+        console.log(`[followup] ✔ sent check-in for ${ref(t.id)} to owner=${ownerAad.slice(0, 8)}…`);
+      } catch (err) {
+        // The owner never received this reminder: drop the record so the next
+        // tick retries and the escalation sweep can't report it as ignored.
+        deleteFollowup(record.followupId);
+        skipped.push(`${ref(t.id)} ${owner} send failed`);
+        console.error(`[followup] send failed for ${ref(t.id)} ${owner} — will retry next tick:`, (err as Error)?.message);
+      }
     }
   }
 

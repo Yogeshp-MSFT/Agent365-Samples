@@ -33,6 +33,11 @@ function maskGuid(g: string): string {
   return g.length > 10 ? `${g.slice(0, 4)}…${g.slice(-4)}` : g;
 }
 
+function maskUpn(u: string): string {
+  const at = u.indexOf('@');
+  return at > 0 ? `${u.slice(0, Math.min(3, at))}…@…` : maskGuid(u);
+}
+
 function shortId(s: string): string {
   return s.length > 12 ? `${s.slice(0, 6)}…${s.slice(-4)}` : s;
 }
@@ -87,7 +92,7 @@ export function printStartupBanner(): void {
   if (leaderAad) {
     ok('LEADER_AAD_ID', maskGuid(leaderAad));
   } else if (leaderUpn) {
-    ok('LEADER_UPN', leaderUpn, 'LEADER_AAD_ID will auto-resolve on first turn');
+    ok('LEADER_UPN', maskUpn(leaderUpn), 'LEADER_AAD_ID will auto-resolve on first turn');
   } else {
     err(
       'LEADER_UPN',
@@ -151,7 +156,7 @@ export function printStartupBanner(): void {
   if (cosAgentUpn) {
     ok(
       'COS_AGENT_UPN',
-      cosAgentUpn,
+      maskUpn(cosAgentUpn),
       'meetings captured whenever BOTH the leader and this UPN are on the invite (any organizer, including in-progress/upcoming meetings)'
     );
   } else {

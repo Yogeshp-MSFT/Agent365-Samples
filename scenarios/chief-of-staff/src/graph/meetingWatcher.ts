@@ -52,11 +52,66 @@ export interface MeetingWatcherOptions {
 }
 
 /**
+ * Every Teams occurrence seen in the window — qualifying or not. Recurring and
+ * back-to-back meetings can share one join URL, so occurrences the CoS isn't
+ * invited to still bound which transcript belongs to a captured occurrence.
+ */
+export interface ObservedOccurrence {
+  eventId: string;
+  joinWebUrl: string;
+  startTime?: number;
+  endTime: number;
+  durationMinutes: number;
+}
+
+function eventParticipants(ev: any): Set<string> {
+  const organizerAddr: string | undefined = ev.organizer?.emailAddress?.address?.toLowerCase();
+  const attendeeAddrs = ((ev.attendees ?? []) as any[])
+    .map((a) => (a.emailAddress?.address ?? '').toLowerCase())
+    .filter(Boolean);
+  return new Set<string>([...(organizerAddr ? [organizerAddr] : []), ...attendeeAddrs]);
+}
+
+/**
+ * Re-read one calendar event and report whether it still qualifies for
+ * capture (not cancelled, both the leader and the CoS still on the invite).
+ * 'unknown' means the lookup itself failed — callers must retry rather than
+ * treat it as a revocation.
+ */
+export async function checkEventParticipation(
+  opts: Pick<MeetingWatcherOptions, 'authorization' | 'context' | 'authHandlerName'>,
+  ownerUpn: string,
+  eventId: string,
+  leaderUpn: string,
+  cosAgentUpn: string
+): Promise<'qualified' | 'disqualified' | 'unknown'> {
+  try {
+    const token = await acquireGraphToken(opts as MeetingWatcherOptions);
+    const url =
+      `${GRAPH_BASE}/users/${encodeURIComponent(ownerUpn)}/events/${encodeURIComponent(eventId)}` +
+      `?$select=id,isCancelled,isOnlineMeeting,organizer,attendees`;
+    const res = await axios.get(url, { headers: { Authorization: `Bearer ${token}` } });
+    const ev = res.data ?? {};
+    if (ev.isCancelled || ev.isOnlineMeeting === false) return 'disqualified';
+    const participants = eventParticipants(ev);
+    return participants.has(leaderUpn.toLowerCase()) && participants.has(cosAgentUpn.toLowerCase())
+      ? 'qualified'
+      : 'disqualified';
+  } catch (err) {
+    const status = (err as any)?.response?.status;
+    if (status === 404) return 'disqualified'; // event deleted
+    log.warn('meetingWatcher', `participation re-check failed for event=…${eventId.slice(-8)} (status=${status ?? 'n/a'}) — will retry`);
+    return 'unknown';
+  }
+}
+
+/**
  * Discover meetings that qualify for CoS capture. Never throws — logs and
  * returns [] on failure so the poller keeps running.
  */
 export async function discoverQualifyingMeetings(
-  opts: MeetingWatcherOptions
+  opts: MeetingWatcherOptions,
+  observed?: ObservedOccurrence[]
 ): Promise<QualifyingMeeting[]> {
   const { graphOwnerUpn, leaderUpn, cosAgentUpn, watchHours } = opts;
   if (!graphOwnerUpn || !leaderUpn || !cosAgentUpn) return [];
@@ -124,6 +179,21 @@ export async function discoverQualifyingMeetings(
       if (!joinUrl) {
         log.debug('meetingWatcher', `skip ${ref} — no onlineMeeting.joinUrl on event`);
         continue;
+      }
+      // Record every online occurrence (qualifying or not) as a transcript
+      // window boundary for other occurrences on the same join URL.
+      if (observed) {
+        const oEnd = ev.end?.dateTime ? Date.parse(ev.end.dateTime + 'Z') : NaN;
+        const oStart = ev.start?.dateTime ? Date.parse(ev.start.dateTime + 'Z') : NaN;
+        if (isFinite(oEnd)) {
+          observed.push({
+            eventId: String(ev.id),
+            joinWebUrl: joinUrl,
+            startTime: isFinite(oStart) ? oStart : undefined,
+            endTime: oEnd,
+            durationMinutes: isFinite(oStart) ? Math.max(1, Math.round((oEnd - oStart) / 60000)) : 30,
+          });
+        }
       }
 
       const organizerAddr: string | undefined =
@@ -244,7 +314,7 @@ async function resolveOnlineMeetingId(
     if (!userId) {
       log.warn(
         'meetingWatcher',
-        `resolveOnlineMeetingId: could not resolve UPN "${userUpn}" to AAD Object ID`
+        `resolveOnlineMeetingId: could not resolve the owner UPN to AAD Object ID`
       );
       return undefined;
     }

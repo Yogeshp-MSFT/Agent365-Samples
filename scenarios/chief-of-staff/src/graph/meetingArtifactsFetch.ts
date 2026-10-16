@@ -67,7 +67,7 @@ export async function fetchTranscriptsForMeeting(
     if (!userId) {
       log.warn(
         'transcriptFetch',
-        `could not resolve UPN "${userUpn}" to AAD Object ID for /onlineMeetings call`
+        `could not resolve the owner UPN to AAD Object ID for /onlineMeetings call`
       );
       return [];
     }
@@ -141,7 +141,7 @@ export async function fetchTranscriptContent(
     if (!userId) {
       log.warn(
         'transcriptFetch',
-        `could not resolve UPN "${userUpn}" to AAD Object ID for /transcripts/{id}/content call`
+        `could not resolve the owner UPN to AAD Object ID for /transcripts/{id}/content call`
       );
       return undefined;
     }
@@ -211,7 +211,7 @@ export async function fetchAiInsightsForMeeting(
   if (!userId) {
     log.warn(
       'insightsFetch',
-      `could not resolve UPN "${userUpn}" to AAD Object ID for /aiInsights call`
+      `could not resolve the owner UPN to AAD Object ID for /aiInsights call`
     );
     return { available: false };
   }

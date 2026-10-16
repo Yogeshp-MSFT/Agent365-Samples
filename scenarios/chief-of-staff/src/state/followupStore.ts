@@ -240,6 +240,20 @@ export function findOpenFollowupsForTask(taskId: string): PendingFollowup[] {
 }
 
 /**
+ * Close one follow-up and cancel any owner request attached to it (queued
+ * leader delivery, pending extension decision). Used when the leader takes the
+ * request off the table (e.g. reassign).
+ */
+export function cancelOwnerRequest(followupId: string): void {
+  const f = store.get(followupId);
+  if (!f) return;
+  f.status = 'resolved';
+  delete f.pendingLeaderDelivery;
+  if (f.extensionStatus === 'pending') f.extensionStatus = 'cancelled';
+  store.set(followupId, f);
+}
+
+/**
  * The task is complete: resolve every follow-up for it and cancel any owner
  * request still waiting for delivery or for the leader's decision, so neither
  * the retry pass nor a typed/old-card approval can revive it.

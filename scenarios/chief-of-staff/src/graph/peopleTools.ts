@@ -55,7 +55,7 @@ export async function resolveUpnToAad(
   } catch (err) {
     const e = err as any;
     console.warn(
-      `[resolveUpnToAad] Failed to resolve "${key}":`,
+      `[resolveUpnToAad] Failed to resolve a UPN (${key.length} chars):`,
       e?.response?.data ?? e?.message ?? String(e)
     );
     return null;
@@ -87,7 +87,7 @@ export async function resolveAadToUpn(
   } catch (err) {
     const e = err as any;
     console.warn(
-      `[resolveAadToUpn] Failed to resolve "${key}":`,
+      `[resolveAadToUpn] Failed to resolve aad=${key.slice(0, 8)}…:`,
       e?.response?.data ?? e?.message ?? String(e)
     );
     return null;

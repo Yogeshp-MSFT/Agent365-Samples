@@ -457,7 +457,7 @@ export function createBriefCardTool(opts: BriefToolOptions) {
           const hint =
             "The leader hasn't DM'd the agent yet, so we don't have a ConversationReference to reach them proactively. " +
             'Ask them to send any Teams message to the agent once, then retry — or fall back to mcp_TeamsServer plain-text DM.';
-          console.error('[send_brief_card] no cached conv ref for', args.leaderAadObjectId);
+          console.error(`[send_brief_card] no cached conv ref for leader aad=${args.leaderAadObjectId.slice(0, 8)}…`);
           return JSON.stringify({ ok: false, error: 'no-conversation-ref', hint });
         }
         const card = buildBriefAdaptiveCard({

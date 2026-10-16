@@ -18,7 +18,7 @@
 // Returns the READY captures so the scheduler can fire runCapture on each.
 
 import { Authorization, TurnContext } from '@microsoft/agents-hosting';
-import { discoverQualifyingMeetings } from './meetingWatcher';
+import { checkEventParticipation, discoverQualifyingMeetings, type ObservedOccurrence } from './meetingWatcher';
 import {
   fetchAiInsightsForMeeting,
   fetchTranscriptContent,
@@ -30,6 +30,7 @@ import {
   computeWaitBudget,
   createPendingCapture,
   findCapturesDueForCheck,
+  getCapture,
   hasCaptureForEvent,
   isTranscriptClaimed,
   listAll,
@@ -138,19 +139,41 @@ export async function pollForNewTranscripts(
   return ready;
 }
 
+// Latest discovery results. `qualifiedThisPass` lets the retry sweep skip the
+// per-event participation re-check for events discovery just confirmed;
+// `observedByJoinUrl` holds every online occurrence (invited or not), used as
+// transcript-window boundaries for occurrences sharing a join URL.
+let qualifiedThisPass = new Set<string>();
+let observedByJoinUrl = new Map<string, ObservedOccurrence[]>();
+
 async function runDiscoveryPass(
   opts: PollOptions,
   cfg: ReturnType<typeof readConfig>
 ): Promise<void> {
-  const meetings = await discoverQualifyingMeetings({
-    authorization: opts.authorization,
-    context: opts.context,
-    authHandlerName: opts.authHandlerName,
-    graphOwnerUpn: cfg.graphOwnerUpn,
-    leaderUpn: cfg.leaderUpn,
-    cosAgentUpn: cfg.cosAgentUpn,
-    watchHours: cfg.watchHours,
-  });
+  const observed: ObservedOccurrence[] = [];
+  const meetings = await discoverQualifyingMeetings(
+    {
+      authorization: opts.authorization,
+      context: opts.context,
+      authHandlerName: opts.authHandlerName,
+      graphOwnerUpn: cfg.graphOwnerUpn,
+      leaderUpn: cfg.leaderUpn,
+      cosAgentUpn: cfg.cosAgentUpn,
+      watchHours: cfg.watchHours,
+    },
+    observed
+  );
+  qualifiedThisPass = new Set(meetings.map((m) => m.eventId));
+  // Keep the previous map if discovery failed (it returns nothing then).
+  if (observed.length > 0) {
+    const byUrl = new Map<string, ObservedOccurrence[]>();
+    for (const o of observed) {
+      const list = byUrl.get(o.joinWebUrl) ?? [];
+      list.push(o);
+      byUrl.set(o.joinWebUrl, list);
+    }
+    observedByJoinUrl = byUrl;
+  }
 
   let newlyTracked = 0;
   for (const m of meetings) {
@@ -161,6 +184,7 @@ async function runDiscoveryPass(
     });
     const giveUpAfter = m.endTime + cfg.giveUpAfterHours * 60 * 60 * 1000;
     if (hasCaptureForEvent(m.eventId)) {
+      if (!getCapture(m.eventId)?.joinWebUrl) updateCapture(m.eventId, { joinWebUrl: m.joinWebUrl });
       // The same event id can move (reschedule). Refresh its deadlines so it
       // isn't abandoned before the meeting happens.
       const outcome = rescheduleCapture(m.eventId, {
@@ -178,6 +202,7 @@ async function runDiscoveryPass(
     createPendingCapture({
       eventId: m.eventId,
       meetingId: m.meetingId,
+      joinWebUrl: m.joinWebUrl,
       subject: m.subject,
       organizerAad: m.organizerAad,
       ownerUpn: cfg.graphOwnerUpn,
@@ -202,9 +227,11 @@ async function runDiscoveryPass(
   }
 }
 
+const PARTICIPATION_RECHECK_RETRY_MS = 5 * 60 * 1000;
+
 async function runRetrySweep(
   opts: PollOptions,
-  _cfg: ReturnType<typeof readConfig>
+  cfg: ReturnType<typeof readConfig>
 ): Promise<DetectedTranscript[]> {
   const now = Date.now();
   const due = findCapturesDueForCheck(now);
@@ -212,6 +239,27 @@ async function runRetrySweep(
 
   const ready: DetectedTranscript[] = [];
   for (const cap of due) {
+    // The invitation can change after discovery (CoS removed, meeting
+    // cancelled). Re-verify before fetching or processing anything, unless
+    // this tick's discovery already confirmed the event.
+    if (!qualifiedThisPass.has(cap.eventId)) {
+      const verdict = await checkEventParticipation(
+        opts,
+        cap.ownerUpn,
+        cap.eventId,
+        cfg.leaderUpn,
+        cfg.cosAgentUpn
+      );
+      if (verdict === 'disqualified') {
+        log.info('capturePoller', `retiring ${eventRef(cap.eventId)} — no longer qualifies (CoS/leader removed, cancelled, or deleted)`);
+        markCaptureGaveUp(cap.eventId);
+        continue;
+      }
+      if (verdict === 'unknown') {
+        updateCapture(cap.eventId, { nextCheckAt: now + PARTICIPATION_RECHECK_RETRY_MS });
+        continue;
+      }
+    }
     const result = await advanceCapture(opts, cap, now);
     if (result) ready.push(result);
   }
@@ -242,11 +290,15 @@ async function advanceCapture(
     `advance ${eventRef(cap.eventId)} attempt=${cap.attempts} transcriptId=${cap.transcriptId ? cap.transcriptId.slice(0, 8) + '…' : '∅'} insightsFetched=${cap.insightsFetched}`
   );
 
-  // Give-up guard: too much time has passed with no transcript.
-  if (now > cap.giveUpAfter && !cap.transcriptId) {
+  // Give-up guard: too much time has passed with no readable content (no
+  // transcript, or a transcript whose body never fetched and no insights).
+  const hasReadableContent = (c: PendingCapture) =>
+    !!c.transcriptContent ||
+    (c.insightsActionItems?.length ?? 0) + (c.insightsMeetingNotes?.length ?? 0) > 0;
+  if (now > cap.giveUpAfter && !hasReadableContent(cap)) {
     log.warn(
       'capturePoller',
-      `giving up on ${eventRef(cap.eventId)} — no transcript after ${(
+      `giving up on ${eventRef(cap.eventId)} — no ${cap.transcriptId ? 'readable transcript content' : 'transcript'} after ${(
         (now - cap.endTime) /
         (60 * 60 * 1000)
       ).toFixed(1)}h`
@@ -346,8 +398,12 @@ async function advanceCapture(
   const transcriptSufficient =
     !!cap.transcriptContent && cap.attempts >= minAttemptsForTranscriptOnly;
 
+  // A transcript id alone is not enough: the body must have been fetched, or
+  // Copilot insights must carry usable items. Otherwise keep retrying the
+  // artifact fetch (bounded by giveUpAfter above).
   const ready =
     !!cap.transcriptId &&
+    hasReadableContent(cap) &&
     (cap.insightsFetched || waitBudgetExhausted || transcriptSufficient);
 
   if (ready) {
@@ -412,10 +468,26 @@ function occurrenceStart(o: OccurrenceSpan): number {
   return o.startTime ?? o.endTime - o.durationMinutes * 60 * 1000;
 }
 
-/** Other tracked occurrences of the same online meeting. */
-function sameMeetingNeighbors(cap: Pick<PendingCapture, 'eventId' | 'meetingId'>): OccurrenceSpan[] {
-  if (!cap.meetingId) return [];
-  return listAll().filter((c) => c.meetingId === cap.meetingId && c.eventId !== cap.eventId);
+/**
+ * Other occurrences of the same online meeting: tracked captures plus every
+ * occurrence discovery saw on the same join URL — including ones the CoS is
+ * not invited to, which never become captures.
+ */
+function sameMeetingNeighbors(
+  cap: Pick<PendingCapture, 'eventId' | 'meetingId' | 'joinWebUrl'>
+): OccurrenceSpan[] {
+  const byEvent = new Map<string, OccurrenceSpan>();
+  if (cap.meetingId) {
+    for (const c of listAll()) {
+      if (c.meetingId === cap.meetingId && c.eventId !== cap.eventId) byEvent.set(c.eventId, c);
+    }
+  }
+  if (cap.joinWebUrl) {
+    for (const o of observedByJoinUrl.get(cap.joinWebUrl) ?? []) {
+      if (o.eventId !== cap.eventId && !byEvent.has(o.eventId)) byEvent.set(o.eventId, o);
+    }
+  }
+  return Array.from(byEvent.values());
 }
 
 /** Log-safe event reference — event ids share a mailbox prefix, so use the tail. */
@@ -431,7 +503,7 @@ function eventRef(eventId: string | undefined): string {
  */
 export function selectTranscriptForOccurrence(
   transcripts: TranscriptSummary[],
-  cap: Pick<PendingCapture, 'eventId' | 'meetingId' | 'startTime' | 'endTime' | 'durationMinutes'>,
+  cap: Pick<PendingCapture, 'eventId' | 'meetingId' | 'joinWebUrl' | 'startTime' | 'endTime' | 'durationMinutes'>,
   now: number,
   neighbors: OccurrenceSpan[] = sameMeetingNeighbors(cap)
 ): TranscriptSummary | undefined {

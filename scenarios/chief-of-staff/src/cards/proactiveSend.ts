@@ -49,13 +49,13 @@ export async function sendCardProactively(
   const ref = lookupConversationRef(recipientAad);
   if (!ref) {
     throw new Error(
-      `no-conversation-ref: no personal (1:1) conversation is stored for aad=${recipientAad}. ` +
+      `no-conversation-ref: no personal (1:1) conversation is stored for aad=${recipientAad.slice(0, 8)}…. ` +
         `The recipient must DM the agent at least once before we can proactively send them a card.`
     );
   }
   // Defense in depth: never deliver a private DM into a group chat or channel.
   if (!isPersonalConversation(ref.conversation)) {
-    throw new Error(`Refusing proactive send: stored conversation for aad=${recipientAad} is not a personal chat.`);
+    throw new Error(`Refusing proactive send: stored conversation for aad=${recipientAad.slice(0, 8)}… is not a personal chat.`);
   }
 
   if (!botAppId) {

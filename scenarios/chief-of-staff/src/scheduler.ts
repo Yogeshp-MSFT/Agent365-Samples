@@ -255,29 +255,42 @@ export function startScheduler(deps: SchedulerDeps): void {
   );
 
   // ── Poll: completed Planner tasks → runTaskComplete ──
+  // Guarded like the meeting poll: a slow DM send must not let the next tick
+  // re-read the same pending completion (with its old recipient list) and
+  // notify the same people again.
+  let plannerPollInFlight = false;
   intervalIds.push(
     setInterval(async () => {
-      await fireInAuthedContext(deps, 'planner-poll', async (ctx, state, client) => {
-        const done = await pollForCompletedTasks({
-          authorization: deps.authorization,
-          context: ctx,
-          authHandlerName: deps.authHandlerName,
-        });
-        for (const t of done) {
-          try {
-            const outcome = await runTaskComplete(
-              { taskId: t.taskId, planId: t.planId, alreadyDelivered: t.alreadyDelivered },
-              ctx,
-              state,
-              client
-            );
-            acknowledgeCompletion(t.taskId, outcome);
-          } catch (err) {
-            acknowledgeCompletion(t.taskId, { complete: false, delivered: [] });
-            console.error(`[scheduler] runTaskComplete(${t.taskId.slice(0, 8)}…) failed — will retry:`, err);
+      if (plannerPollInFlight) {
+        console.log('[scheduler] planner-poll skipped — previous run still delivering');
+        return;
+      }
+      plannerPollInFlight = true;
+      try {
+        await fireInAuthedContext(deps, 'planner-poll', async (ctx, state, client) => {
+          const done = await pollForCompletedTasks({
+            authorization: deps.authorization,
+            context: ctx,
+            authHandlerName: deps.authHandlerName,
+          });
+          for (const t of done) {
+            try {
+              const outcome = await runTaskComplete(
+                { taskId: t.taskId, planId: t.planId, alreadyDelivered: t.alreadyDelivered },
+                ctx,
+                state,
+                client
+              );
+              acknowledgeCompletion(t.taskId, outcome);
+            } catch (err) {
+              acknowledgeCompletion(t.taskId, { complete: false, delivered: [] });
+              console.error(`[scheduler] runTaskComplete(${t.taskId.slice(0, 8)}…) failed — will retry:`, err);
+            }
           }
-        }
-      });
+        });
+      } finally {
+        plannerPollInFlight = false;
+      }
     }, POLL_TASKS_MS)
   );
 }
@@ -344,7 +357,7 @@ async function sweepStaleFollowupsAndEscalate(
     return;
   }
 
-  console.log(`[scheduler] escalating ${stale.length} stale followup(s) to leader ${LEADER_UPN}`);
+  console.log(`[scheduler] escalating ${stale.length} stale followup(s) to the leader`);
   for (const f of stale) {
     // Belt-and-suspenders: re-check the Planner task before escalating. If
     // the owner already marked it complete (and the taskComplete flow hasn't

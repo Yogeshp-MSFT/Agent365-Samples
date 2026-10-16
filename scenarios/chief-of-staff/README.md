@@ -34,7 +34,7 @@ A running Node service on your dev machine (or Azure App Service) that:
 |---|---|
 | **Capture** — extracts action items + decisions from Teams meetings and creates Planner tasks | Calendar poller finds any Teams meeting with both the leader and the CoS on the invite (any organizer; in-progress and upcoming meetings are tracked until their transcript exists), the transcript for that occurrence is fetched, LLM extracts |
 | **Daily Brief** — Adaptive Card DM to the leader with priorities, watch items, upcoming meetings | Cron (default 8 AM weekdays, gated behind `BRIEF_ENABLED`) |
-| **Follow-up** — Adaptive Card DM to each at-risk owner (`On track` / `Need more time` / `I'm blocked`) | Cron (default hourly) |
+| **Follow-up** — Adaptive Card DM to each at-risk owner — every current assignee of a task gets their own card (`On track` / `Need more time` / `I'm blocked`) | Cron (default hourly) |
 | **Extension request** — leader gets an approval card, agent PATCHes Planner due date on approval | Owner clicks "Need more time" or types `extend` |
 | **Blocker meeting** — agent proposes 3 slots, books calendar invite on click | Owner clicks "I'm blocked" or types `blocked` |
 | **Escalation** — 🚨 card DM'd to the leader if the owner ignores their follow-up | Post-followup sweep after `FOLLOWUP_ESCALATE_AFTER_HOURS`; auto-cancels if the task is closed first |
@@ -390,11 +390,11 @@ Expected boot output:
 [startup] ─── Chief of Staff — Configuration Check ───
 [startup] ✅ AZURE_OPENAI_DEPLOYMENT=gpt-4o — endpoint=… api-version=2024-10-21
 [startup] ✅ agent_id=e320…4964 — tenant=1fe4…8d81
-[startup] ✅ LEADER_UPN=mario@… — LEADER_AAD_ID will auto-resolve on first turn
+[startup] ✅ LEADER_UPN=mar…@… — LEADER_AAD_ID will auto-resolve on first turn
 [startup] ✅ PLANNER_PLAN_ID=9H_e2N…AGlda
 [startup] ✅ PLANNER_BUCKET_NEW=09dDjr…FVgg
 [startup] ✅ LEADERSHIP_TEAM_ID=… — Recall gated to team members
-[startup] ✅ COS_AGENT_UPN=chief-of-staff@… — meetings captured whenever BOTH the leader and this UPN are on the invite (any organizer, including in-progress/upcoming meetings)
+[startup] ✅ COS_AGENT_UPN=chi…@… — meetings captured whenever BOTH the leader and this UPN are on the invite (any organizer, including in-progress/upcoming meetings)
 [startup] ✅ GRAPH_APP_ID=<masked> — Graph calls use standalone worker app (application permissions)
 [startup] ℹ️  FOLLOWUP_ESCALATE_AFTER_HOURS=3 — owners are escalated if they don't reply within this window
 [startup] ℹ️  NODE_ENV=development
@@ -497,7 +497,8 @@ POST /planner/tasks   × N
 - The owner receives an Adaptive Card with three buttons.
   - **On track** → agent confirms; Planner is patched to `In Progress 5%`;
     the follow-up is closed.
-  - **Need more time** → agent proposes a new date and DMs the leader an
+  - **Need more time** → agent proposes a new date (5 business days out,
+    counted on the `BRIEF_DISPLAY_TZ` calendar) and DMs the leader an
     approval card. Leader clicks **Approve new date** → agent PATCHes the
     Planner due date and, only once that succeeds, confirms to the leader
     and DMs the owner. If the PATCH fails, both are told it isn't synced
@@ -511,7 +512,9 @@ POST /planner/tasks   × N
     is scheduled. A failed booking leaves the check-in open, tells the owner
     nothing was booked, and lets the leader pick another slot. Only one
     booking runs at a time per card, so clicking a second slot while the
-    first is booking doesn't create a second meeting.
+    first is booking doesn't create a second meeting. A delivered card whose
+    task has since been completed (or whose request was closed) books
+    nothing.
   - If the leader's card can't be delivered (e.g. the leader hasn't messaged
     the agent yet), the extension/blocker request is saved and retried on
     every follow-up cycle (up to `LEADER_DELIVERY_MAX_ATTEMPTS`, default 24);
@@ -529,8 +532,9 @@ check-ins that are still open and on tasks Planner currently assigns to
 them (a closed check-in only accepts **Complete**).
 
 **Reassign is a manual handoff.** The agent has no "change assignee" action:
-clicking **Reassign** closes the check-in and tells the leader to change the
-assignee in Planner. The next follow-up cycle then checks in with the new
+clicking **Reassign** closes the check-in, cancels the owner's pending
+extension request (so a typed `approve` can't revive it), and tells the
+leader to change the assignee in Planner. The next follow-up cycle then checks in with the new
 owner.
 
 ### 8.4 Escalation (owner ignored the check-in)
@@ -578,7 +582,10 @@ the in-memory resolve fired by `runTaskComplete`).
   sender** (the leader may name any task), ignoring
   `[BLOCKER]`/`[RISK]`/`[DECISION]`/`[COMPLETED]` prefixes. Identifying
   tokens such as `Q2`, `v1`, or numbers must match.
-- Only an exact title match is completed. A close-but-not-exact match gets a
+- Only an exact title match is completed. "Exact" ignores only case,
+  whitespace, and those prefixes — punctuation and non-ASCII letters must
+  match, so `"Review C# hiring plan"` never completes `Review C++ hiring
+  plan`. A close-but-not-exact match gets a
   "Did you mean …?" reply and nothing changes until the exact title is sent.
 - Agent replies: `✅ Nice work — marking "…" complete. (Planner updated: 100% complete)`.
 - `plannerPoller` sees the transition on its next tick and fires

@@ -67,6 +67,8 @@ function toolError(name: string, err: unknown): string {
 interface CreatedTaskRecord {
   taskId: string;
   createdAt: number;
+  /** True while the task's description (decision context) still has to be written. */
+  descriptionPending?: boolean;
 }
 const CREATED_TASK_RETENTION_MS = 14 * 24 * 60 * 60 * 1000;
 const createdTaskIndex = new PersistentMap<CreatedTaskRecord>({
@@ -299,6 +301,17 @@ function createCreateTaskTool(opts: PlannerToolOptions) {
           if (prior) {
             const live = await getPlannerTaskDetails(prior.taskId);
             if (live.ok) {
+              // Finish a description write that failed on an earlier attempt.
+              if (prior.descriptionPending && args.description?.trim()) {
+                const saved = await setPlannerTaskDescription(prior.taskId, args.description.trim(), token);
+                if (!saved.ok) {
+                  return toolError(
+                    'planner_create_task',
+                    `task exists but its description could not be saved (${saved.error}); retry later`
+                  );
+                }
+                createdTaskIndex.set(dedupeKey, { ...prior, descriptionPending: false });
+              }
               recordToolOutcome({ tool: 'planner_create_task', ok: true });
               return JSON.stringify({
                 ok: true,
@@ -326,15 +339,28 @@ function createCreateTaskTool(opts: PlannerToolOptions) {
           },
         });
 
-        let descriptionSaved: boolean | undefined;
-        if (args.description?.trim()) {
-          const saved = await setPlannerTaskDescription(res.data.id, args.description.trim(), token);
-          descriptionSaved = saved.ok;
-          if (!saved.ok) {
-            console.warn(`[plannerTools] task created but description was not saved: ${saved.error}`);
-          }
+        const wantsDescription = !!args.description?.trim();
+        // Record the new task immediately, so a retry reuses it even if the
+        // description write below fails.
+        if (dedupeKey) {
+          createdTaskIndex.set(dedupeKey, {
+            taskId: res.data.id,
+            createdAt: Date.now(),
+            descriptionPending: wantsDescription,
+          });
         }
-        if (dedupeKey) createdTaskIndex.set(dedupeKey, { taskId: res.data.id, createdAt: Date.now() });
+        if (wantsDescription) {
+          const saved = await setPlannerTaskDescription(res.data.id, args.description!.trim(), token);
+          if (!saved.ok) {
+            // Report a failure so the capture stays retryable; the retry
+            // reuses this task and writes the description.
+            return toolError(
+              'planner_create_task',
+              `task ${String(res.data.id).slice(0, 8)}… was created but its description could not be saved (${saved.error}); retry to finish it`
+            );
+          }
+          if (dedupeKey) createdTaskIndex.set(dedupeKey, { taskId: res.data.id, createdAt: Date.now(), descriptionPending: false });
+        }
         recordToolOutcome({ tool: 'planner_create_task', ok: true });
         return JSON.stringify({
           ok: true,
@@ -342,7 +368,7 @@ function createCreateTaskTool(opts: PlannerToolOptions) {
           title: res.data.title,
           bucketId: res.data.bucketId,
           assignees,
-          ...(descriptionSaved === undefined ? {} : { descriptionSaved }),
+          ...(wantsDescription ? { descriptionSaved: true } : {}),
         });
       } catch (err) {
         return toolError('planner_create_task', err);
@@ -655,9 +681,11 @@ export async function completePlannerTask(
 // or reports 'ambiguous' / 'not_found' / 'none_assigned' so the caller can
 // prompt for clarification instead of silently guessing.
 //
-// Matching rules (all case-insensitive, ignoring [BLOCKER]/[RISK]/[DECISION]
-// prefixes and non-word chars):
-//   1. Exact normalized-title match  → immediate winner.
+// Matching rules (all case-insensitive, ignoring [BLOCKER]/[RISK]/[DECISION]/
+// [COMPLETED] prefixes):
+//   1. Exact match — LOSSLESS: only case, whitespace, and the prefix above are
+//      ignored; punctuation and non-ASCII letters must match ("C#" ≠ "C++").
+//      Only this tier may be acted on without confirmation.
 //   2. Query is a substring of title → keep as candidate.
 //   3. Every word in query appears in title → keep as candidate (word-set).
 // If we end up with exactly one candidate → return it. If assigneeAad is
@@ -674,14 +702,18 @@ export async function findOpenTaskByTitle(
   if (!planId) return { ok: false, reason: 'no_plan_id' };
   if (!titleHint?.trim()) return { ok: false, reason: 'not_found' };
 
+  const stripPrefix = (s: string) => s.replace(/^\s*\[(blocker|risk|decision|completed)\]\s*/i, '');
+  // Lossless key for the exact tier: case + whitespace only.
+  const exactKey = (s: string) => stripPrefix(s.normalize('NFC')).toLocaleLowerCase().replace(/\s+/g, ' ').trim();
+  // Lossy key for suggestions (substring / word-set) that always need confirmation.
   const normalize = (s: string) =>
-    s
-      .toLowerCase()
-      .replace(/^\s*\[(blocker|risk|decision|completed)\]\s*/i, '')
-      .replace(/[^\w\s]/g, ' ')
+    stripPrefix(s.normalize('NFC'))
+      .toLocaleLowerCase()
+      .replace(/[^\p{L}\p{N}\s]/gu, ' ')
       .replace(/\s+/g, ' ')
       .trim();
 
+  const queryExact = exactKey(titleHint);
   const queryNorm = normalize(titleHint);
   if (!queryNorm) return { ok: false, reason: 'not_found' };
   // Keep every identifying token (Q2, v1, 12…). Only drop filler words that
@@ -721,7 +753,10 @@ export async function findOpenTaskByTitle(
         !!opts?.assigneeAad && !!t.assignments && Object.keys(t.assignments).some((aad) => aad.toLowerCase() === opts.assigneeAad!.toLowerCase());
 
       let matchType: Candidate['matchType'] | null = null;
-      if (titleNorm === queryNorm) matchType = 'exact';
+      if (exactKey(t.title ?? '') === queryExact) matchType = 'exact';
+      // Equal only after dropping punctuation (e.g. "C#" vs "C++") is a
+      // suggestion, never an automatic match.
+      else if (titleNorm === queryNorm) matchType = 'substring';
       else if (` ${titleNorm} `.includes(` ${queryNorm} `) || ` ${queryNorm} `.includes(` ${titleNorm} `)) matchType = 'substring';
       else if (queryWords.length > 0 && queryWords.every((w) => titleTokens.has(w))) matchType = 'wordset';
 

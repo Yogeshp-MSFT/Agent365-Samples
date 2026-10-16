@@ -241,20 +241,32 @@ setInterval, guarded by `meetingPollInFlight` — see §10.2):
   the leader and the CoS agent are on the invite — regardless of who
   organized them (delegates, other execs, and external organizers count).
   It resolves each event's `joinWebUrl` to an `onlineMeetingId` and adds new
-  occurrences to `pendingCaptureStore`. An existing event whose start/end
+  occurrences to `pendingCaptureStore`. Discovery follows calendarView paging
+  (`@odata.nextLink`), so a busy calendar isn't truncated, and it also
+  records every online occurrence in the window — invited or not — as a
+  transcript-window boundary for its join URL. An existing event whose start/end
   moved is refreshed (`rescheduleCapture`), and a `gave-up` record is
   reopened when the reschedule moves it into a new capture window.
 - **Pass 2 — retry sweep.** For each pending capture whose `nextCheckAt` has
-  arrived, `advanceCapture` tries to fetch the transcript for **this
+  arrived, the sweep first re-reads the calendar event (unless this tick's
+  discovery just confirmed it). A cancelled or deleted event, or one the
+  leader or CoS has been removed from, retires the capture before anything
+  is fetched or processed; a failed lookup is retried, never treated as a
+  revocation. Then `advanceCapture` tries to fetch the transcript for **this
   occurrence** (created between 15 minutes before its scheduled start and
   15 minutes after its scheduled end, and not already consumed by another
   capture). Recurring and back-to-back meetings reuse one join URL, so next
-  to another tracked occurrence of the same online meeting the slack stops at
-  the midpoint of the gap and the shared boundary belongs to the later
+  to any other occurrence on the same join URL — tracked or not (an
+  occurrence the CoS isn't invited to still counts) — the slack stops at the
+  midpoint of the gap and the shared boundary belongs to the later
   occurrence. It also fetches the Copilot insights, then decides one of three
   outcomes:
-  1. **Ready** — transcript is here AND (insights arrived OR wait budget
-     exhausted OR `attempts >= CAPTURE_MIN_ATTEMPTS_TRANSCRIPT_ONLY`).
+  1. **Ready** — transcript is here AND readable content exists (the
+     transcript body was fetched, or Copilot insights returned items) AND
+     (insights arrived OR wait budget exhausted OR
+     `attempts >= CAPTURE_MIN_ATTEMPTS_TRANSCRIPT_ONLY`). A transcript id
+     whose body failed to fetch keeps retrying; `runCapture` also refuses
+     content-less input.
      The capture is marked `ready` (durably, with its artifacts) and emitted
      to the scheduler, which fires `runCapture`. The scheduler marks it
      `complete` only after `runCapture` succeeds — an `Error:` reply from the
@@ -265,7 +277,9 @@ setInterval, guarded by `meetingPollInFlight` — see §10.2):
      the same capture already created (keyed by capture + title +
      assignees in `created-tasks.json`), so it doesn't duplicate them;
      unrelated tasks that merely share a title are never merged.
-  2. **Give up** — no transcript after `CAPTURE_GIVE_UP_AFTER_HOURS`.
+  2. **Give up** — no readable content (no transcript, or a transcript
+     whose body never fetched and no insights) after
+     `CAPTURE_GIVE_UP_AFTER_HOURS`.
      Marks the capture `gave-up` and moves on.
   3. **Retry** — computes the next delay from a `[1, 3, 7, 15, 30]` minute
      ladder (clamped by wait budget) and updates `nextCheckAt`.
@@ -373,7 +387,7 @@ sequenceDiagram
   else Owner clicks "Need more time"
     Owner->>Router: Invoke {verb: 'extend', followupId}
     Router->>Router: authorizeIntent (open check-in + live Planner assignee)
-    Router->>Router: compute suggestedNewDueDate (+5 business days)
+    Router->>Router: compute suggestedNewDueDate (+5 business days in BRIEF_DISPLAY_TZ)
     Router->>Store: recordOwnerResponse + queueLeaderDelivery
     Router->>Leader: extension card (deliverPendingLeaderRequest)
     alt delivered
@@ -834,8 +848,8 @@ All card verbs are strings in `activity.value.verb`:
 | `complete` | (also matched via chat regex) | `findOpenTaskByTitle` → `completePlannerTask` (100%) |
 | `approve_extend` | Extension request card | Only while the request is still `pending` (old cards for decided/cancelled requests are refused): `updatePlannerTaskDueDate` + DM owner |
 | `reject_extend` | Extension request card | Only while `pending`: deterministic DM to owner "not approved" |
-| `reassign` | Extension request card | Manual handoff: closes the check-in and tells the leader to change the assignee in Planner |
-| `book_meeting` | Blocker meeting card | One booking at a time per follow-up (in-flight lock across all slots). LLM + `mcp_CalendarTools.book_meeting` first; on exact `OK` → resolve, PATCH `[BLOCKER]` title prefix, DM owner; on failure → DM owner "not booked", keep the check-in open |
+| `reassign` | Extension request card | Manual handoff: closes the check-in, cancels the pending extension request / queued delivery, and tells the leader to change the assignee in Planner |
+| `book_meeting` | Blocker meeting card | One booking at a time per follow-up (in-flight lock across all slots). Under the lock it refuses a closed request or a task that is complete/deleted in Planner (live check). LLM + `mcp_CalendarTools.book_meeting` first; on exact `OK` → resolve, PATCH `[BLOCKER]` title prefix, DM owner; on failure → DM owner "not booked", keep the check-in open |
 | `defer_blocker` | Blocker meeting card | Snooze — resolves the followup with a note |
 | `esc_reassign` | Escalation card | Same manual handoff as `reassign` |
 | `esc_extend` | Escalation card | Sends the leader an extension approval card |
@@ -898,6 +912,11 @@ setInterval(async () => {
 ```
 
 `try/finally` guarantees the guard clears even on crashes.
+
+The Planner-completion poll uses the same pattern (`plannerPollInFlight`)
+around both polling **and** notification delivery: a pending completion keeps
+its old recipient list until the whole run finishes, so a second tick during a
+slow DM send would otherwise notify the same owner twice.
 
 ### 10.3 Dedup guards in the router
 
@@ -1170,7 +1189,9 @@ prevent the demo. Address before pilot / production.
   Planner, brief, and capture/meeting-discovery logs record id fragments
   (task-id prefixes, calendar event-id tails), counts, and reason codes —
   never task titles, meeting subjects, brief contents, attendee addresses,
-  recipient names, or full AAD ids, at any log level.
+  recipient names, UPNs, full AAD ids, or full meeting/transcript ids, at
+  any log level. Error text that is logged or returned (for example
+  `no-conversation-ref`) carries the same 8-character id prefix.
 - **`transcriptContent` truncation.** Capped at `MAX_INLINE_TRANSCRIPT_CHARS`
   = 60 000 chars in `src/cos/capture.ts`. Very long meetings (> ~40 min of
   dense speech) may lose the tail. Fix: chunk + summarise, or upgrade to

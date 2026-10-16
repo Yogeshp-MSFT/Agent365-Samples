@@ -56,7 +56,7 @@ async function sendCardToUser(
 ): Promise<{ conversationId: string | undefined }> {
   if (!hasConversationRef(recipientAad)) {
     throw new Error(
-      `no-conversation-ref: recipient aad=${recipientAad} has not DM'd the Chief of Staff agent ` +
+      `no-conversation-ref: recipient aad=${recipientAad.slice(0, 8)}… has not DM'd the Chief of Staff agent ` +
         `(or installed the app) yet, so there is no personal chat to deliver the card to.`
     );
   }
