@@ -28,8 +28,20 @@ function redactHeaders(h: any): any {
 
 function pickUrl(cfg: AxiosRequestConfig): string {
   const raw = urlOf(cfg);
-  // Trim overlong query strings so the log stays readable.
-  return raw.length > 200 ? raw.slice(0, 200) + '…' : raw;
+  // Log the route shape only: Graph paths and queries carry user ids, UPNs,
+  // meeting/transcript ids and join URLs, so ids and the query are masked.
+  const [pathOnly, query] = raw.split('?', 2);
+  const masked = pathOnly
+    .split('/')
+    .map((seg) => {
+      const s = decodeURIComponent(seg);
+      if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s)) return '{guid}';
+      if (s.includes('@')) return '{upn}';
+      if (s.length > 24 && /[A-Za-z0-9_\-=:.]{24,}/.test(s)) return '{id}';
+      return seg;
+    })
+    .join('/');
+  return query ? `${masked}?{query}` : masked;
 }
 
 /**

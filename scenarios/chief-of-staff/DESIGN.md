@@ -237,8 +237,9 @@ setInterval, guarded by `meetingPollInFlight` — see §10.2):
 
 - **Pass 1 — discovery.** `discoverQualifyingMeetings` reads the calendar of
   the graph-owner (CoS agent by default) over a window that includes recent,
-  in-progress, and upcoming occurrences, and keeps Teams meetings where BOTH
-  the leader and the CoS agent are on the invite — regardless of who
+  in-progress, and upcoming occurrences, and keeps non-cancelled Teams meetings
+  where BOTH the leader and the CoS agent are on the invite (and haven't
+  declined) — regardless of who
   organized them (delegates, other execs, and external organizers count).
   It resolves each event's `joinWebUrl` to an `onlineMeetingId` and adds new
   occurrences to `pendingCaptureStore`. Discovery follows calendarView paging
@@ -250,7 +251,8 @@ setInterval, guarded by `meetingPollInFlight` — see §10.2):
 - **Pass 2 — retry sweep.** For each pending capture whose `nextCheckAt` has
   arrived, the sweep first re-reads the calendar event (unless this tick's
   discovery just confirmed it). A cancelled or deleted event, or one the
-  leader or CoS has been removed from, retires the capture before anything
+  leader or CoS has been removed from or declined, retires the capture
+  (marked *revoked*, so it reopens if the invitation comes back) before anything
   is fetched or processed; a failed lookup is retried, never treated as a
   revocation. Then `advanceCapture` tries to fetch the transcript for **this
   occurrence** (created between 15 minutes before its scheduled start and
@@ -269,18 +271,19 @@ setInterval, guarded by `meetingPollInFlight` — see §10.2):
      content-less input.
      The capture is marked `ready` (durably, with its artifacts) and emitted
      to the scheduler, which fires `runCapture`. The scheduler marks it
-     `complete` only after `runCapture` succeeds — an `Error:` reply from the
-     model **or any failed `planner_create_task` call** (tracked per run via
-     `util/toolContext.ts`, independent of the model's summary) is a
-     failure. On failure it stays `ready` and is retried (up to
-     `CAPTURE_MAX_PROCESSING_FAILURES`, default 3). A retry reuses the tasks
-     the same capture already created (keyed by capture + title +
-     assignees in `created-tasks.json`), so it doesn't duplicate them;
-     unrelated tasks that merely share a title are never merged.
+     `complete` only after `runCapture` succeeds (see §5.1: extraction is
+     checkpointed, writes are deterministic, and any failed item write is
+     a failure). On failure it stays `ready` and is retried (up to
+     `CAPTURE_MAX_PROCESSING_FAILURES`, default 3); the retry resumes from
+     the extraction checkpoint, so items already written are never
+     re-created.
   2. **Give up** — no readable content (no transcript, or a transcript
      whose body never fetched and no insights) after
      `CAPTURE_GIVE_UP_AFTER_HOURS`.
-     Marks the capture `gave-up` and moves on.
+     Marks the capture `gave-up` and moves on. A capture retired because
+     its invitation was withdrawn is marked *revoked* instead; when
+     discovery sees the event qualify again it is reopened with clean
+     artifact and retry state.
   3. **Retry** — computes the next delay from a `[1, 3, 7, 15, 30]` minute
      ladder (clamped by wait budget) and updates `nextCheckAt`.
 
@@ -298,7 +301,7 @@ sequenceDiagram
   participant Poller as transcriptPoller
   participant Graph as Graph (transcripts + insights)
   participant Cap as runCapture (cos/capture.ts)
-  participant LLM as gpt-4o + planner_create_task
+  participant LLM as gpt-4o (people lookups only)
   participant P as Planner
   participant DM as sendCardProactively → owners + leader
 
@@ -313,22 +316,43 @@ sequenceDiagram
     Poller->>Graph: GET transcript body (VTT)
     Graph-->>Poller: 1227 chars
     Poller->>Graph: GET /copilot/…/aiInsights (v1.0, then beta)
-    Graph-->>Poller: (empty or action items)
+    Graph-->>Poller: keep only insights whose callId / contentCorrelationId match this transcript
     Poller->>Store: markCaptureReady
     Poller-->>Cap: emit READY
-    Cap->>LLM: dispatch prompt (transcript inlined)
-    LLM->>P: planner_create_task × N (with description; skips existing titles)
-    LLM->>DM: send_task_assignment_card per owner
-    LLM->>DM: post summary in meeting chat
+    alt no extraction checkpoint yet
+      Cap->>LLM: extract items as JSON (no write tools)
+      LLM-->>Cap: items + resolved owners
+      Cap->>Store: save checkpoint (stable item ids) BEFORE any write
+    else retry
+      Cap->>Store: load checkpoint (no re-extraction)
+    end
+    loop each item not yet written
+      Cap->>P: create task in the leadership plan (+ description), save taskId
+      Cap->>DM: assignment card, save cardSent
+    end
+    Cap->>DM: post summary in meeting chat (once, best effort)
     Cap-->>Store: markCaptureComplete (only on success; else stays READY)
   end
 ```
 
-Two things to note:
+Things to note:
 
-- The capture prompt is very prescriptive. It anchors "today's" date, lists
-  the leader AAD as the fallback assignee, insists on a due date, and treats
-  meeting/transcript content as **untrusted** (prompt-injection defense).
+- Extraction runs on a client with only the read-only people lookups
+  (`extractionOnly`): no Planner, card, or WorkIQ tools. Instructions hidden
+  in an untrusted transcript can't write anything; all writes happen in
+  `cos/capture.ts` from the validated JSON.
+- The extracted items are persisted on the capture record (stable ids
+  `i1…iN`, with per-item `taskId` / `descriptionSaved` / `cardSent`) before
+  the first write. A retry resumes from that checkpoint, so an item worded
+  differently on a second run can't duplicate one already written, and a
+  failed description write is retried from the stored description.
+- The prompt anchors "today's" date, lists the leader AAD as the fallback
+  assignee, insists on a due date, and treats meeting/transcript content as
+  **untrusted** (prompt-injection defense).
+- Copilot insights are bound to the occurrence: only records whose
+  `callId` / `contentCorrelationId` match the selected transcript are used
+  (or, if the transcript has no correlation ids, records created after the
+  occurrence began). A recurring meeting's earlier insights are ignored.
 - When `hasInsights=false` (no Copilot license or empty response) the LLM
   extracts from the raw VTT — with the same output contract. That's the path
   demo tenants without a Copilot license end up on, and it produces the same
@@ -491,8 +515,10 @@ sequenceDiagram
 ```
 
 `plannerPoller` seeds a baseline on its first tick so already-complete tasks
-don't spuriously fire `runTaskComplete` at startup. Only *transitions*
-(prev<100 && curr==100) count.
+don't spuriously fire `runTaskComplete` at startup. After that, a witnessed
+transition (prev<100 && curr==100) counts, and so does a task created after
+the seed time that is already complete when first seen (e.g. a captured
+task completed by chat before the next poll).
 
 ### 5.6 Task complete via chat
 
@@ -758,11 +784,11 @@ app) at least once first. The reference store is persisted across restarts
 
 Two places, and only two:
 
-1. **`src/cos/capture.ts` → `runCapture`.** One LLM turn per meeting.
-   Extracts action items + decisions from a transcript (rich Copilot
-   insights when available; raw VTT otherwise). Calls
-   `planner_create_task` + `send_task_assignment_card` + `mcp_TeamsServer`
-   to post the meeting summary.
+1. **`src/cos/capture.ts` → `runCapture`.** One extraction turn per meeting
+   (skipped on retry — the checkpoint is reused). It returns action items +
+   decisions as JSON using only read-only people lookups; the Planner tasks
+   and assignment cards are then written by TypeScript. A final,
+   best-effort LLM call posts the meeting summary via `mcp_TeamsServer`.
 2. **`src/agent.ts` → `handleUserMessage` fallback path** (and
    `handleUserEmail` for email). One LLM turn per user DM or email that
    isn't a card action or keyword reply, after the same leadership-team gate.
@@ -967,7 +993,7 @@ debounced (200 ms) write on every mutation. This makes restarts safe:
 | `plannerPoller.lastProgress` | `planner-progress.json` | None — `{taskId: percent}` map | None |
 | `plannerPoller.pendingCompletions` | `planner-completions-pending.json` | Removed once every notification is delivered (or after `TASK_COMPLETE_MAX_ATTEMPTS`, default 12) | None |
 | scheduler bootstrap reference | `scheduler-ref.json` | None | None |
-| capture-created task index | `created-tasks.json` | Entries older than 14 days | None — `{capture + title + assignees → taskId}`, used only so a retried capture reuses its own tasks |
+| planner poller seed marker | `planner-poller-meta.json` | None | None — the baseline seed time |
 
 **Guarantees:**
 
@@ -1185,6 +1211,12 @@ prevent the demo. Address before pilot / production.
   tools (§12.5) — so a prompt
   injection can't make the LLM read protected data. The refusal *text* is
   still produced by the LLM.
+- **One Planner plan.** Every Planner read or write uses the worker app's
+  tenant-wide `Tasks.ReadWrite.All`, so the configured leadership plan is the
+  only one the agent touches: `planner_list_tasks` / `planner_create_task`
+  reject any other plan or a bucket outside it, `planner_get_task` refuses
+  tasks from other plans, and owner card actions require the task to be in
+  the leadership plan.
 - **Logs carry no Planner or meeting content.** Follow-up, task-complete,
   Planner, brief, and capture/meeting-discovery logs record id fragments
   (task-id prefixes, calendar event-id tails), counts, and reason codes —
@@ -1210,11 +1242,11 @@ prevent the demo. Address before pilot / production.
   `DISPLAY_TZ` in `brief.ts`/`followup.ts`/`actionRouter.ts` defaults). Set
   the env var for other tenants. For a per-leader TZ, resolve it from
   Graph (`GET /users/{leader}/mailboxSettings`).
-- **`plannerPoller` catches transitions during downtime, but not new tasks.**
-  The persisted `lastProgress` map only tracks tasks we've already seen.
-  A task created AND completed during downtime is invisible on the next
-  poll (both prev and curr are unset). Fix: seed missing tasks with 0 on
-  hydrate + first-poll comparison.
+- **New tasks completed before their first poll.** ~~A task created AND
+  completed between polls was invisible.~~ **Fixed:** the poller records
+  when its baseline was seeded (`planner-poller-meta.json`) and notifies for
+  any task created after that point that is already complete when first
+  seen. Tasks that predate the seed stay suppressed.
 - **No rate limiting.** A malicious user could DM the agent thousands of
   times/minute. Fine for a single-leader demo; add token-bucket
   rate-limiting before opening it up.
@@ -1238,8 +1270,8 @@ cos-agent/
 │   ├── util/
 │   │   ├── logger.ts                         # Level-based logger (LOG_LEVEL)
 │   │   ├── httpLogger.ts                     # Global axios interceptor (LOG_HTTP)
-│   │   ├── time.ts                           # BRIEF_DISPLAY_TZ formatting + DST-aware wall-clock → UTC
-│   │   └── toolContext.ts                    # Per-run tool outcomes + source ref (capture retry safety)
+│   │   └── time.ts                           # BRIEF_DISPLAY_TZ formatting + DST-aware wall-clock → UTC
+
 │   ├── graph/
 │   │   ├── graphAppToken.ts                  # Standalone Graph worker (client_credentials via MSAL)
 │   │   ├── peopleTools.ts                    # graph_find_user + attendees + UPN↔AAD + isUserInTeam + acquireGraphToken
@@ -1309,7 +1341,7 @@ Grouped by concern. Every var has a code default; only the ones marked
 | `HOST` | `0.0.0.0` in prod, `localhost` in dev | Express bind host. `127.0.0.1` in `.env.template` is local-only; omit `HOST` on App Service |
 | `PORT` | `3978` | Express port (App Service supplies its own) |
 | `LOG_LEVEL` | `info` | `error`/`warn`/`info`/`debug`/`trace` |
-| `LOG_HTTP` | `false` | Log every axios call with status + latency (masked auth) |
+| `LOG_HTTP` | `false` | Log every axios call with status + latency. Auth headers are masked, and ids, UPNs, and query strings in the URL are replaced with placeholders (`{guid}`, `{upn}`, `{id}`, `{query}`) |
 | `DEBUG` | — | Bot Framework SDK debug namespaces (`agents:*` prints a lot) |
 | `SKIP_TOOLING_ON_ERRORS` | `false` | `false`: a WorkIQ MCP registration failure fails the turn. `true`: continue without those tools |
 | `BEARER_TOKEN_<MCP_SERVER_NAME>` | — | Dev only, with `USE_AGENTIC_AUTH=false` and `NODE_ENV=development`: per-server MCP token for that server's audience (e.g. `BEARER_TOKEN_MCP_MAILTOOLS`). Set while `USE_AGENTIC_AUTH` is not `false`, it is rejected as a configuration error |

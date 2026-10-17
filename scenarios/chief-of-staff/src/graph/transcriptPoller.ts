@@ -35,6 +35,8 @@ import {
   isTranscriptClaimed,
   listAll,
   markCaptureGaveUp,
+  markCaptureRevoked,
+  reopenRevokedCapture,
   markCaptureReady,
   PendingCapture,
   pickNextRetryDelayMinutes,
@@ -185,6 +187,19 @@ async function runDiscoveryPass(
     const giveUpAfter = m.endTime + cfg.giveUpAfterHours * 60 * 60 * 1000;
     if (hasCaptureForEvent(m.eventId)) {
       if (!getCapture(m.eventId)?.joinWebUrl) updateCapture(m.eventId, { joinWebUrl: m.joinWebUrl });
+      // Re-invited after a revocation: discovery confirms it qualifies again.
+      if (
+        reopenRevokedCapture(m.eventId, {
+          startTime: m.startTime,
+          endTime: m.endTime,
+          durationMinutes: m.durationMinutes,
+          waitBudgetMinutes: budget,
+          giveUpAfter,
+        })
+      ) {
+        log.info('capturePoller', `reopened ${eventRef(m.eventId)} — the event qualifies again after its invitation was withdrawn`);
+        continue;
+      }
       // The same event id can move (reschedule). Refresh its deadlines so it
       // isn't abandoned before the meeting happens.
       const outcome = rescheduleCapture(m.eventId, {
@@ -252,7 +267,7 @@ async function runRetrySweep(
       );
       if (verdict === 'disqualified') {
         log.info('capturePoller', `retiring ${eventRef(cap.eventId)} — no longer qualifies (CoS/leader removed, cancelled, or deleted)`);
-        markCaptureGaveUp(cap.eventId);
+        markCaptureRevoked(cap.eventId);
         continue;
       }
       if (verdict === 'unknown') {
@@ -322,9 +337,13 @@ async function advanceCapture(
       updateCapture(cap.eventId, {
         transcriptId: match.transcriptId,
         transcriptFetchedAt: now,
+        transcriptCallId: match.callId,
+        transcriptCorrelationId: match.contentCorrelationId,
       });
       cap.transcriptId = match.transcriptId;
       cap.transcriptFetchedAt = now;
+      cap.transcriptCallId = match.callId;
+      cap.transcriptCorrelationId = match.contentCorrelationId;
     } else if (transcripts.length > 0) {
       log.debug(
         'capturePoller',
@@ -353,11 +372,13 @@ async function advanceCapture(
   // 2) If transcript is here, try insights (once per cycle until fetched).
   let insights: InsightsResult | undefined;
   if (cap.transcriptId && !cap.insightsFetched) {
-    insights = await fetchAiInsightsForMeeting(
-      opts,
-      cap.ownerUpn,
-      cap.meetingId
-    );
+    // Only insights correlated with THIS occurrence's transcript count; a
+    // recurring meeting's collection also holds earlier occurrences.
+    insights = await fetchAiInsightsForMeeting(opts, cap.ownerUpn, cap.meetingId, {
+      callId: cap.transcriptCallId,
+      contentCorrelationId: cap.transcriptCorrelationId,
+      windowStart: (cap.startTime ?? cap.endTime - cap.durationMinutes * 60 * 1000) - 15 * 60 * 1000,
+    });
     if (insights.available) {
       updateCapture(cap.eventId, {
         insightsFetched: true,

@@ -64,9 +64,15 @@ export interface ObservedOccurrence {
   durationMinutes: number;
 }
 
-function eventParticipants(ev: any): Set<string> {
+/**
+ * People actually on the invite: the organizer plus attendees who have not
+ * declined. Shared by discovery and the pre-processing re-check so both apply
+ * the same participation rule.
+ */
+export function eventParticipants(ev: any): Set<string> {
   const organizerAddr: string | undefined = ev.organizer?.emailAddress?.address?.toLowerCase();
   const attendeeAddrs = ((ev.attendees ?? []) as any[])
+    .filter((a) => String(a?.status?.response ?? '').toLowerCase() !== 'declined')
     .map((a) => (a.emailAddress?.address ?? '').toLowerCase())
     .filter(Boolean);
   return new Set<string>([...(organizerAddr ? [organizerAddr] : []), ...attendeeAddrs]);
@@ -132,7 +138,7 @@ export async function discoverQualifyingMeetings(
     const url =
       `${GRAPH_BASE}/users/${encodeURIComponent(graphOwnerUpn)}/calendarView` +
       `?startDateTime=${start}&endDateTime=${end}` +
-      `&$select=id,subject,start,end,isOnlineMeeting,onlineMeeting,organizer,attendees` +
+      `&$select=id,subject,start,end,isCancelled,isOnlineMeeting,onlineMeeting,organizer,attendees` +
       `&$top=100`;
 
     log.debug(
@@ -182,7 +188,7 @@ export async function discoverQualifyingMeetings(
       }
       // Record every online occurrence (qualifying or not) as a transcript
       // window boundary for other occurrences on the same join URL.
-      if (observed) {
+      if (observed && !ev.isCancelled) {
         const oEnd = ev.end?.dateTime ? Date.parse(ev.end.dateTime + 'Z') : NaN;
         const oStart = ev.start?.dateTime ? Date.parse(ev.start.dateTime + 'Z') : NaN;
         if (isFinite(oEnd)) {
@@ -196,20 +202,21 @@ export async function discoverQualifyingMeetings(
         }
       }
 
+      if (ev.isCancelled) {
+        log.debug('meetingWatcher', `skip ${ref} — cancelled`);
+        continue;
+      }
       const organizerAddr: string | undefined =
         ev.organizer?.emailAddress?.address?.toLowerCase();
-      const attendees = (ev.attendees ?? []) as any[];
-      const attendeeAddrs = attendees
+      const attendeeAddrs = ((ev.attendees ?? []) as any[])
         .map((a) => (a.emailAddress?.address ?? '').toLowerCase())
         .filter(Boolean);
-      // Everyone on the invite (organizer + attendees). We qualify a meeting
-      // whenever BOTH the leader AND the CoS are on it — regardless of who
-      // organized it. This lets delegates, shared mailboxes, or other people
-      // schedule meetings on the leader's behalf and still get captured.
-      const participants = new Set<string>([
-        ...(organizerAddr ? [organizerAddr] : []),
-        ...attendeeAddrs,
-      ]);
+      // Everyone on the invite who hasn't declined (organizer + attendees). We
+      // qualify a meeting whenever BOTH the leader AND the CoS are on it —
+      // regardless of who organized it. This lets delegates, shared
+      // mailboxes, or other people schedule meetings on the leader's behalf
+      // and still get captured. Same rule as checkEventParticipation.
+      const participants = eventParticipants(ev);
       const leaderInvolved = participants.has(leaderUpnLower);
       const cosInvolved = participants.has(cosUpnLower);
       if (!leaderInvolved) {

@@ -222,6 +222,7 @@ export function startScheduler(deps: SchedulerDeps): void {
             try {
               await runCapture(
                 {
+                  eventId: t.eventId,
                   meetingId: t.meetingId,
                   transcriptId: t.transcriptId,
                   organizerId: t.organizerId,

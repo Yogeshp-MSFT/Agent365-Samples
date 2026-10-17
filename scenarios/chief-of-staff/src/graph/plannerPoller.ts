@@ -96,6 +96,17 @@ if (firstPollDone) {
   );
 }
 
+// When the baseline was first seeded. A task first seen AFTER seeding that is
+// already 100% was created after the agent started watching and completed
+// before its first poll (e.g. a captured task completed by chat within one
+// POLL_TASKS_MS) — that is a real completion and must notify. Tasks that
+// already existed at seed time stay suppressed.
+const pollerMeta = new PersistentMap<number>({ file: 'planner-poller-meta.json' });
+if (firstPollDone && pollerMeta.get('seededAt') === undefined) {
+  // Baseline hydrated from an older version without this marker.
+  pollerMeta.set('seededAt', Date.now());
+}
+
 /**
  * Poll Planner for tasks that just became 100% complete. Empty on failure.
  * First poll after boot only seeds the baseline — no completions reported
@@ -112,7 +123,7 @@ export async function pollForCompletedTasks(opts: {
   try {
     const token = await acquireGraphToken(opts);
     const res = await axios.get(
-      `${GRAPH_BASE}/planner/plans/${planId}/tasks?$select=id,planId,percentComplete&$top=200`,
+      `${GRAPH_BASE}/planner/plans/${planId}/tasks?$select=id,planId,percentComplete,createdDateTime&$top=200`,
       { headers: { Authorization: `Bearer ${token}` } }
     );
 
@@ -120,8 +131,13 @@ export async function pollForCompletedTasks(opts: {
     for (const t of res.data?.value ?? []) {
       const prev = lastProgress.get(t.id);
       const curr = typeof t.percentComplete === 'number' ? t.percentComplete : 0;
-      // Only fire on transition to 100 that we actually witnessed happening.
-      if (firstPollDone && prev !== undefined && prev < 100 && curr === 100) {
+      // Fire on a witnessed transition to 100, or on a task created after the
+      // baseline was seeded that is already complete when first seen.
+      const seededAt = pollerMeta.get('seededAt');
+      const created = t.createdDateTime ? Date.parse(t.createdDateTime) : NaN;
+      const newSinceSeed =
+        prev === undefined && seededAt !== undefined && Number.isFinite(created) && created >= seededAt;
+      if (firstPollDone && curr === 100 && ((prev !== undefined && prev < 100) || newSinceSeed)) {
         completedNow.push(t.id);
         if (!pendingCompletions.has(t.id)) {
           pendingCompletions.set(t.id, { planId: t.planId, detectedAt: Date.now(), attempts: 0, delivered: [] });
@@ -139,6 +155,7 @@ export async function pollForCompletedTasks(opts: {
     }
     if (!firstPollDone) {
       firstPollDone = true;
+      pollerMeta.set('seededAt', Date.now());
       console.log(
         `[plannerPoller] baseline seeded with ${lastProgress.size} tasks — future completions will fire runTaskComplete.`
       );

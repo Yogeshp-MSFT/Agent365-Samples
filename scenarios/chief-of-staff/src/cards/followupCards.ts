@@ -773,6 +773,20 @@ function buildTaskAssignmentCard(args: TaskAssignmentArgs): object {
   };
 }
 
+/** Send the task-assignment card without the LLM (deterministic capture). */
+export async function sendTaskAssignmentCardDirect(
+  opts: CardToolOptions,
+  args: TaskAssignmentArgs
+): Promise<{ ok: boolean; error?: string; noConversationRef?: boolean }> {
+  try {
+    await sendCardToUser(opts, args.ownerAadObjectId, buildTaskAssignmentCard(args), 'task-assignment');
+    return { ok: true };
+  } catch (err) {
+    const msg = String((err as any)?.message ?? err);
+    return { ok: false, error: msg, noConversationRef: msg.startsWith('no-conversation-ref') };
+  }
+}
+
 export function createTaskAssignmentTool(opts: CardToolOptions) {
   return tool({
     name: 'send_task_assignment_card',

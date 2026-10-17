@@ -26,8 +26,6 @@ import { tool } from '@openai/agents';
 import { Authorization, TurnContext } from '@microsoft/agents-hosting';
 import { getPlannerPlanId, getPlannerBucketId } from './plannerConfig';
 import { acquireAppOnlyGraphToken } from './graphAppToken';
-import { PersistentMap } from '../state/persistentMap';
-import { currentSourceRef, recordToolOutcome } from '../util/toolContext';
 
 const GRAPH_BASE = 'https://graph.microsoft.com/v1.0';
 
@@ -58,33 +56,126 @@ function toolError(name: string, err: unknown): string {
   const e = err as any;
   const msg = e?.response?.data ?? e?.message ?? String(e);
   console.error(`[plannerTools] ${name} failed:`, msg);
-  recordToolOutcome({ tool: name, ok: false, error: typeof msg === 'string' ? msg : JSON.stringify(msg) });
   return JSON.stringify({ ok: false, tool: name, error: msg });
 }
 
-// Index of tasks created by a deterministic run (e.g. a meeting capture), so a
-// retried run returns the task it already created instead of a duplicate.
-interface CreatedTaskRecord {
-  taskId: string;
-  createdAt: number;
-  /** True while the task's description (decision context) still has to be written. */
-  descriptionPending?: boolean;
+// ─── Plan boundary ─────────────────────────────────────────────────────────
+// Every Planner call uses the worker's tenant-wide application permissions,
+// so the configured leadership plan is the ONLY plan this agent reads or
+// writes. A caller (or the model) can't widen that by supplying another
+// plan, bucket, or task id.
+export async function getAllowedPlanId(): Promise<string | undefined> {
+  return defaultPlanId();
 }
-const CREATED_TASK_RETENTION_MS = 14 * 24 * 60 * 60 * 1000;
-const createdTaskIndex = new PersistentMap<CreatedTaskRecord>({
-  file: 'created-tasks.json',
-  keepOnHydrate: (r) => !!r && Date.now() - r.createdAt < CREATED_TASK_RETENTION_MS,
-});
 
-function createdTaskKey(
-  sourceRef: string | undefined,
+async function resolveAllowedPlan(
+  requested?: string | null
+): Promise<{ ok: true; planId: string } | { ok: false; error: string }> {
+  const allowed = await getAllowedPlanId();
+  if (!allowed) {
+    return { ok: false, error: 'No Planner plan configured (PLANNER_PLAN_ID or LEADERSHIP_TEAM_ID auto-resolve)' };
+  }
+  if (requested && requested !== allowed) {
+    return { ok: false, error: 'Only the configured leadership plan can be accessed.' };
+  }
+  return { ok: true, planId: allowed };
+}
+
+/** True when a task's planId is the configured leadership plan. */
+export async function isTaskInAllowedPlan(taskPlanId: string | undefined | null): Promise<boolean> {
+  const allowed = await getAllowedPlanId();
+  return !!allowed && !!taskPlanId && taskPlanId === allowed;
+}
+
+async function resolveAllowedBucket(
   planId: string,
-  title: string,
-  assignees: string[]
-): string | undefined {
-  if (!sourceRef) return undefined;
-  const who = assignees.map((a) => a.trim().toLowerCase()).sort().join(',');
-  return `${sourceRef}|${planId}|${title.trim().toLowerCase()}|${who}`;
+  requested: string | null | undefined,
+  token: string
+): Promise<{ ok: true; bucketId: string } | { ok: false; error: string }> {
+  const fallback = await defaultBucketId();
+  const bucketId = requested || fallback;
+  if (!bucketId) return { ok: false, error: 'No bucketId (PLANNER_BUCKET_NEW or team auto-resolve)' };
+  if (bucketId === fallback) return { ok: true, bucketId };
+  // Any other bucket must belong to the allowed plan.
+  try {
+    const res = await axios.get(
+      `${GRAPH_BASE}/planner/buckets/${encodeURIComponent(bucketId)}?$select=id,planId`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    if (res.data?.planId !== planId) return { ok: false, error: 'That bucket is not in the leadership plan.' };
+    return { ok: true, bucketId };
+  } catch {
+    return { ok: false, error: 'Could not verify the bucket belongs to the leadership plan.' };
+  }
+}
+
+// ─── Deterministic task creation (shared by the tool and meeting capture) ──
+export interface CreatePlannerTaskInput {
+  title: string;
+  description?: string | null;
+  planId?: string | null;
+  bucketId?: string | null;
+  assigneeAadIds?: string[] | null;
+  dueDateTime?: string | null;
+  priority?: number | null;
+}
+
+export type CreatePlannerTaskResult =
+  | { ok: true; taskId: string; title: string; bucketId: string; assignees: string[]; descriptionSaved?: boolean }
+  /** `taskId` is set when the task exists but a follow-up write failed. */
+  | { ok: false; error: string; taskId?: string };
+
+/**
+ * Create one task in the configured leadership plan. When a description is
+ * supplied and its write fails, returns ok:false WITH the new taskId so the
+ * caller can record the task and retry only the description.
+ */
+export async function createPlannerTaskDirect(input: CreatePlannerTaskInput): Promise<CreatePlannerTaskResult> {
+  try {
+    if (!input.title?.trim()) return { ok: false, error: 'title is required' };
+    const plan = await resolveAllowedPlan(input.planId);
+    if (!plan.ok) return { ok: false, error: plan.error };
+    const token = await acquireAppOnlyGraphToken();
+    const bucket = await resolveAllowedBucket(plan.planId, input.bucketId, token);
+    if (!bucket.ok) return { ok: false, error: bucket.error };
+
+    const assignees =
+      input.assigneeAadIds && input.assigneeAadIds.length > 0
+        ? input.assigneeAadIds
+        : ([process.env.LEADER_AAD_ID?.trim()].filter(Boolean) as string[]);
+    const assignments: Record<string, unknown> = {};
+    for (const aad of assignees) {
+      assignments[aad] = { '@odata.type': '#microsoft.graph.plannerAssignment', orderHint: ' !' };
+    }
+    const body: Record<string, unknown> = { planId: plan.planId, bucketId: bucket.bucketId, title: input.title.trim() };
+    if (Object.keys(assignments).length > 0) body.assignments = assignments;
+    if (input.dueDateTime) body.dueDateTime = input.dueDateTime;
+    if (typeof input.priority === 'number') body.priority = input.priority;
+
+    const res = await axios.post(`${GRAPH_BASE}/planner/tasks`, body, {
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    });
+    const taskId = String(res.data.id);
+    const description = input.description?.trim();
+    if (description) {
+      const saved = await setPlannerTaskDescription(taskId, description, token);
+      if (!saved.ok) {
+        return { ok: false, taskId, error: `task created but its description could not be saved (${saved.error})` };
+      }
+    }
+    return {
+      ok: true,
+      taskId,
+      title: res.data.title,
+      bucketId: res.data.bucketId,
+      assignees,
+      ...(description ? { descriptionSaved: true } : {}),
+    };
+  } catch (err) {
+    const e = err as any;
+    const msg = e?.response?.data ?? e?.message ?? String(e);
+    return { ok: false, error: typeof msg === 'string' ? msg : JSON.stringify(msg) };
+  }
 }
 
 // ─── Tool argument types ───────────────────────────────────────────────────
@@ -96,30 +187,21 @@ interface GetTaskArgs {
   taskId: string;
 }
 
-interface CreateTaskArgs {
-  title: string;
-  description?: string | null;
-  planId?: string | null;
-  bucketId?: string | null;
-  assigneeAadIds?: string[] | null;
-  dueDateTime?: string | null;
-  priority?: number | null;
-}
+type CreateTaskArgs = CreatePlannerTaskInput;
 
 // ─── planner_list_tasks ────────────────────────────────────────────────────
 function createListTasksTool(opts: PlannerToolOptions) {
   return tool({
     name: 'planner_list_tasks',
     description:
-      'List open Planner tasks in a plan. Returns id, title, bucketId, dueDateTime, percentComplete, and assignments.',
+      'List open Planner tasks in the leadership plan. Returns id, title, bucketId, dueDateTime, percentComplete, and assignments.',
     parameters: {
       type: 'object',
       additionalProperties: false,
       properties: {
         planId: {
           type: ['string', 'null'],
-          description:
-            'Planner plan id. If omitted or null, the agent uses the default plan from env PLANNER_PLAN_ID.',
+          description: 'Leave null. Only the configured leadership plan can be read.',
         },
       },
       required: ['planId'],
@@ -127,10 +209,10 @@ function createListTasksTool(opts: PlannerToolOptions) {
     execute: async (rawArgs: unknown) => {
       const args = (rawArgs ?? {}) as ListTasksArgs;
       try {
-        const planId = args.planId ?? (await defaultPlanId());
-        if (!planId) return toolError('planner_list_tasks', 'No planId (arg or PLANNER_PLAN_ID / team auto-resolve)');
+        const plan = await resolveAllowedPlan(args.planId);
+        if (!plan.ok) return toolError('planner_list_tasks', plan.error);
         const token = await acquireGraphToken(opts);
-        const res = await axios.get(`${GRAPH_BASE}/planner/plans/${planId}/tasks`, {
+        const res = await axios.get(`${GRAPH_BASE}/planner/plans/${encodeURIComponent(plan.planId)}/tasks`, {
           headers: { Authorization: `Bearer ${token}` },
         });
         const tasks = (res.data.value ?? []).map((t: any) => ({
@@ -155,7 +237,7 @@ function createGetTaskTool(opts: PlannerToolOptions) {
   return tool({
     name: 'planner_get_task',
     description:
-      'Read a single Planner task with all fields (title, description, dueDateTime, assignments, percentComplete, bucketId, priority).',
+      'Read a single task from the leadership plan with all fields (title, description, dueDateTime, assignments, percentComplete, bucketId, priority).',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -172,10 +254,14 @@ function createGetTaskTool(opts: PlannerToolOptions) {
       try {
         if (!args.taskId) return toolError('planner_get_task', 'taskId is required');
         const token = await acquireGraphToken(opts);
-        const res = await axios.get(`${GRAPH_BASE}/planner/tasks/${args.taskId}`, {
+        const res = await axios.get(`${GRAPH_BASE}/planner/tasks/${encodeURIComponent(args.taskId)}`, {
           headers: { Authorization: `Bearer ${token}` },
         });
         const t = res.data;
+        // Never return tasks from other plans the worker app can technically read.
+        if (!(await isTaskInAllowedPlan(t?.planId))) {
+          return toolError('planner_get_task', 'That task is not in the leadership plan.');
+        }
         let description: string | undefined;
         if (t.hasDescription) {
           try {
@@ -213,13 +299,12 @@ function createGetTaskTool(opts: PlannerToolOptions) {
 }
 
 // ─── planner_create_task ───────────────────────────────────────────────────
-function createCreateTaskTool(opts: PlannerToolOptions) {
+function createCreateTaskTool(_opts: PlannerToolOptions) {
   return tool({
     name: 'planner_create_task',
     description:
-      'Create a new Planner task in a plan+bucket, optionally with assignees, a due date, and a description. ' +
-      'Each call creates a separate task; tasks with the same title for different owners stay separate. ' +
-      'Only a retried meeting capture reuses the task it already created for the same title and assignees.',
+      'Create a new task in the leadership plan, optionally with assignees, a due date, and a description. ' +
+      'Each call creates a separate task. (Meeting capture does not use this tool; it writes tasks deterministically.)',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -235,11 +320,11 @@ function createCreateTaskTool(opts: PlannerToolOptions) {
         },
         planId: {
           type: ['string', 'null'],
-          description: 'Planner plan id. Defaults to env PLANNER_PLAN_ID.',
+          description: 'Leave null. Only the configured leadership plan can be written.',
         },
         bucketId: {
           type: ['string', 'null'],
-          description: 'Planner bucket id. Defaults to env PLANNER_BUCKET_NEW.',
+          description: 'Bucket in the leadership plan. Defaults to the "New" bucket.',
         },
         assigneeAadIds: {
           type: ['array', 'null'],
@@ -260,119 +345,19 @@ function createCreateTaskTool(opts: PlannerToolOptions) {
     } as any,
     execute: async (rawArgs: unknown) => {
       const args = (rawArgs ?? {}) as CreateTaskArgs;
-      try {
-        const planId = args.planId ?? (await defaultPlanId());
-        const bucketId = args.bucketId ?? (await defaultBucketId());
-        if (!args.title) return toolError('planner_create_task', 'title is required');
-        if (!planId) return toolError('planner_create_task', 'No planId (arg or PLANNER_PLAN_ID / team auto-resolve)');
-        if (!bucketId)
-          return toolError('planner_create_task', 'No bucketId (arg or PLANNER_BUCKET_NEW / team auto-resolve)');
-
-        const assignees =
-          args.assigneeAadIds && args.assigneeAadIds.length > 0
-            ? args.assigneeAadIds
-            : ([process.env.LEADER_AAD_ID].filter(Boolean) as string[]);
-        const assignments: Record<string, unknown> = {};
-        for (const aad of assignees) {
-          assignments[aad] = {
-            '@odata.type': '#microsoft.graph.plannerAssignment',
-            orderHint: ' !',
-          };
-        }
-
-        const body: Record<string, unknown> = {
-          planId,
-          bucketId,
-          title: args.title,
-        };
-        if (Object.keys(assignments).length > 0) body.assignments = assignments;
-        if (args.dueDateTime) body.dueDateTime = args.dueDateTime;
-        if (typeof args.priority === 'number') body.priority = args.priority;
-
-        const token = await acquireGraphToken(opts);
-
-        // Retry safety: a capture re-run after a partial failure must not
-        // duplicate tasks it already created. Deduplication is scoped to the
-        // run's source (e.g. one meeting capture) + title + assignees — never
-        // to the title alone, so distinct owners' tasks stay separate.
-        const dedupeKey = createdTaskKey(currentSourceRef(), planId, args.title, assignees);
-        if (dedupeKey) {
-          const prior = createdTaskIndex.get(dedupeKey);
-          if (prior) {
-            const live = await getPlannerTaskDetails(prior.taskId);
-            if (live.ok) {
-              // Finish a description write that failed on an earlier attempt.
-              if (prior.descriptionPending && args.description?.trim()) {
-                const saved = await setPlannerTaskDescription(prior.taskId, args.description.trim(), token);
-                if (!saved.ok) {
-                  return toolError(
-                    'planner_create_task',
-                    `task exists but its description could not be saved (${saved.error}); retry later`
-                  );
-                }
-                createdTaskIndex.set(dedupeKey, { ...prior, descriptionPending: false });
-              }
-              recordToolOutcome({ tool: 'planner_create_task', ok: true });
-              return JSON.stringify({
-                ok: true,
-                alreadyExisted: true,
-                taskId: prior.taskId,
-                title: live.title ?? args.title,
-                assignees: live.assigneeAads,
-              });
-            }
-            if (!live.notFound) {
-              // Can't confirm the earlier task is gone — fail this attempt
-              // (the capture stays retryable) rather than risk a duplicate.
-              return toolError(
-                'planner_create_task',
-                `could not verify the task created on an earlier attempt (${live.error}); retry later`
-              );
-            }
-            createdTaskIndex.delete(dedupeKey);
-          }
-        }
-        const res = await axios.post(`${GRAPH_BASE}/planner/tasks`, body, {
-          headers: {
-            Authorization: `Bearer ${token}`,
-            'Content-Type': 'application/json',
-          },
-        });
-
-        const wantsDescription = !!args.description?.trim();
-        // Record the new task immediately, so a retry reuses it even if the
-        // description write below fails.
-        if (dedupeKey) {
-          createdTaskIndex.set(dedupeKey, {
-            taskId: res.data.id,
-            createdAt: Date.now(),
-            descriptionPending: wantsDescription,
-          });
-        }
-        if (wantsDescription) {
-          const saved = await setPlannerTaskDescription(res.data.id, args.description!.trim(), token);
-          if (!saved.ok) {
-            // Report a failure so the capture stays retryable; the retry
-            // reuses this task and writes the description.
-            return toolError(
-              'planner_create_task',
-              `task ${String(res.data.id).slice(0, 8)}… was created but its description could not be saved (${saved.error}); retry to finish it`
-            );
-          }
-          if (dedupeKey) createdTaskIndex.set(dedupeKey, { taskId: res.data.id, createdAt: Date.now(), descriptionPending: false });
-        }
-        recordToolOutcome({ tool: 'planner_create_task', ok: true });
+      const r = await createPlannerTaskDirect(args);
+      if (r.ok) return JSON.stringify(r);
+      if (r.taskId) {
+        // The task exists; only the description failed. Report it so the
+        // model doesn't create the same task again.
         return JSON.stringify({
           ok: true,
-          taskId: res.data.id,
-          title: res.data.title,
-          bucketId: res.data.bucketId,
-          assignees,
-          ...(wantsDescription ? { descriptionSaved: true } : {}),
+          taskId: r.taskId,
+          descriptionSaved: false,
+          warning: 'The task was created, but its description could not be saved. Do not create it again.',
         });
-      } catch (err) {
-        return toolError('planner_create_task', err);
       }
+      return toolError('planner_create_task', r.error);
     },
   });
 }
@@ -601,7 +586,7 @@ export async function setPlannerTaskDescription(
 export async function getPlannerTaskDetails(
   taskId: string
 ): Promise<
-  | { ok: true; title: string; assigneeAads: string[]; percentComplete: number }
+  | { ok: true; title: string; assigneeAads: string[]; percentComplete: number; planId: string }
   | { ok: false; error: string; notFound: boolean }
 > {
   try {
@@ -615,7 +600,7 @@ export async function getPlannerTaskDetails(
     const assignments = (res.data?.assignments ?? {}) as Record<string, unknown>;
     const assigneeAads = Object.keys(assignments);
     const pct = Number(res.data?.percentComplete ?? 0);
-    return { ok: true, title, assigneeAads, percentComplete: pct };
+    return { ok: true, title, assigneeAads, percentComplete: pct, planId: String(res.data?.planId ?? '') };
   } catch (err) {
     const msg = (err as any)?.response?.data ?? (err as any)?.message ?? String(err);
     // Only a 404 proves the task is gone; throttling, 5xx, and transport

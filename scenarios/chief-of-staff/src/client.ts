@@ -135,6 +135,13 @@ export interface ClientOptions {
    * protected data can't be read regardless of what the prompt says.
    */
   restrictedAccess?: boolean;
+  /**
+   * Meeting-capture extraction: only the read-only people lookups needed to
+   * resolve owners. No Planner/card write tools and no WorkIQ MCP, so content
+   * inside an untrusted transcript can't trigger writes during extraction —
+   * all writes happen afterwards in deterministic code (cos/capture.ts).
+   */
+  extractionOnly?: boolean;
 }
 
 // When false (default), a WorkIQ MCP registration failure fails the turn
@@ -160,6 +167,7 @@ export async function getClient(
   };
   const humanInitiated = options.humanInitiated ?? true;
   const restricted = options.restrictedAccess === true;
+  const extractionOnly = !restricted && options.extractionOnly === true;
   // Groups every span this run emits (invoke_agent, chat, execute_tool).
   const runId = randomUUID();
   const scopeOptions = { sessionId: runId, humanInitiated, peopleOpts };
@@ -169,6 +177,8 @@ export async function getClient(
   // directory and chat-membership lookups.
   const tools = restricted
     ? []
+    : extractionOnly
+    ? [...createPeopleTools(peopleOpts)]
     : [
         // Graph-backed Planner tools (mcp_PlannerServer isn't hosted in this tenant).
         ...createPlannerTools(peopleOpts),
@@ -189,6 +199,9 @@ export async function getClient(
 
   if (restricted) {
     console.log('[client] restricted sender — no tools attached (Planner, card, people, WorkIQ MCP).');
+    return new CosAgentClient(agent, peopleOpts, humanInitiated, runId);
+  }
+  if (extractionOnly) {
     return new CosAgentClient(agent, peopleOpts, humanInitiated, runId);
   }
 

@@ -50,6 +50,9 @@ export interface TranscriptSummary {
   transcriptId: string;
   createdDateTime?: string;
   transcriptContentUrl?: string;
+  /** Call / content correlation ids — shared with this call's Copilot insights. */
+  callId?: string;
+  contentCorrelationId?: string;
 }
 
 /**
@@ -74,7 +77,7 @@ export async function fetchTranscriptsForMeeting(
     const url =
       `${GRAPH_V1}/users/${encodeURIComponent(userId)}` +
       `/onlineMeetings/${encodeURIComponent(meetingId)}/transcripts`;
-    log.debug('transcriptFetch', `GET ${url}`);
+    log.debug('transcriptFetch', `GET transcripts meeting=${meetingId.slice(0, 8)}…`);
     const res = await axios.get(url, {
       headers: { Authorization: `Bearer ${token}` },
     });
@@ -89,6 +92,8 @@ export async function fetchTranscriptsForMeeting(
         transcriptId: String(t.id),
         createdDateTime: t.createdDateTime,
         transcriptContentUrl: t.transcriptContentUrl,
+        callId: t.callId ?? undefined,
+        contentCorrelationId: t.contentCorrelationId ?? undefined,
       }));
   } catch (err) {
     const e = err as any;
@@ -201,10 +206,40 @@ export interface InsightsResult {
   meetingNotes?: SimpleMeetingNote[];
 }
 
+/** Identifies the occurrence whose insights we want. */
+export interface InsightsOccurrence {
+  callId?: string;
+  contentCorrelationId?: string;
+  /** Earliest plausible creation time for this occurrence's insights (ms). */
+  windowStart: number;
+}
+
+/**
+ * Keep only insight records that belong to the captured occurrence. A
+ * recurring meeting's aiInsights collection holds every occurrence's
+ * results, so records are matched by the transcript's correlation ids; when
+ * the transcript has none, only records created after this occurrence began
+ * are accepted. Unmatched records are ignored (treated as not available).
+ */
+export function selectInsightsForOccurrence(insights: any[], occ: InsightsOccurrence): any[] {
+  const byId = !!(occ.callId || occ.contentCorrelationId);
+  return insights.filter((ins) => {
+    if (byId) {
+      return (
+        (!!occ.contentCorrelationId && ins.contentCorrelationId === occ.contentCorrelationId) ||
+        (!!occ.callId && ins.callId === occ.callId)
+      );
+    }
+    const created = ins.createdDateTime ? Date.parse(ins.createdDateTime) : NaN;
+    return Number.isFinite(created) && created >= occ.windowStart;
+  });
+}
+
 export async function fetchAiInsightsForMeeting(
   opts: GraphOpts,
   userUpn: string,
-  meetingId: string
+  meetingId: string,
+  occurrence: InsightsOccurrence
 ): Promise<InsightsResult> {
   const token = await acquireGraphToken(opts);
   const userId = await resolveUserIdForOnlineMeetings(opts, userUpn);
@@ -218,11 +253,11 @@ export async function fetchAiInsightsForMeeting(
   const path = `/copilot/users/${encodeURIComponent(userId)}/onlineMeetings/${encodeURIComponent(meetingId)}/aiInsights`;
 
   // Try v1.0 first.
-  log.debug('insightsFetch', `GET ${GRAPH_V1}${path}`);
+  log.debug('insightsFetch', `GET v1.0 aiInsights meeting=${meetingId.slice(0, 8)}…`);
   const v1 = await tryFetchInsights(token, `${GRAPH_V1}${path}`);
   if (v1.status === 'ok') {
     log.debug('insightsFetch', `v1.0 returned ${v1.data.length} insight object(s) for meeting=${meetingId.slice(0, 8)}…`);
-    return normalise(v1.data);
+    return normalise(selectInsightsForOccurrence(v1.data, occurrence));
   }
   if (v1.status === 'unsupported') {
     log.debug('insightsFetch', `v1.0 forbidden for meeting=${meetingId.slice(0, 8)}… (403) — tenant may lack Copilot licence`);
@@ -231,11 +266,11 @@ export async function fetchAiInsightsForMeeting(
 
   // Fall back to /beta when v1.0 is empty or returns 404 (the endpoint may
   // only exist on beta in this tenant).
-  log.debug('insightsFetch', `v1.0 ${v1.status}, trying /beta ${GRAPH_BETA}${path}`);
+  log.debug('insightsFetch', `v1.0 ${v1.status}, trying /beta for meeting=${meetingId.slice(0, 8)}…`);
   const beta = await tryFetchInsights(token, `${GRAPH_BETA}${path}`);
   if (beta.status === 'ok') {
     log.debug('insightsFetch', `beta returned ${beta.data.length} insight object(s) for meeting=${meetingId.slice(0, 8)}…`);
-    return normalise(beta.data);
+    return normalise(selectInsightsForOccurrence(beta.data, occurrence));
   }
   // Only declare insights unavailable when BOTH versions say so.
   if (
@@ -273,7 +308,7 @@ async function tryFetchInsights(
     // decides. 403 means the tenant/app genuinely can't read insights.
     if (status === 404) return { status: 'not-found' };
     if (status === 403) return { status: 'unsupported' };
-    log.warn('insightsFetch', `${url} failed`, {
+    log.warn('insightsFetch', `aiInsights request failed (${url.includes('/beta/') ? 'beta' : 'v1.0'})`, {
       status,
       body: e?.response?.data ?? e?.message ?? String(e),
     });

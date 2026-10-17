@@ -25,6 +25,21 @@ export interface SimpleActionItem {
   description?: string;
 }
 
+/** One extracted action item / decision, with its write progress. */
+export interface CaptureItem {
+  itemId: string;
+  kind: 'task' | 'decision';
+  title: string;
+  description?: string;
+  dueDateTime?: string | null;
+  ownerAad: string;
+  ownerName: string;
+  taskId?: string;
+  descriptionSaved?: boolean;
+  cardSent?: boolean;
+  cardSkipped?: string;
+}
+
 export interface SimpleMeetingNote {
   title?: string;
   content?: string;
@@ -55,9 +70,23 @@ export interface PendingCapture {
   /** Downstream (runCapture) failures for a READY capture. */
   processingFailures?: number;
 
+  /** Set when the capture was retired because the invitation was withdrawn
+   *  (CoS/leader removed, declined, cancelled). Discovery reopens it if the
+   *  event qualifies again; exhausted retries never set this. */
+  revokedAt?: number;
+
   // Fetched artifacts
   transcriptId?: string;
   transcriptFetchedAt?: number;
+  /** Correlation ids of the selected transcript — used to accept only the
+   *  Copilot insights that belong to this same occurrence. */
+  transcriptCallId?: string;
+  transcriptCorrelationId?: string;
+  /** Extraction checkpoint: the items the model extracted on the first
+   *  processing attempt, with per-item write progress. Retries resume from
+   *  here instead of re-extracting (so re-worded items can't duplicate). */
+  extractedItems?: CaptureItem[];
+  summaryPosted?: boolean;
   /**
    * The raw WebVTT transcript body, fetched via the standalone Graph worker.
    * Populated once transcriptId is known. Undefined = not yet fetched, or the
@@ -226,10 +255,53 @@ export function rescheduleCapture(
   return result;
 }
 
+/**
+ * The invitation was withdrawn: retire the capture but remember why, so a
+ * later re-invitation can reopen it (unlike exhausted retries).
+ */
+export function markCaptureRevoked(eventId: string): void {
+  const c = store.get(eventId);
+  if (!c) return;
+  markCaptureGaveUp(eventId);
+  c.revokedAt = Date.now();
+  store.set(eventId, c);
+}
+
+/**
+ * Fresh discovery confirms a revoked capture qualifies again: reopen it with
+ * clean artifact and retry state. No-op for captures that weren't revoked.
+ */
+export function reopenRevokedCapture(
+  eventId: string,
+  timing: { startTime?: number; endTime: number; durationMinutes: number; waitBudgetMinutes: number; giveUpAfter: number }
+): boolean {
+  const c = store.get(eventId);
+  if (!c || c.status !== 'gave-up' || !c.revokedAt) return false;
+  Object.assign(c, timing);
+  c.status = 'pending';
+  c.revokedAt = undefined;
+  c.attempts = 0;
+  c.processingFailures = 0;
+  c.nextCheckAt = Date.now();
+  c.transcriptId = undefined;
+  c.transcriptFetchedAt = undefined;
+  c.transcriptCallId = undefined;
+  c.transcriptCorrelationId = undefined;
+  c.transcriptContent = undefined;
+  c.insightsFetched = false;
+  c.insightsActionItems = undefined;
+  c.insightsMeetingNotes = undefined;
+  c.extractedItems = undefined;
+  c.summaryPosted = undefined;
+  store.set(eventId, c);
+  return true;
+}
+
 export function markCaptureComplete(eventId: string): void {
   const c = store.get(eventId);
   if (!c) return;
   c.status = 'complete';
+  c.extractedItems = undefined;
   // Strip fat fields — the transcript has already been fed to the LLM.
   // Keeping them in memory serves no purpose and the serializeTransform
   // drops them on disk anyway; freeing the in-memory copy is a bonus.

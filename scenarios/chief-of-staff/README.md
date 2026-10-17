@@ -32,7 +32,7 @@ A running Node service on your dev machine (or Azure App Service) that:
 
 | Capability | Trigger |
 |---|---|
-| **Capture** — extracts action items + decisions from Teams meetings and creates Planner tasks | Calendar poller finds any Teams meeting with both the leader and the CoS on the invite (any organizer; in-progress and upcoming meetings are tracked until their transcript exists), the transcript for that occurrence is fetched, LLM extracts |
+| **Capture** — extracts action items + decisions from Teams meetings and creates Planner tasks (extraction is checkpointed, then tasks and assignment cards are written by code, so a retry never duplicates work) | Calendar poller finds any Teams meeting with both the leader and the CoS on the invite (any organizer; in-progress and upcoming meetings are tracked until their transcript exists), the transcript for that occurrence is fetched, LLM extracts |
 | **Daily Brief** — Adaptive Card DM to the leader with priorities, watch items, upcoming meetings | Cron (default 8 AM weekdays, gated behind `BRIEF_ENABLED`) |
 | **Follow-up** — Adaptive Card DM to each at-risk owner — every current assignee of a task gets their own card (`On track` / `Need more time` / `I'm blocked`) | Cron (default hourly) |
 | **Extension request** — leader gets an approval card, agent PATCHes Planner due date on approval | Owner clicks "Need more time" or types `extend` |
@@ -361,7 +361,7 @@ for the exhaustive list):
 | `CAPTURE_MIN_ATTEMPTS_TRANSCRIPT_ONLY` | `2` | Attempt count after which we fire capture on transcript alone (skip waiting for insights) |
 | `CAPTURE_GIVE_UP_AFTER_HOURS` | `4` | Give up on a meeting whose transcript never appears |
 | `LOG_LEVEL` | `info` | `error` / `warn` / `info` / `debug` / `trace` |
-| `LOG_HTTP` | `false` | Log every outbound HTTP call with status + latency |
+| `LOG_HTTP` | `false` | Log every outbound HTTP call with status + latency (ids, UPNs, and query strings in URLs are masked) |
 | `SCHEDULER_ENABLED` | `true` | Set `false` to disable all crons + pollers |
 | `SKIP_TOOLING_ON_ERRORS` | `false` | `false` fails a turn when WorkIQ MCP registration fails; `true` continues without those tools |
 | `BRIEF_DISPLAY_TZ` | `Asia/Kolkata` | Wall-clock TZ for card dates and blocker meeting slots (DST-aware) |

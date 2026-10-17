@@ -21,6 +21,7 @@ import { tool } from '@openai/agents';
 import { Authorization, CloudAdapter, TurnContext } from '@microsoft/agents-hosting';
 import { getBotAppId, sendCardProactively } from './proactiveSend';
 import { hasConversationRef } from '../state/conversationRefs';
+import { DISPLAY_TZ } from '../util/time';
 
 export interface BriefToolOptions {
   authorization: Authorization;
@@ -93,13 +94,16 @@ function sanitizeBriefLine(line: unknown): string | null {
 
 export function buildBriefAdaptiveCard(args: BriefCardArgs): object {
   const now = new Date();
+  // Header uses the same zone as the card contents and the brief schedule.
   const dateLong = now.toLocaleDateString(undefined, {
+    timeZone: DISPLAY_TZ,
     weekday: 'long',
     month: 'long',
     day: 'numeric',
     year: 'numeric',
   });
   const timeShort = now.toLocaleTimeString(undefined, {
+    timeZone: DISPLAY_TZ,
     hour: 'numeric',
     minute: '2-digit',
   });

@@ -34,6 +34,7 @@ import {
   completePlannerTask,
   findOpenTaskByTitle,
   getPlannerTaskDetails,
+  isTaskInAllowedPlan,
   updatePlannerTaskDueDate,
   updatePlannerTaskTitle,
 } from '../graph/plannerTools';
@@ -321,6 +322,13 @@ export function isAffirmativeCompletion(rawText: string): boolean {
   const nonFactual =
     /\b(will|shall|going to|gonna|plan(?:ning)? to|about to|need to|needs to|have to|has to|want to|wants to|wanted|trying to|try to|hope|hopes|hoped|hoping|wish|wishes|wished|if only|should|would|could|might|may|maybe|perhaps|probably|possibly|apparently|supposedly|ideally|supposed to|meant to|expect|expects|expected|assume|assumed|think|thought|believe|guess|imagine|pretend|almost|nearly|soon|later|tomorrow|next week|once|after|before|until|unless|if|when|whether)\b|'ll\b|'d\b/;
   if (nonFactual.test(text)) return false;
+  // Belief / doubt / hearsay ("I doubt that…", "Bob said…", "seems done") and
+  // any reported "that"-clause describe someone's view, not a completion the
+  // sender is reporting.
+  const epistemic =
+    /\b(doubt|doubts|doubted|doubtful|unsure|uncertain|unclear|unlikely|wonder|wondering|question|suspect|suspects|reckon|bet|feel|feels|felt|seems?|seemed|appears?|appeared|looks like|claims?|claimed|says|said|told|heard|reportedly|allegedly|rumou?red|according to|apparently|supposedly|pretend|imagine|dream)\b/;
+  if (epistemic.test(text)) return false;
+  if (/\bthat\s+(task|it|this|the|our|my|your|his|her|their)\b/.test(text)) return false;
   // Requests and imperatives ("please check …", "can you confirm …", "let me
   // know …", "make sure X is done") ask about status — they don't report it.
   const request =
@@ -500,6 +508,9 @@ async function authorizeIntent(
   if (targetTaskId) {
     const details = await getPlannerTaskDetails(targetTaskId);
     if (!details.ok) return "I couldn't verify that task in Planner, so I didn't change it.";
+    if (!(await isTaskInAllowedPlan(details.planId))) {
+      return "That task isn't in the leadership plan, so I didn't change it.";
+    }
     if (!details.assigneeAads.some((aad) => sameAad(aad, senderAad))) {
       return 'That task is not assigned to you, so I did not change it.';
     }
@@ -782,6 +793,17 @@ async function routeIntent(
     // Resolve the request: card buttons carry its followupId; a typed
     // `approve` / `reject` resolves against requests awaiting a decision.
     let target = followup;
+    // A card that names a request must only ever act on THAT request. If its
+    // record is gone (pruned after retention), refuse — never fall back to
+    // whichever request happens to be pending now.
+    const cardFollowupId =
+      typeof intent.data.followupId === 'string' && intent.data.followupId ? intent.data.followupId : undefined;
+    if (!target && cardFollowupId) {
+      await context.sendActivity(
+        "That extension request has expired or no longer exists, so I didn't change anything. If the task still needs more time, the owner can ask again."
+      );
+      return { handled: true };
+    }
     if (!target) {
       const pending = findPendingExtensionRequests();
       if (pending.length === 0) {
