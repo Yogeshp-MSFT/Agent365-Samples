@@ -134,7 +134,11 @@ The script:
    chat create/write permission is requested — card DMs use Bot Framework.
 3. Admin-consents them tenant-wide via `az` (no browser, avoids
    AADSTS82007 in demo tenants), then waits until every role is assigned.
-   If consent fails, it exits non-zero **before** creating any secret.
+   Because `admin-consent` grants **everything** the app requests, the script
+   first lists the app's permissions and stops — without consenting — if a
+   reused `cos-graph-worker` app requests anything beyond these eight roles;
+   remove the extras and re-run. If consent fails, it exits non-zero
+   **before** creating any secret.
 4. Creates a client secret only when the app has no unexpired one, and
    prints:
    ```text

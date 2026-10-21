@@ -207,25 +207,25 @@ async function resolveTeamIdentifier(
     });
     const groups = res.data?.value ?? [];
     if (groups.length === 0) {
-      console.warn(`[resolveTeamIdentifier] No Team matches display name "${raw}"`);
+      console.warn(`[resolveTeamIdentifier] No Team matches the configured display name`);
       return undefined;
     }
     if (groups.length > 1) {
       // Display names aren't unique. This value is an authorization boundary,
       // so never guess — require the operator to configure the Team GUID.
       console.warn(
-        `[resolveTeamIdentifier] ${groups.length} Teams are named "${raw}" — refusing to pick one. Set LEADERSHIP_TEAM_ID to the Team's group GUID.`
+        `[resolveTeamIdentifier] ${groups.length} Teams share the configured display name — refusing to pick one. Set LEADERSHIP_TEAM_ID to the Team's group GUID.`
       );
       return undefined;
     }
     const id = groups[0].id as string;
     teamIdResolveCache.set(cacheKey, id);
-    console.log(`[resolveTeamIdentifier] display name "${raw}" → ${id}`);
+    console.log(`[resolveTeamIdentifier] display name → group ${id.slice(0, 8)}…`);
     return id;
   } catch (err) {
     const e = err as any;
     console.warn(
-      `[resolveTeamIdentifier] displayName lookup failed for "${raw}":`,
+      `[resolveTeamIdentifier] displayName lookup failed:`,
       e?.response?.data ?? e?.message ?? String(e)
     );
     return undefined;
@@ -280,7 +280,7 @@ export async function isUserInTeam(
   try {
     const tid = await resolveTeamIdentifier(raw, opts);
     if (!tid) {
-      console.warn(`[isUserInTeam] LEADERSHIP_TEAM_ID "${raw}" could not be resolved — denying access.`);
+      console.warn(`[isUserInTeam] LEADERSHIP_TEAM_ID could not be resolved — denying access.`);
       return false;
     }
     const members = await fetchTeamMemberAads(tid, opts);
@@ -288,7 +288,7 @@ export async function isUserInTeam(
   } catch (err) {
     const e = err as any;
     console.warn(
-      `[isUserInTeam] membership lookup failed for input="${raw}" — denying access:`,
+      `[isUserInTeam] membership lookup failed — denying access:`,
       e?.response?.data ?? e?.message ?? String(e)
     );
     return false;

@@ -281,9 +281,11 @@ setInterval, guarded by `meetingPollInFlight` — see §10.2):
      whose body never fetched and no insights) after
      `CAPTURE_GIVE_UP_AFTER_HOURS`.
      Marks the capture `gave-up` and moves on. A capture retired because
-     its invitation was withdrawn is marked *revoked* instead; when
-     discovery sees the event qualify again it is reopened with clean
-     artifact and retry state.
+     its invitation was withdrawn (removed, declined, cancelled) is marked
+     *revoked* instead; when discovery sees the event qualify again it is
+     reopened with clean transcript/insight artifacts and retry counters,
+     **keeping** the extraction checkpoint so tasks already written are
+     resumed, not re-created.
   3. **Retry** — computes the next delay from a `[1, 3, 7, 15, 30]` minute
      ladder (clamped by wait budget) and updates `nextCheckAt`.
 
@@ -302,6 +304,7 @@ sequenceDiagram
   participant Graph as Graph (transcripts + insights)
   participant Cap as runCapture (cos/capture.ts)
   participant LLM as gpt-4o (people lookups only)
+  participant Post as gpt-4o (Teams chat-post tool only)
   participant P as Planner
   participant DM as sendCardProactively → owners + leader
 
@@ -328,9 +331,10 @@ sequenceDiagram
     end
     loop each item not yet written
       Cap->>P: create task in the leadership plan (+ description), save taskId
-      Cap->>DM: assignment card, save cardSent
+      Cap->>DM: assignment card, save cardSent (or cardSkipped if no chat ref)
     end
-    Cap->>DM: post summary in meeting chat (once, best effort)
+    Cap->>DM: tell the leader which owners had no chat ref (once)
+    Cap->>Post: post summary to the meeting chat (chatInfo.threadId)
     Cap-->>Store: markCaptureComplete (only on success; else stays READY)
   end
 ```
@@ -338,9 +342,20 @@ sequenceDiagram
 Things to note:
 
 - Extraction runs on a client with only the read-only people lookups
-  (`extractionOnly`): no Planner, card, or WorkIQ tools. Instructions hidden
-  in an untrusted transcript can't write anything; all writes happen in
-  `cos/capture.ts` from the validated JSON.
+  (`extractionOnly`): no Planner, card, or WorkIQ tools. All Planner and card
+  writes happen in `cos/capture.ts` from the validated JSON.
+- The meeting-chat summary is the one model call that sees extracted text
+  and can act. It runs on a separate `summaryPostOnly` client: no local
+  tools, only the Teams MCP server filtered to message-posting tools, and a
+  minimal system prompt with no Planner or booking instructions. So the most
+  transcript-derived text can do is change the posted message — it can't
+  create tasks, send mail, or book meetings. `summaryPosted` is set only after
+  a confirmed post. The chat id is the meeting's `chatInfo.threadId`, captured
+  at discovery.
+- Owners with no stored personal chat reference don't get the assignment
+  card (`cardSkipped`); the task is still created and the leader gets one DM
+  listing those owners. Their regular follow-up check-ins reach them once
+  they message the agent.
 - The extracted items are persisted on the capture record (stable ids
   `i1…iN`, with per-item `taskId` / `descriptionSaved` / `cardSent`) before
   the first write. A retry resumes from that checkpoint, so an item worded
@@ -692,10 +707,11 @@ every inbound Activity from users we haven't seen. Consumed by
 
 **Consequence:** a recipient must have DM'd the agent at least once for the
 agent to send them a proactive card. The leader always has (they use the
-agent), so the Brief always works. For follow-up owners we rely on Capture's
-`send_task_assignment_card` to establish the ref — that DM works because it
-goes to the owner (whom we captured the ref for the moment they said "hi"
-to the agent), or falls back to plain-text if not.
+agent), so the Brief always works. Capture creates the Planner task for
+every owner, but an owner with no stored reference gets no assignment card:
+the item is marked `cardSkipped`, it is **not** retried, and the leader gets
+one DM listing those owners. Follow-up check-ins re-check the reference on
+every tick, so those owners are reached once they message the agent.
 
 Because the store is now persistent, users only need to DM the agent **once,
 ever** — not once per process restart.
@@ -772,8 +788,10 @@ proactive messaging (`adapter.continueConversation`) using a cached
 **personal (1:1)** `ConversationReference` for the recipient. Group-chat and
 channel references are never stored as DM destinations, and a non-personal
 reference is rejected at send time. If no reference is cached the send
-fails with a `no-conversation-ref` error and every caller reports `ok:false`
-(work stays retryable) — the recipient must DM the agent (or install the
+fails with a `no-conversation-ref` error. Follow-up, extension/blocker
+delivery, and task-complete callers keep that work retryable; capture
+instead marks the assignment card `cardSkipped` and tells the leader once
+(see §6.3) — the recipient must DM the agent (or install the
 app) at least once first. The reference store is persisted across restarts
 (`.cos-state/conversation-refs.json`).
 
@@ -1201,9 +1219,10 @@ prevent the demo. Address before pilot / production.
   alerting during downtime, move followups to a durable queue.
 - **Card recipient must have DM'd the agent once.** Persisted, so this is
   a one-time cost per user — not per restart. But we still can't cold-start
-  a card to a brand-new user. Fix: on first-time DM, use
-  `mcp_TeamsServer.send_message` as a plain-text fallback that also
-  establishes the ref.
+  a card to a brand-new user: capture's assignment card is skipped for them
+  and the leader is told instead. A plain-text first contact via
+  `mcp_TeamsServer.send_message` (which would also establish the ref) is not
+  implemented.
 - **The Recall wording is LLM-generated.** Data access is enforced
   server-side for Teams messages **and** email: senders outside the
   leadership team (or whose identity or membership can't be verified) get a

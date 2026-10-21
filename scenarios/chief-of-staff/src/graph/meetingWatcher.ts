@@ -30,6 +30,7 @@ export interface QualifyingMeeting {
   subject: string;
   organizerAad?: string;
   organizerUpn?: string;
+  /** Meeting chat thread id (onlineMeeting.chatInfo.threadId). */
   chatId?: string;
   /** Scheduled start of this occurrence (epoch ms), when known. */
   startTime?: number;
@@ -253,7 +254,8 @@ export async function discoverQualifyingMeetings(
       );
 
       // Resolve joinWebUrl → onlineMeetingId (still queried as graphOwnerUpn).
-      const meetingId = await resolveOnlineMeetingId(opts, token, graphOwnerUpn, joinUrl);
+      const online = await resolveOnlineMeeting(opts, token, graphOwnerUpn, joinUrl);
+      const meetingId = online?.id;
       if (!meetingId) {
         log.warn(
           'meetingWatcher',
@@ -269,6 +271,7 @@ export async function discoverQualifyingMeetings(
       qualifying.push({
         eventId: String(ev.id),
         meetingId,
+        chatId: online?.chatThreadId,
         subject,
         organizerAad: ev.organizer?.emailAddress?.address ? undefined : undefined, // resolved elsewhere if needed
         organizerUpn: organizerAddr,
@@ -308,12 +311,12 @@ export async function discoverQualifyingMeetings(
  * to be a GUID (AAD Object ID) — it does NOT accept a UPN like calendarView
  * does. We resolve the UPN once here and cache via peopleTools.resolveUpnToAad.
  */
-async function resolveOnlineMeetingId(
+async function resolveOnlineMeeting(
   opts: MeetingWatcherOptions,
   token: string,
   userUpn: string,
   joinWebUrl: string
-): Promise<string | undefined> {
+): Promise<{ id: string; chatThreadId?: string } | undefined> {
   try {
     // Resolve UPN → GUID (cached). If already looks like a GUID, use as-is.
     const isGuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(userUpn);
@@ -321,7 +324,7 @@ async function resolveOnlineMeetingId(
     if (!userId) {
       log.warn(
         'meetingWatcher',
-        `resolveOnlineMeetingId: could not resolve the owner UPN to AAD Object ID`
+        `resolveOnlineMeeting: could not resolve the owner UPN to AAD Object ID`
       );
       return undefined;
     }
@@ -334,10 +337,13 @@ async function resolveOnlineMeetingId(
       headers: { Authorization: `Bearer ${token}` },
     });
     const items = (res.data?.value ?? []) as any[];
-    return items[0]?.id;
+    if (!items[0]?.id) return undefined;
+    // chatInfo.threadId is the meeting chat — used for attendee lookup and
+    // the capture summary post.
+    return { id: String(items[0].id), chatThreadId: items[0].chatInfo?.threadId ?? undefined };
   } catch (err) {
     const e = err as any;
-    log.warn('meetingWatcher', 'resolveOnlineMeetingId failed', {
+    log.warn('meetingWatcher', 'resolveOnlineMeeting failed', {
       status: e?.response?.status,
       body: e?.response?.data ?? e?.message ?? String(e),
     });

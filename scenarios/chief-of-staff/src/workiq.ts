@@ -108,9 +108,16 @@ export async function addWorkIqServersToAgent(
   agent: Agent,
   authorization: Authorization,
   authHandlerName: string,
-  turnContext: TurnContext
+  turnContext: TurnContext,
+  /** Restrict to these servers and (optionally) to tools matching a predicate. */
+  only?: { servers: string[]; toolFilter?: (toolName: string) => boolean }
 ): Promise<void> {
-  const servers = loadConfiguredServers();
+  const servers = loadConfiguredServers().filter(
+    (s) => !only || only.servers.includes(s.mcpServerName)
+  );
+  if (only && servers.length === 0) {
+    throw new Error(`WorkIQ server(s) ${only.servers.join(', ')} not configured in ToolingManifest.json`);
+  }
   const tokens = new Map<string, string>();
   const mcpServers: MCPServerStreamableHttp[] = [];
 
@@ -131,6 +138,9 @@ export async function addWorkIqServersToAgent(
         url: server.url,
         name: server.mcpServerName,
         requestInit: { headers },
+        ...(only?.toolFilter
+          ? { toolFilter: async (_ctx: unknown, tool: { name: string }) => only.toolFilter!(tool.name) }
+          : {}),
       })
     );
   }

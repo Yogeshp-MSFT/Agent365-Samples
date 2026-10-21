@@ -38,6 +38,8 @@ export interface CaptureItem {
   descriptionSaved?: boolean;
   cardSent?: boolean;
   cardSkipped?: string;
+  /** The leader was told this owner couldn't be reached. */
+  skipReported?: boolean;
 }
 
 export interface SimpleMeetingNote {
@@ -269,7 +271,8 @@ export function markCaptureRevoked(eventId: string): void {
 
 /**
  * Fresh discovery confirms a revoked capture qualifies again: reopen it with
- * clean artifact and retry state. No-op for captures that weren't revoked.
+ * clean transcript/insight artifacts and retry counters, keeping the
+ * extraction checkpoint. No-op for captures that weren't revoked.
  */
 export function reopenRevokedCapture(
   eventId: string,
@@ -291,8 +294,9 @@ export function reopenRevokedCapture(
   c.insightsFetched = false;
   c.insightsActionItems = undefined;
   c.insightsMeetingNotes = undefined;
-  c.extractedItems = undefined;
-  c.summaryPosted = undefined;
+  // Keep extractedItems and summaryPosted: tasks may already exist, and
+  // wiping the checkpoint would re-extract and duplicate them. The reopened
+  // capture resumes the unfinished writes instead.
   store.set(eventId, c);
   return true;
 }

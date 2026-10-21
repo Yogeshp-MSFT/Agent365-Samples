@@ -103,7 +103,7 @@ async function resolveGroupId(rawInput: string): Promise<string | undefined> {
         }
       } catch (err) {
         console.warn(
-          `[plannerConfig] channel-email lookup failed for "${raw}":`,
+          `[plannerConfig] channel-email lookup failed:`,
           (err as any)?.response?.data ?? (err as Error)?.message
         );
       }
@@ -130,7 +130,7 @@ async function resolveGroupId(rawInput: string): Promise<string | undefined> {
     const groups = (res.data?.value ?? []) as GraphGroup[];
     if (groups.length === 0) {
       console.warn(
-        `[plannerConfig] No Team found with display name "${raw}" — check LEADERSHIP_TEAM_ID`
+        `[plannerConfig] No Team found with the configured display name — check LEADERSHIP_TEAM_ID`
       );
       return undefined;
     }
@@ -138,18 +138,18 @@ async function resolveGroupId(rawInput: string): Promise<string | undefined> {
       // Display names aren't unique and this id also drives the access gate —
       // never guess; require the Team GUID.
       console.warn(
-        `[plannerConfig] ${groups.length} Teams are named "${raw}" — refusing to pick one. Set LEADERSHIP_TEAM_ID to the Team's group GUID.`
+        `[plannerConfig] ${groups.length} Teams share the configured display name — refusing to pick one. Set LEADERSHIP_TEAM_ID to the Team's group GUID.`
       );
       return undefined;
     }
     cachedGroupId = groups[0].id;
     console.log(
-      `[plannerConfig] LEADERSHIP_TEAM_ID display name "${raw}" → group ${groups[0].id.slice(0, 8)}…`
+      `[plannerConfig] LEADERSHIP_TEAM_ID display name → group ${groups[0].id.slice(0, 8)}…`
     );
     return cachedGroupId;
   } catch (err) {
     console.warn(
-      `[plannerConfig] display-name lookup failed for "${raw}":`,
+      `[plannerConfig] display-name lookup failed:`,
       (err as any)?.response?.data ?? (err as Error)?.message
     );
     return undefined;
@@ -188,31 +188,31 @@ async function autoResolvePlanId(): Promise<string | undefined> {
       );
       if (!match) {
         console.warn(
-          `[plannerConfig] No plan named "${wantName}" under group ${groupId.slice(0, 8)}… — found: ${plans.map((p) => `"${p.title}"`).join(', ')}`
+          `[plannerConfig] No plan named "${wantName}" under group ${groupId.slice(0, 8)}… — ${plans.length} plan(s) in the team; check PLANNER_PLAN_NAME`
         );
         return undefined;
       }
       console.log(
-        `[plannerConfig] PLANNER_PLAN_NAME="${wantName}" → plan ${match.id} (${plans.length} plan(s) in team)`
+        `[plannerConfig] PLANNER_PLAN_NAME → plan ${match.id.slice(0, 8)}… (${plans.length} plan(s) in team)`
       );
       return match.id;
     }
 
     if (plans.length > 1) {
       console.warn(
-        `[plannerConfig] ${plans.length} plans found in team but PLANNER_PLAN_NAME not set — cannot auto-pick. Set PLANNER_PLAN_NAME to one of: ${plans.map((p) => `"${p.title}"`).join(', ')}`
+        `[plannerConfig] ${plans.length} plans found in team but PLANNER_PLAN_NAME not set — cannot auto-pick. Set PLANNER_PLAN_NAME to the exact plan name.`
       );
       return undefined;
     }
 
     const chosen = plans[0];
     console.log(
-      `[plannerConfig] Auto-resolved plan: "${chosen.title}" (${chosen.id}) — the only plan in team ${groupId.slice(0, 8)}…`
+      `[plannerConfig] Auto-resolved plan ${chosen.id.slice(0, 8)}… — the only plan in team ${groupId.slice(0, 8)}…`
     );
     return chosen.id;
   } catch (err) {
     console.warn(
-      `[plannerConfig] listing plans for group ${groupId} failed:`,
+      `[plannerConfig] listing plans for group ${groupId.slice(0, 8)}… failed:`,
       (err as any)?.response?.data ?? (err as Error)?.message
     );
     return undefined;
@@ -230,7 +230,7 @@ async function autoResolveBucketId(planId: string): Promise<string | undefined> 
     const buckets = (res.data?.value ?? []) as GraphBucket[];
     if (buckets.length === 0) {
       console.warn(
-        `[plannerConfig] No buckets found in plan ${planId} — create one named "New" in the plan`
+        `[plannerConfig] No buckets found in plan ${planId.slice(0, 8)}… — create one named "New" in the plan`
       );
       return undefined;
     }
@@ -239,17 +239,17 @@ async function autoResolveBucketId(planId: string): Promise<string | undefined> 
     );
     if (!match) {
       console.warn(
-        `[plannerConfig] No bucket named "${wantName}" in plan ${planId} — found: ${buckets.map((b) => `"${b.name}"`).join(', ')}. Rename a bucket or set PLANNER_BUCKET_NAME.`
+        `[plannerConfig] No bucket named "${wantName}" in plan ${planId.slice(0, 8)}… (${buckets.length} bucket(s)). Rename a bucket or set PLANNER_BUCKET_NAME.`
       );
       return undefined;
     }
     console.log(
-      `[plannerConfig] Auto-resolved bucket: "${match.name}" (${match.id}) in plan ${planId.slice(0, 8)}…`
+      `[plannerConfig] Auto-resolved bucket ${match.id.slice(0, 8)}… in plan ${planId.slice(0, 8)}…`
     );
     return match.id;
   } catch (err) {
     console.warn(
-      `[plannerConfig] listing buckets for plan ${planId} failed:`,
+      `[plannerConfig] listing buckets for plan ${planId.slice(0, 8)}… failed:`,
       (err as any)?.response?.data ?? (err as Error)?.message
     );
     return undefined;

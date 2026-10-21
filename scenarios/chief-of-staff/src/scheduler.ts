@@ -101,9 +101,9 @@ export function cacheConversationReference(activity: Activity): void {
         }) as Partial<ConversationReference>;
   schedulerRefStore.set(SCHEDULER_REF_KEY, cachedRef);
   console.log(
-    `[scheduler] cached conversation reference — cron/pollers can now fire (tenant=${
+    `[scheduler] cached conversation reference — cron/pollers can now fire (tenant=${String(
       (cachedRef as any).conversation?.tenantId ?? '?'
-    })`
+    ).slice(0, 8)}…)`
   );
 }
 
@@ -373,9 +373,18 @@ async function sweepStaleFollowupsAndEscalate(
         );
         continue;
       }
+      // The recorded owner was unassigned since the check-in: they aren't
+      // the one ignoring it, so don't escalate them.
+      if (details.ok && !details.assigneeAads.some((a) => a.toLowerCase() === f.ownerAad.toLowerCase())) {
+        markResolved(f.followupId);
+        console.log(
+          `[scheduler] skip escalation for task=${f.taskId.slice(0, 8)}… — owner is no longer assigned (auto-resolved followup ${f.followupId.slice(0, 8)}…).`
+        );
+        continue;
+      }
     } catch (err) {
       console.warn(
-        `[scheduler] pre-escalation Planner check failed for ${f.taskId} — will escalate anyway:`,
+        `[scheduler] pre-escalation Planner check failed for task=${f.taskId.slice(0, 8)}… — will escalate anyway:`,
         (err as Error)?.message ?? err
       );
     }

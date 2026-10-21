@@ -186,7 +186,10 @@ async function runDiscoveryPass(
     });
     const giveUpAfter = m.endTime + cfg.giveUpAfterHours * 60 * 60 * 1000;
     if (hasCaptureForEvent(m.eventId)) {
-      if (!getCapture(m.eventId)?.joinWebUrl) updateCapture(m.eventId, { joinWebUrl: m.joinWebUrl });
+      const existing = getCapture(m.eventId);
+      if (!existing?.joinWebUrl) updateCapture(m.eventId, { joinWebUrl: m.joinWebUrl });
+      // Backfill the meeting chat for captures queued before it was tracked.
+      if (!existing?.chatId && m.chatId) updateCapture(m.eventId, { chatId: m.chatId });
       // Re-invited after a revocation: discovery confirms it qualifies again.
       if (
         reopenRevokedCapture(m.eventId, {
@@ -221,7 +224,7 @@ async function runDiscoveryPass(
       subject: m.subject,
       organizerAad: m.organizerAad,
       ownerUpn: cfg.graphOwnerUpn,
-      chatId: undefined,
+      chatId: m.chatId,
       startTime: m.startTime,
       endTime: m.endTime,
       durationMinutes: m.durationMinutes,
@@ -378,6 +381,7 @@ async function advanceCapture(
       callId: cap.transcriptCallId,
       contentCorrelationId: cap.transcriptCorrelationId,
       windowStart: (cap.startTime ?? cap.endTime - cap.durationMinutes * 60 * 1000) - 15 * 60 * 1000,
+      windowEnd: insightsWindowEnd(cap),
     });
     if (insights.available) {
       updateCapture(cap.eventId, {
@@ -509,6 +513,17 @@ function sameMeetingNeighbors(
     }
   }
   return Array.from(byEvent.values());
+}
+
+/**
+ * Upper bound for time-matched insights: the start of the next occurrence on
+ * the same join URL, or the capture deadline when there is none.
+ */
+function insightsWindowEnd(cap: PendingCapture): number {
+  const later = sameMeetingNeighbors(cap)
+    .map((n) => occurrenceStart(n))
+    .filter((s) => s >= cap.endTime);
+  return later.length > 0 ? Math.min(...later) : cap.giveUpAfter;
 }
 
 /** Log-safe event reference — event ids share a mailbox prefix, so use the tail. */

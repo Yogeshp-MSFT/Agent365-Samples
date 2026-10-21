@@ -212,6 +212,8 @@ export interface InsightsOccurrence {
   contentCorrelationId?: string;
   /** Earliest plausible creation time for this occurrence's insights (ms). */
   windowStart: number;
+  /** Insights created at/after this belong to a later occurrence (ms). */
+  windowEnd?: number;
 }
 
 /**
@@ -231,7 +233,13 @@ export function selectInsightsForOccurrence(insights: any[], occ: InsightsOccurr
       );
     }
     const created = ins.createdDateTime ? Date.parse(ins.createdDateTime) : NaN;
-    return Number.isFinite(created) && created >= occ.windowStart;
+    // Time fallback is bounded on both sides: after this occurrence began and
+    // before the next occurrence on the same join URL (or the capture deadline).
+    return (
+      Number.isFinite(created) &&
+      created >= occ.windowStart &&
+      (occ.windowEnd === undefined || created < occ.windowEnd)
+    );
   });
 }
 

@@ -431,7 +431,7 @@ export async function acknowledgePlannerTask(
     return { ok: true, percentComplete: newPct, startDateTime: startIso, alreadyStarted: false };
   } catch (err) {
     const msg = (err as any)?.response?.data ?? (err as any)?.message ?? String(err);
-    console.error(`[plannerTools] acknowledgePlannerTask failed for task=${taskId}:`, msg);
+    console.error(`[plannerTools] acknowledgePlannerTask failed for task=${taskId.slice(0, 8)}…:`, msg);
     return { ok: false, error: typeof msg === 'string' ? msg : JSON.stringify(msg) };
   }
 }
@@ -485,7 +485,7 @@ export async function updatePlannerTaskDueDate(
     return { ok: true, previousDue, newDue: dueIso };
   } catch (err) {
     const msg = (err as any)?.response?.data ?? (err as any)?.message ?? String(err);
-    console.error(`[plannerTools] updatePlannerTaskDueDate failed for task=${taskId}:`, msg);
+    console.error(`[plannerTools] updatePlannerTaskDueDate failed for task=${taskId.slice(0, 8)}…:`, msg);
     return { ok: false, error: typeof msg === 'string' ? msg : JSON.stringify(msg) };
   }
 }
@@ -534,7 +534,7 @@ export async function updatePlannerTaskTitle(
     return { ok: true, previousTitle, newTitle };
   } catch (err) {
     const msg = (err as any)?.response?.data ?? (err as any)?.message ?? String(err);
-    console.error(`[plannerTools] updatePlannerTaskTitle failed for task=${taskId}:`, msg);
+    console.error(`[plannerTools] updatePlannerTaskTitle failed for task=${taskId.slice(0, 8)}…:`, msg);
     return { ok: false, error: typeof msg === 'string' ? msg : JSON.stringify(msg) };
   }
 }
@@ -655,7 +655,7 @@ export async function completePlannerTask(
     return { ok: true, title, previousPercent, alreadyComplete: false };
   } catch (err) {
     const msg = (err as any)?.response?.data ?? (err as any)?.message ?? String(err);
-    console.error(`[plannerTools] completePlannerTask failed for task=${taskId}:`, msg);
+    console.error(`[plannerTools] completePlannerTask failed for task=${taskId.slice(0, 8)}…:`, msg);
     return { ok: false, error: typeof msg === 'string' ? msg : JSON.stringify(msg) };
   }
 }

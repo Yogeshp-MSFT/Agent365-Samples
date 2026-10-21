@@ -89,19 +89,21 @@ function pendingAsCompletedTasks(): CompletedTask[] {
 // If we hydrated a baseline from disk, treat the first poll as a normal
 // comparison (transitions that happened during downtime WILL fire). Only
 // a truly cold start (empty file) needs the seed-and-suppress dance.
-let firstPollDone = lastProgress.size > 0;
-if (firstPollDone) {
-  console.log(
-    `[plannerPoller] hydrated baseline of ${lastProgress.size} task(s) from disk — completions during downtime will fire on next poll.`
-  );
-}
-
 // When the baseline was first seeded. A task first seen AFTER seeding that is
 // already 100% was created after the agent started watching and completed
 // before its first poll (e.g. a captured task completed by chat within one
 // POLL_TASKS_MS) — that is a real completion and must notify. Tasks that
 // already existed at seed time stay suppressed.
 const pollerMeta = new PersistentMap<number>({ file: 'planner-poller-meta.json' });
+
+// Seeded before (even for a plan that was empty then) → compare normally.
+let firstPollDone = lastProgress.size > 0 || pollerMeta.get('seededAt') !== undefined;
+if (firstPollDone) {
+  console.log(
+    `[plannerPoller] hydrated baseline of ${lastProgress.size} task(s) from disk — completions during downtime will fire on next poll.`
+  );
+}
+
 if (firstPollDone && pollerMeta.get('seededAt') === undefined) {
   // Baseline hydrated from an older version without this marker.
   pollerMeta.set('seededAt', Date.now());

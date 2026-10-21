@@ -97,6 +97,8 @@ function shouldSkipCardInvoke(key: string): boolean {
 // case Teams ever splits a retry across a fresh activity.id).
 const bookMeetingSeen = new Map<string, number>();
 const BOOK_MEETING_DEDUPE_MS = 60 * 1000;
+// A slot must start at least this far in the future to be booked.
+const SLOT_MIN_LEAD_MS = 5 * 60 * 1000;
 
 function shouldSkipBookMeeting(key: string): boolean {
   const now = Date.now();
@@ -328,7 +330,10 @@ export function isAffirmativeCompletion(rawText: string): boolean {
   const epistemic =
     /\b(doubt|doubts|doubted|doubtful|unsure|uncertain|unclear|unlikely|wonder|wondering|question|suspect|suspects|reckon|bet|feel|feels|felt|seems?|seemed|appears?|appeared|looks like|claims?|claimed|says|said|told|heard|reportedly|allegedly|rumou?red|according to|apparently|supposedly|pretend|imagine|dream)\b/;
   if (epistemic.test(text)) return false;
-  if (/\bthat\s+(task|it|this|the|our|my|your|his|her|their)\b/.test(text)) return false;
+  // Quoted titles are masked as "TASK", so match case-insensitively.
+  if (/\bthat\s+(task|it|this|the|our|my|your|his|her|their)\b/i.test(text)) return false;
+  // Statements that deny or disown the claim ("it is false that…", "not true").
+  if (/\b(false|untrue|wrong|incorrect|inaccurate|mistaken|lie|lying|myth|joke|joking|kidding|sarcastic|hypothetically|theoretically)\b/.test(text)) return false;
   // Requests and imperatives ("please check …", "can you confirm …", "let me
   // know …", "make sure X is done") ask about status — they don't report it.
   const request =
@@ -399,8 +404,7 @@ function extractIntent(
     if (text === kw || text.startsWith(kw + ' ')) {
       if (verb === 'complete') {
         if (!isAffirmativeCompletion(rawText)) return null;
-        const hint = extractQuotedTitleHint(rawText);
-        return { verb, data: hint ? { taskTitleHint: hint } : {} };
+        return { verb, data: completionTitleData(rawText) };
       }
       return { verb, data: {} };
     }
@@ -416,9 +420,9 @@ function extractIntent(
   // means "the task I was just asked about is done".
   const completionVerbRegex = /\b(complet(?:ed?|ing)|finish(?:ed)?|done|closed?|wrapped(?:\s+up)?)\b/i;
   if (completionVerbRegex.test(text) && isAffirmativeCompletion(rawText)) {
-    const hint = extractQuotedTitleHint(rawText);
-    if (hint) {
-      return { verb: 'complete', data: { taskTitleHint: hint } };
+    const titleData = completionTitleData(rawText);
+    if (Object.keys(titleData).length > 0) {
+      return { verb: 'complete', data: titleData };
     }
     // Ignore long-form messages (>140 chars) so we don't hijack a narrative
     // that happens to contain the word "done".
@@ -435,19 +439,38 @@ function extractIntent(
  *  backtick delimiters. Returns the FIRST non-trivial quoted substring
  *  (≥3 chars), or undefined. */
 function extractQuotedTitleHint(text: string): string | undefined {
-  // Order: straight-double, straight-single, backtick, curly-double, curly-single.
+  // Planner titles are 1–255 characters. Order: straight-double, straight-
+  // single (word-bounded so apostrophes like "I'm"/"Bob's" don't count),
+  // backtick, curly-double, curly-single.
   const patterns: RegExp[] = [
-    /"([^"]{3,200})"/,
-    /'([^']{3,200})'/,
-    /`([^`]{3,200})`/,
-    /[\u201C\u201D]([^\u201C\u201D]{3,200})[\u201C\u201D]/,
-    /[\u2018\u2019]([^\u2018\u2019]{3,200})[\u2018\u2019]/,
+    /"([^"]{1,255})"/,
+    /(?:^|\s)'([^']{1,255})'(?=\s|$|[.,!?;:])/,
+    /`([^`]{1,255})`/,
+    /[\u201C\u201D]([^\u201C\u201D]{1,255})[\u201C\u201D]/,
+    /(?:^|\s)[\u2018\u2019]([^\u2018\u2019]{1,255})[\u2018\u2019](?=\s|$|[.,!?;:])/,
   ];
   for (const re of patterns) {
     const m = re.exec(text);
-    if (m?.[1]) return m[1].trim();
+    if (m?.[1]?.trim()) return m[1].trim();
   }
   return undefined;
+}
+
+/** True when the sender quoted something as a title, even if it can't be used. */
+function hasQuotedTitle(text: string): boolean {
+  return /"[^"]*"|`[^`]*`|[\u201C\u201D][^\u201C\u201D]*[\u201C\u201D]|(?:^|\s)['\u2018\u2019][^'\u2018\u2019]*['\u2018\u2019](?=\s|$|[.,!?;:])/.test(text);
+}
+
+/**
+ * Title data for a completion message. A quoted title that can't be used
+ * (empty, or longer than Planner allows) is still recorded as an explicit
+ * title, so the router refuses instead of completing a different task.
+ */
+function completionTitleData(rawText: string): Record<string, unknown> {
+  const hint = extractQuotedTitleHint(rawText);
+  if (hint) return { taskTitleHint: hint };
+  if (hasQuotedTitle(rawText)) return { explicitTitleUnreadable: true };
+  return {};
 }
 
 /** Resolve the PendingFollowup a verb targets.
@@ -485,10 +508,28 @@ async function authorizeIntent(
 ): Promise<string | undefined> {
   if (!senderAad) return "I couldn't verify who sent this, so I didn't change anything.";
 
-  if (LEADER_VERBS.has(verb)) {
-    return isLeader ? undefined : 'Only the leader can act on this card.';
+  if (LEADER_VERBS.has(verb) && !isLeader) return 'Only the leader can act on this card.';
+
+  // The leader is trusted to act on any check-in, but only on tasks in the
+  // leadership plan: card data (or a follow-up created by the LLM tool) can
+  // carry any task id the worker app could otherwise read or write.
+  if (isLeader) {
+    const leaderTaskId =
+      (typeof data.taskId === 'string' && data.taskId ? data.taskId : undefined) ?? followup?.taskId;
+    if (leaderTaskId) {
+      const details = await getPlannerTaskDetails(leaderTaskId);
+      if (details.ok && !(await isTaskInAllowedPlan(details.planId))) {
+        return "That task isn't in the leadership plan, so I didn't change it.";
+      }
+      // A deleted task (404) is handled by each verb; other lookup failures
+      // fail closed.
+      if (!details.ok && !details.notFound) {
+        return "I couldn't verify that task in Planner, so I didn't change it.";
+      }
+    }
+    return undefined;
   }
-  if (!OWNER_VERBS.has(verb) || isLeader) return undefined;
+  if (!OWNER_VERBS.has(verb)) return undefined;
 
   if (followup && !sameAad(followup.ownerAad, senderAad)) {
     return 'That check-in belongs to someone else, so I did not change it.';
@@ -504,7 +545,10 @@ async function authorizeIntent(
   if (submittedTaskId && followup && followup.taskId !== submittedTaskId) {
     return "That card doesn't match the check-in on record, so I didn't change anything.";
   }
-  const targetTaskId = submittedTaskId ?? followup?.taskId;
+  // A completion that names a title targets THAT task (resolved later, limited
+  // to the sender's own tasks) — not the sender's latest check-in.
+  const namesTitle = verb === 'complete' && (!!data.taskTitleHint || !!data.explicitTitleUnreadable);
+  const targetTaskId = submittedTaskId ?? (namesTitle ? undefined : followup?.taskId);
   if (targetTaskId) {
     const details = await getPlannerTaskDetails(targetTaskId);
     if (!details.ok) return "I couldn't verify that task in Planner, so I didn't change it.";
@@ -668,6 +712,15 @@ async function routeIntent(
         );
         return { handled: true };
       }
+    }
+
+    // A quoted title we couldn't read is still an explicit title: refuse
+    // rather than completing the sender's latest check-in instead.
+    if (!taskId && !titleHint && intent.data.explicitTitleUnreadable) {
+      await context.sendActivity(
+        `I couldn't read the task title you quoted, so I haven't changed anything. Reply with the exact title in quotes, e.g. \`The task "Send draft proposal" is done\`.`
+      );
+      return { handled: true };
     }
 
     // Follow-up fallback only when the sender named no task at all.
@@ -906,6 +959,33 @@ async function routeIntent(
       if (followup && getFollowup(followup.followupId)?.meetingScheduledAt) {
         await context.sendActivity(
           `An unblock meeting for "${taskTitle}" was already booked from this card, so I didn't book another one.`
+        );
+        return { handled: true };
+      }
+      // A card can be opened long after it was sent. Never book a slot that
+      // is invalid or already (nearly) in the past — offer fresh slots instead.
+      const slotStart = Date.parse(timeslotIso);
+      if (!Number.isFinite(slotStart) || slotStart < Date.now() + SLOT_MIN_LEAD_MS) {
+        bookMeetingSeen.delete(dedupeKey);
+        let refreshed = false;
+        if (followup && getFollowup(followup.followupId)?.status !== 'resolved') {
+          const slots = proposeMeetingSlots();
+          const r = await sendBlockerMeetingCardDirect(client.getPeopleOpts(), {
+            leaderAadObjectId: leaderAad,
+            followupId: followup.followupId,
+            taskId: followup.taskId,
+            taskTitle: followup.taskTitle,
+            ownerName: followup.ownerName,
+            ownerAadObjectId: followup.ownerAad,
+            blockerSummary: 'Slot refresh — the earlier times on this request have passed.',
+            proposedTimes: slots.map((s) => s.label),
+            proposedTimesIso: slots.map((s) => s.iso),
+          });
+          refreshed = r.ok;
+        }
+        await context.sendActivity(
+          `That time slot has already passed, so I didn't book anything.` +
+            (refreshed ? ` I've sent you a new card with upcoming times.` : ` Please pick a new time with ${followup?.ownerName ?? 'the owner'}.`)
         );
         return { handled: true };
       }

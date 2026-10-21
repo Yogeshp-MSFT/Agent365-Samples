@@ -195,6 +195,14 @@ export async function runFollowup(
     droppedByReason[reason] = (droppedByReason[reason] ?? 0) + 1;
     return false;
   };
+  // Reconcile every open task's check-ins with its CURRENT assignees first —
+  // including tasks that are unassigned or outside the reminder horizon, which
+  // the filter below drops — so a removed owner is never escalated.
+  for (const t of tasks) {
+    if (!t || (t.percentComplete ?? 0) >= 100) continue;
+    resolveOrphanedFollowups(t.id, new Set(Object.keys(t.assignments ?? {}).map((a) => a.toLowerCase())));
+  }
+
   const atRisk = tasks.filter((t) => {
     if (!t) return false;
     if ((t.percentComplete ?? 0) >= 100) return drop('complete');
@@ -240,7 +248,6 @@ export async function runFollowup(
       skip(t, 'no-assignee');
       continue;
     }
-    resolveOrphanedFollowups(t.id, new Set(assigneeAads.map((a) => a.toLowerCase())));
 
     // Every current assignee gets their own check-in, cooldown, and delivery
     // result — one co-owner without a chat reference doesn't block the others.

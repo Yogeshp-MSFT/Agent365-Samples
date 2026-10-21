@@ -137,6 +137,31 @@ foreach ($roleName in $APP_ROLE_NAMES) {
 
 Write-Host ''
 Write-Host '=== 4. Admin-consenting the app (tenant-wide) ==='
+# admin-consent grants EVERY permission in requiredResourceAccess, not only the
+# eight roles above. Refuse if a reused app requests anything else — the
+# operator must remove (or knowingly review) the extras first.
+$currentAccess = (Invoke-AzJson @('ad', 'app', 'show', '--id', $APP_ID)).requiredResourceAccess
+$wantedIdSet = @($wantedRoleIds.Values)
+$extras = @()
+foreach ($res in @($currentAccess)) {
+  foreach ($perm in @($res.resourceAccess)) {
+    $isWanted = ($res.resourceAppId -eq $GRAPH_ID) -and ($perm.type -eq 'Role') -and ($wantedIdSet -contains $perm.id)
+    if (-not $isWanted) {
+      $label = $perm.id
+      if ($res.resourceAppId -eq $GRAPH_ID) {
+        $named = if ($perm.type -eq 'Role') { $graphSp.appRoles | Where-Object { $_.id -eq $perm.id } } else { $graphSp.oauth2PermissionScopes | Where-Object { $_.id -eq $perm.id } }
+        if ($named) { $label = "$($named.value)" }
+      }
+      $extras += "  - resource=$($res.resourceAppId) $($perm.type) $label"
+    }
+  }
+}
+if ($extras.Count -gt 0) {
+  Write-Host "  '$APP_NAME' requests permissions beyond the $($APP_ROLE_NAMES.Count) this sample needs:"
+  $extras | ForEach-Object { Write-Host $_ }
+  Write-Error "Refusing to admin-consent: consent would also grant the permissions listed above. Remove them from the app registration (Entra admin center > App registrations > $APP_NAME > API permissions) and re-run. No consent was granted and no secret was created."
+  exit 1
+}
 Invoke-Az @('ad', 'app', 'permission', 'admin-consent', '--id', $APP_ID) | Out-Host
 
 Write-Host ''
