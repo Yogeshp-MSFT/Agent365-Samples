@@ -43,7 +43,10 @@ A running Node service on your dev machine (or Azure App Service) that:
 | **Recall / chit-chat** — the leader asks "where are we on X?" and gets a status answer, restricted to leadership team members (Teams chat **and** email) | LLM turn with `planner_list_tasks` + `mcp_CalendarTools` |
 
 Everything is deterministic **except** capture extraction (LLM parses the
-transcript) and recall/chit-chat. Booking and meeting-summary posts call
+transcript), recall/chit-chat, and free-text unblock. Card booking and meeting-summary posts call
+WorkIQ directly with code-bound recipients, timestamps, and text. They require
+an actual event/message ID in the tool result; model text such as `OK` is not
+a success signal. A free-text DM can still book through the conversational client's MCP tools. All routing, dedup, date math, and Planner writes are TypeScript.
 WorkIQ directly with code-bound recipients, timestamps, and text. They require
 an actual event/message ID in the tool result; model text such as `OK` is not
 a success signal. All routing, dedup, date math, and Planner writes are TypeScript.
