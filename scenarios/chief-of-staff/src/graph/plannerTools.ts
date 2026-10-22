@@ -467,10 +467,11 @@ export async function updatePlannerTaskDueDate(
     if (!taskId) return { ok: false, error: 'taskId is empty' };
     if (!newDueIso) return { ok: false, error: 'newDueIso is empty' };
 
-    // Normalize input: accept "YYYY-MM-DD" or full ISO. Planner needs full ISO.
+    // A bare day is local civil time. Full ISO values are already resolved
+    // instants (17:00 local can itself be midnight UTC); do not normalize twice.
     let dueIso = newDueIso.trim();
-    if (/^\d{4}-\d{2}-\d{2}$/.test(dueIso)) dueIso = `${dueIso}T00:00:00Z`;
-    if (Number.isNaN(new Date(dueIso).getTime())) {
+    if (/^\d{4}-\d{2}-\d{2}$/.test(dueIso)) dueIso = normalizeDueDate(dueIso);
+    if (!/T.*(?:Z|[+-]\d{2}:\d{2})$/.test(dueIso) || !Number.isFinite(Date.parse(dueIso))) {
       return { ok: false, error: `newDueIso is not a valid ISO date: ${newDueIso}` };
     }
 
@@ -515,11 +516,11 @@ export async function updatePlannerTaskDueDate(
 // the prefix is already present, we skip the PATCH.
 export async function updatePlannerTaskTitle(
   taskId: string,
-  newTitle: string
+  titleUpdate: string | ((currentTitle: string) => string)
 ): Promise<{ ok: true; previousTitle?: string; newTitle: string; skipped?: boolean } | { ok: false; error: string }> {
   try {
     if (!taskId) return { ok: false, error: 'taskId is empty' };
-    if (!newTitle || !newTitle.trim()) return { ok: false, error: 'newTitle is empty' };
+    if (typeof titleUpdate === 'string' && !titleUpdate.trim()) return { ok: false, error: 'newTitle is empty' };
 
     const token = await acquireAppOnlyGraphToken();
 
@@ -531,6 +532,8 @@ export async function updatePlannerTaskTitle(
     const etag = getRes.data['@odata.etag'];
     if (!etag) return { ok: false, error: 'Planner task response missing @odata.etag' };
     const previousTitle: string | undefined = getRes.data.title;
+    const newTitle = typeof titleUpdate === 'function' ? titleUpdate(previousTitle ?? '') : titleUpdate;
+    if (!newTitle.trim()) return { ok: false, error: 'newTitle is empty' };
     if (previousTitle && previousTitle.trim() === newTitle.trim()) {
       return { ok: true, previousTitle, newTitle, skipped: true };
     }

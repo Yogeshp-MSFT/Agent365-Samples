@@ -63,6 +63,9 @@ legacy UTC-midnight values are treated as that same civil due day.
 This legacy conversion happens only at the conversational tool boundary;
 capture checkpoints already hold resolved instants and pass them unchanged
 to Planner and the assignment card.
+The conversational extension-card tool follows the same boundary: its card
+and stored proposal share one normalized instant. A card for a superseded
+proposal cannot approve a newer date; use the latest card or a typed decision.
 
 ---
 

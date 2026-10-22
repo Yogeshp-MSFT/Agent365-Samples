@@ -25,6 +25,7 @@
 
 import axios from 'axios';
 import { acquireAppOnlyGraphToken } from './graphAppToken';
+import { providerError } from '../util/logger';
 
 const GRAPH_BASE = 'https://graph.microsoft.com/v1.0';
 const GUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -104,7 +105,7 @@ async function resolveGroupId(rawInput: string): Promise<string | undefined> {
       } catch (err) {
         console.warn(
           `[plannerConfig] channel-email lookup failed:`,
-          (err as any)?.response?.data ?? (err as Error)?.message
+          providerError(err)
         );
       }
       console.warn(
@@ -150,7 +151,7 @@ async function resolveGroupId(rawInput: string): Promise<string | undefined> {
   } catch (err) {
     console.warn(
       `[plannerConfig] display-name lookup failed:`,
-      (err as any)?.response?.data ?? (err as Error)?.message
+      providerError(err)
     );
     return undefined;
   }
@@ -213,7 +214,7 @@ async function autoResolvePlanId(): Promise<string | undefined> {
   } catch (err) {
     console.warn(
       `[plannerConfig] listing plans for group ${groupId.slice(0, 8)}… failed:`,
-      (err as any)?.response?.data ?? (err as Error)?.message
+      providerError(err)
     );
     return undefined;
   }
@@ -250,7 +251,7 @@ async function autoResolveBucketId(planId: string): Promise<string | undefined> 
   } catch (err) {
     console.warn(
       `[plannerConfig] listing buckets for plan ${planId.slice(0, 8)}… failed:`,
-      (err as any)?.response?.data ?? (err as Error)?.message
+      providerError(err)
     );
     return undefined;
   }

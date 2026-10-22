@@ -21,6 +21,7 @@
 
 import { tool } from '@openai/agents';
 import { providerError } from '../util/logger';
+import { formatDisplayDate, normalizeDueDate } from '../util/time';
 import { Authorization, CloudAdapter, TurnContext } from '@microsoft/agents-hosting';
 import {
   createFollowup,
@@ -31,7 +32,6 @@ import {
 } from '../state/followupStore';
 import { getBotAppId, sendCardProactively } from './proactiveSend';
 import { hasConversationRef } from '../state/conversationRefs';
-import { formatDisplayDate } from '../util/time';
 
 export interface CardToolOptions {
   authorization: Authorization;
@@ -348,6 +348,7 @@ function buildExtensionRequestCard(args: ExtensionRequestArgs): object {
       actionButton('Reject', 'reject_extend', {
         followupId: args.followupId,
         taskId: args.taskId,
+        newDueDate: args.suggestedNewDueDate,
       }),
       actionButton('Reassign', 'reassign', {
         followupId: args.followupId,
@@ -373,7 +374,7 @@ export function createExtensionRequestTool(opts: CardToolOptions) {
         taskTitle: { type: 'string' },
         ownerName: { type: 'string' },
         currentDueDate: { type: ['string', 'null'], description: 'ISO date, if known.' },
-        suggestedNewDueDate: { type: 'string', description: 'ISO date proposed by the agent.' },
+        suggestedNewDueDate: { type: 'string', description: 'Proposed civil due day (YYYY-MM-DD) in BRIEF_DISPLAY_TZ, or an explicit timezone-qualified timestamp.' },
         agentRationale: { type: ['string', 'null'], description: 'One-line reason, e.g. "Owner cited scope creep."' },
       },
       required: [
@@ -400,6 +401,9 @@ export function createExtensionRequestTool(opts: CardToolOptions) {
         );
       }
       try {
+        // Conversational input only: normalize before both rendering and
+        // persistence. Deterministic owner requests already hold an instant.
+        args.suggestedNewDueDate = normalizeDueDate(args.suggestedNewDueDate);
         const card = buildExtensionRequestCard(args);
         const { conversationId } = await sendCardToUser(opts, args.leaderAadObjectId, card, 'extension-request');
         recordExtensionRequest(args.followupId, args.suggestedNewDueDate);

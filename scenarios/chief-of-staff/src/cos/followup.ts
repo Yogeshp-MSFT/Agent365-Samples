@@ -22,6 +22,7 @@
 // escalation card to the leader.
 
 import axios from 'axios';
+import { providerError } from '../util/logger';
 import { CloudAdapter, TurnContext, TurnState } from '@microsoft/agents-hosting';
 import type { Client } from '../client';
 import { acquireAppOnlyGraphToken } from '../graph/graphAppToken';
@@ -80,7 +81,7 @@ async function resolveDisplayName(token: string, aad: string): Promise<string | 
     const name = (res.data?.displayName ?? '').toString().trim();
     return name || null;
   } catch (err) {
-    console.warn(`[followup] resolveDisplayName failed for aad=${aad.slice(0, 8)}…:`, (err as Error)?.message);
+    console.warn(`[followup] resolveDisplayName failed for aad=${aad.slice(0, 8)}…:`, providerError(err));
     return null;
   }
 }
@@ -180,7 +181,7 @@ export async function runFollowup(
     const token = await acquireAppOnlyGraphToken();
     tasks = await fetchPlanTasks(token, planId);
   } catch (err) {
-    console.error('[followup] fetchPlanTasks failed:', (err as Error)?.message ?? err);
+    console.error('[followup] fetchPlanTasks failed:', providerError(err));
     return;
   }
 
@@ -295,7 +296,7 @@ export async function runFollowup(
         // tick retries and the escalation sweep can't report it as ignored.
         deleteFollowup(record.followupId);
         skipped.push(`${ref(t.id)} ${owner} send failed`);
-        console.error(`[followup] send failed for ${ref(t.id)} ${owner} — will retry next tick:`, (err as Error)?.message);
+        console.error(`[followup] send failed for ${ref(t.id)} ${owner} — will retry next tick:`, providerError(err));
       }
     }
   }

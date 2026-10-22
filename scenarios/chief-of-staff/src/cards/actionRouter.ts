@@ -344,7 +344,7 @@ export function isAffirmativeCompletion(rawText: string): boolean {
     // With an explicit title, accept only a statement about that entire
     // object. "I finished the introduction to TASK" must not complete TASK.
     const target = '(?:the\\s+|my\\s+|our\\s+)?(?:task\\s+)?TASK';
-    const end = '[.!]*$';
+    const end = '\\s*[.!]*$';
     return [
       new RegExp(`^${target}\\s+(is|was|has been|got)\\s+(now\\s+|already\\s+|fully\\s+)?${done}${end}`, 'i'),
       new RegExp(`^(i|we)('ve|\\s+have|\\s+had)?\\s+(just\\s+|already\\s+|now\\s+|finally\\s+)?(completed|finished|done|wrapped up|closed)\\s+${target}${end}`, 'i'),
@@ -353,9 +353,9 @@ export function isAffirmativeCompletion(rawText: string): boolean {
     ].some((re) => re.test(text));
   }
   const statements = [
-    new RegExp(`^(task\\s+|all\\s+)?(done|complete|completed|finished)\\b`),
-    new RegExp(`^(i'm|im|i am|we're|we are)\\s+(all\\s+|now\\s+)?done\\b`),
-    new RegExp(`^(i|we)('ve|\\s+have|\\s+had)?\\s+(just\\s+|already\\s+|now\\s+|finally\\s+)?(completed|finished|done|wrapped up|closed)\\b`),
+    new RegExp(`^(task\\s+|all\\s+)?${done}\\s*[.!]*$`),
+    new RegExp(`^(i'm|im|i am|we're|we are)\\s+(all\\s+|now\\s+)?done(?:\\s+with\\s+(?:it|the task|the work|everything))?\\s*[.!]*$`),
+    new RegExp(`^(i|we)('ve|\\s+have|\\s+had)?\\s+(just\\s+|already\\s+|now\\s+|finally\\s+)?(completed|finished|done|wrapped up|closed)(?:\\s+(?:it|the task|the work|everything))?\\s*[.!]*$`),
     // A subject reporting the whole task, not an arbitrary clause ending in
     // "is done" ("one third of TASK is done", "the first section ...").
     new RegExp(`^(?:(?:the|my|our|this|that)\\s+)?(?:task(?:\\s+task)?|work|assignment|it|everything|all tasks)\\s+(is|are|was|were|has been|have been|got)\\s+(now\\s+|already\\s+|fully\\s+|all\\s+)?${done}[.!]*$`, 'i'),
@@ -915,7 +915,14 @@ async function routeIntent(
       return { handled: true };
     }
     try {
-      return await decideExtension(context, client, intent.verb, target);
+      if (cardFollowupId) {
+        const shownDate = typeof intent.data.newDueDate === 'string' ? intent.data.newDueDate : undefined;
+        if (!shownDate || Date.parse(shownDate) !== Date.parse(target.extensionRequestedTo)) {
+          await context.sendActivity("That extension proposal has been superseded. Please use the latest card or type approve/reject for the current pending proposal. I haven't changed anything.");
+          return { handled: true };
+        }
+      }
+      return await decideExtension(context, client, intent.verb, target, target.extensionRequestedTo);
     } finally {
       releaseFollowupLock(target.followupId);
     }
@@ -1100,17 +1107,15 @@ async function routeIntent(
       // ── Mark the Planner task with a [BLOCKER] prefix ─────────────────────
       // So the brief's Risks section surfaces it and taskComplete DMs the
       // leader when it closes. Best-effort.
-      if (followup?.taskId && followup.taskTitle) {
-        const alreadyPrefixed =
-          followup.taskTitle.startsWith('[BLOCKER]') ||
-          followup.taskTitle.startsWith('[RISK]');
-        if (!alreadyPrefixed) {
-          const r = await updatePlannerTaskTitle(followup.taskId, `[BLOCKER] ${followup.taskTitle}`);
-          if (!r.ok) {
-            console.warn(
-              `[book_meeting] could not prefix task=${followup.taskId.slice(0, 8)}… with [BLOCKER]: ${r.error}`
-            );
-          }
+      if (followup?.taskId) {
+        const r = await updatePlannerTaskTitle(
+          followup.taskId,
+          (current) => /^\[(BLOCKER|RISK)\]/i.test(current) ? current : `[BLOCKER] ${current}`
+        );
+        if (!r.ok) {
+          console.warn(
+            `[book_meeting] could not prefix task=${followup.taskId.slice(0, 8)}… with [BLOCKER]: ${r.error}`
+          );
         }
       }
 
@@ -1176,13 +1181,18 @@ async function decideExtension(
   context: TurnContext,
   client: Client,
   verb: string,
-  target: PendingFollowup
+  target: PendingFollowup,
+  proposal: string
 ): Promise<CardActionResult> {
   // Typed decisions resolve their request after authorizeIntent. Check the
   // actual selected task here as well, before either decision mutates state.
   const live = await getPlannerTaskDetails(target.taskId);
   if (!live.ok || !(await isTaskInAllowedPlan(live.planId))) {
     await context.sendActivity("I couldn't verify this request belongs to the leadership plan, so I didn't change it.");
+    return { handled: true };
+  }
+  if (target.extensionStatus !== 'pending' || target.extensionRequestedTo !== proposal) {
+    await context.sendActivity("That extension proposal changed while I was checking Planner. Please use the latest card. I haven't changed anything.");
     return { handled: true };
   }
   if (verb === 'reject_extend') {

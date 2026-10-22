@@ -263,12 +263,13 @@ setInterval, guarded by `meetingPollInFlight` — see §10.2):
   midpoint of the gap and the shared boundary belongs to the later
   occurrence. It also fetches the Copilot insights, then decides one of three
   outcomes:
-  1. **Ready** — transcript is here AND readable content exists (the
-     transcript body was fetched, or Copilot insights returned items) AND
+  1. **Ready** — the meeting has ended, its transcript ID is known, and
+     every selected transcript segment has a readable body, AND
      (insights arrived OR wait budget exhausted OR
      `attempts >= CAPTURE_MIN_ATTEMPTS_TRANSCRIPT_ONLY`). A transcript id
-     whose body failed to fetch keeps retrying; `runCapture` also refuses
-     content-less input.
+     whose body failed to fetch keeps retrying until the capture deadline;
+     insights are optional enrichment, never a substitute for a missing
+     segment. `runCapture` also refuses content-less input.
      The capture is marked `ready` (durably, with its artifacts) and emitted
      to the scheduler, which fires `runCapture`. The scheduler marks it
      `complete` only after `runCapture` succeeds (see §5.1: extraction is
@@ -277,9 +278,9 @@ setInterval, guarded by `meetingPollInFlight` — see §10.2):
      `CAPTURE_MAX_PROCESSING_FAILURES`, default 3); the retry resumes from
      the extraction checkpoint, so items already written are never
      re-created.
-  2. **Give up** — no readable content (no transcript, or a transcript
-     whose body never fetched and no insights) after
-     `CAPTURE_GIVE_UP_AFTER_HOURS`.
+  2. **Give up** — complete transcript artifacts are still unavailable after
+     `CAPTURE_GIVE_UP_AFTER_HOURS`: a missing transcript ID or any missing
+     segment body causes expiry, even when correlated insights exist.
      Marks the capture `gave-up` and moves on. A capture retired because
      its invitation was withdrawn (removed, declined, cancelled) is marked
      *revoked* instead; when discovery sees the event qualify again it is

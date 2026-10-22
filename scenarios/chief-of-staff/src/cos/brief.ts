@@ -18,6 +18,7 @@
 //      in code and DM the leader via sendCardProactively.
 
 import axios from 'axios';
+import { providerError } from '../util/logger';
 import { CloudAdapter, TurnContext, TurnState } from '@microsoft/agents-hosting';
 import type { Client } from '../client';
 import { acquireAppOnlyGraphToken } from '../graph/graphAppToken';
@@ -157,7 +158,7 @@ async function resolveDisplayName(token: string, aad: string): Promise<string> {
     briefNameCache.set(aad, value);
     return value;
   } catch (err) {
-    console.warn(`[brief] resolveDisplayName failed for aad=${aad.slice(0, 8)}…:`, (err as Error)?.message);
+    console.warn(`[brief] resolveDisplayName failed for aad=${aad.slice(0, 8)}…:`, providerError(err));
     const fallback = aad.slice(0, 8);
     briefNameCache.set(aad, fallback);
     return fallback;
@@ -257,7 +258,7 @@ export async function runBrief(
       fetchLeaderCalendar(graphToken, leaderUpn, horizonHours),
     ]);
   } catch (err) {
-    console.error('[brief] fetch failed:', (err as Error)?.message ?? err);
+    console.error('[brief] fetch failed:', providerError(err));
     return;
   }
 
@@ -421,6 +422,6 @@ export async function runBrief(
     });
     console.log('[brief] ✔ DM sent to leader.');
   } catch (err) {
-    console.error('[brief] send failed:', (err as Error)?.message ?? err);
+    console.error('[brief] send failed:', providerError(err));
   }
 }

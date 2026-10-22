@@ -202,12 +202,13 @@ export function recordOwnerResponse(
   return f;
 }
 
-export function markEscalated(followupId: string): void {
+export function markEscalated(followupId: string): boolean {
   const f = store.get(followupId);
-  if (!f) return;
+  if (!f || f.status !== 'pending') return false;
   f.status = 'escalated';
   f.escalatedAt = Date.now();
   store.set(followupId, f);
+  return true;
 }
 
 export function markResolved(followupId: string, patch?: Partial<PendingFollowup>): void {

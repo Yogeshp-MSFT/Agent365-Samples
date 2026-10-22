@@ -37,7 +37,7 @@ import { runCapture } from './cos/capture';
 import { runTaskComplete } from './cos/taskComplete';
 import { pollForNewTranscripts } from './graph/transcriptPoller';
 import { acknowledgeCompletion, pollForCompletedTasks } from './graph/plannerPoller';
-import { findStaleForEscalation, markEscalated, markResolved } from './state/followupStore';
+import { findStaleForEscalation, getFollowup, markEscalated, markResolved } from './state/followupStore';
 import { markCaptureComplete, markCaptureProcessingFailed } from './state/pendingCaptureStore';
 import { lookupConversationRef } from './state/conversationRefs';
 import { PersistentMap } from './state/persistentMap';
@@ -329,7 +329,7 @@ async function retryUndeliveredLeaderRequests(deps: SchedulerDeps, ctx: TurnCont
  * FOLLOWUP_ESCALATE_AFTER_HOURS that hasn't been responded to. Runs after
  * every follow-up cron fire.
  */
-async function sweepStaleFollowupsAndEscalate(
+export async function sweepStaleFollowupsAndEscalate(
   deps: SchedulerDeps,
   ctx: TurnContext,
   _client: Client
@@ -390,6 +390,9 @@ async function sweepStaleFollowupsAndEscalate(
       );
     }
 
+    // Selection was before several awaits. An owner may have responded
+    // meanwhile; never send a stale "no reply" card or reopen that response.
+    if (getFollowup(f.followupId)?.status !== 'pending') continue;
     const hours = (Date.now() - f.sentAt) / (60 * 60 * 1000);
     const res = await sendEscalationCardDirect(
       { authorization: deps.authorization, context: ctx, authHandlerName: deps.authHandlerName },

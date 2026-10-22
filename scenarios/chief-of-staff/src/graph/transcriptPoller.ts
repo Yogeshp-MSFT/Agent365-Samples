@@ -308,8 +308,8 @@ async function advanceCapture(
     `advance ${eventRef(cap.eventId)} attempt=${cap.attempts} transcriptId=${cap.transcriptId ? cap.transcriptId.slice(0, 8) + '…' : '∅'} insightsFetched=${cap.insightsFetched}`
   );
 
-  // Give-up guard: too much time has passed with no readable content (no
-  // transcript, or a transcript whose body never fetched and no insights).
+  // Readiness and expiry use the same complete-transcript requirement:
+  // correlated insights never exempt an unreadable segment from the deadline.
   const hasReadableContent = (c: PendingCapture) =>
     !!c.transcriptContent ||
     (c.insightsActionItems?.length ?? 0) + (c.insightsMeetingNotes?.length ?? 0) > 0;
@@ -440,9 +440,8 @@ async function advanceCapture(
   const transcriptSufficient =
     !!cap.transcriptContent && cap.attempts >= minAttemptsForTranscriptOnly;
 
-  // A transcript id alone is not enough: the body must have been fetched, or
-  // Copilot insights must carry usable items. Otherwise keep retrying the
-  // artifact fetch (bounded by giveUpAfter above).
+  // Every selected segment must be readable; insights are optional enrichment.
+  // Otherwise retry artifact fetching until giveUpAfter above.
   const ready =
     hasCompleteArtifacts(cap) &&
     now >= cap.endTime &&
