@@ -35,8 +35,8 @@ below reflects one or more of them.
 1. **Deterministic-first.** Every action a leader depends on (filter Planner,
    propose slot times, PATCH due dates, decide who to escalate to) is
    TypeScript, not the LLM. The LLM is used only where language
-   understanding is genuinely required (chat, meeting-transcript parsing)
-   or as an MCP transport we can't bypass (calendar booking).
+   understanding is genuinely required (chat, meeting-transcript parsing).
+   Calendar booking and meeting-summary posting call MCP directly.
 2. **Card actions must never double-fire.** Teams / Copilot channel enforces a
    ~5-second SLA on both Invoke and card-shaped Message activities. Every
    card-action path ACKs within a few hundred ms and runs the heavy work via
@@ -304,7 +304,7 @@ sequenceDiagram
   participant Graph as Graph (transcripts + insights)
   participant Cap as runCapture (cos/capture.ts)
   participant LLM as gpt-4o (people lookups only)
-  participant Post as gpt-4o (Teams chat-post tool only)
+  participant Post as Direct Teams MCP chat post
   participant P as Planner
   participant DM as sendCardProactively → owners + leader
 
@@ -344,14 +344,12 @@ Things to note:
 - Extraction runs on a client with only the read-only people lookups
   (`extractionOnly`): no Planner, card, or WorkIQ tools. All Planner and card
   writes happen in `cos/capture.ts` from the validated JSON.
-- The meeting-chat summary is the one model call that sees extracted text
-  and can act. It runs on a separate `summaryPostOnly` client: no local
-  tools, only the Teams MCP server filtered to message-posting tools, and a
-  minimal system prompt with no Planner or booking instructions. So the most
-  transcript-derived text can do is change the posted message — it can't
-  create tasks, send mail, or book meetings. `summaryPosted` is set only after
-  a confirmed post. The chat id is the meeting's `chatInfo.threadId`, captured
-  at discovery.
+- The meeting-chat summary is posted directly through the Teams MCP server,
+  without a model. The target is the server-selected `chatInfo.threadId`;
+  the text is passed literally. `summaryPosted` requires a successful tool
+  result with a message ID. A failed or unconfirmed post throws, leaving the
+  capture READY for the bounded processing retry. Existing task/card writes
+  are checkpointed and are not repeated.
 - Owners with no stored personal chat reference don't get the assignment
   card (`cardSkipped`); the task is still created and the leader gets one DM
   listing those owners. Their regular follow-up check-ins reach them once
@@ -365,9 +363,13 @@ Things to note:
   assignee, insists on a due date, and treats meeting/transcript content as
   **untrusted** (prompt-injection defense).
 - Copilot insights are bound to the occurrence: only records whose
-  `callId` / `contentCorrelationId` match the selected transcript are used
-  (or, if the transcript has no correlation ids, records created after the
-  occurrence began). A recurring meeting's earlier insights are ignored.
+  `callId` / `contentCorrelationId` match its transcript segments are used.
+  Without correlation IDs, use the current transcript, not publication time:
+  an earlier call's insights may arrive late.
+- All available transcript segments belonging to the occurrence are fetched
+  and combined in creation order. Capture waits until the meeting has ended
+  and every selected segment body is readable. Segment IDs are persisted so
+  other occurrences cannot claim them.
 - When `hasInsights=false` (no Copilot license or empty response) the LLM
   extracts from the raw VTT — with the same output contract. That's the path
   demo tenants without a Copilot license end up on, and it produces the same
@@ -445,8 +447,8 @@ sequenceDiagram
     Router->>Router: proposeMeetingSlots (3 slots in BRIEF_DISPLAY_TZ)
     Router->>Leader: blocker meeting card (retried like the extension card)
     Leader->>Router: Invoke {verb: 'book_meeting', slotIso}
-    Router->>Router: LLM + mcp_CalendarTools.book_meeting (only remaining LLM call in this path)
-    alt booking returned exactly "OK"
+    Router->>Router: Direct Calendar MCP create-event with code-bound arguments
+    alt calendar tool returned a created event ID
       Router->>Store: markResolved (meetingScheduledAt)
       Router->>P: PATCH title "[BLOCKER] …"
       Router->>Owner: DM "meeting scheduled"
@@ -805,8 +807,8 @@ Two places, and only two:
 1. **`src/cos/capture.ts` → `runCapture`.** One extraction turn per meeting
    (skipped on retry — the checkpoint is reused). It returns action items +
    decisions as JSON using only read-only people lookups; the Planner tasks
-   and assignment cards are then written by TypeScript. A final,
-   best-effort LLM call posts the meeting summary via `mcp_TeamsServer`.
+   and assignment cards are then written by TypeScript. The final meeting
+   summary is posted directly via `mcp_TeamsServer`, without a model.
 2. **`src/agent.ts` → `handleUserMessage` fallback path** (and
    `handleUserEmail` for email). One LLM turn per user DM or email that
    isn't a card action or keyword reply, after the same leadership-team gate.
@@ -815,14 +817,16 @@ Two places, and only two:
    text — the deterministic `blocked` verb (card click or keyword) is the
    primary path.
 
-The blocker card handler's calendar booking (`book_meeting` verb) also
-routes through the LLM, but only because `mcp_CalendarTools.book_meeting`
-is exposed as an MCP tool and not (yet) directly reachable via HTTP. The
-LLM is fed fully pre-computed values with a 1-token response contract
-(`OK` / `FAIL: reason`) so it can't hallucinate. Booking runs **before**
-anything is recorded: only an exact `OK` resolves the follow-up and DMs the
-owner. It is the only card verb that calls the LLM — reject, reassign,
-defer, and escalate send their DMs deterministically.
+The blocker card handler calls the Calendar MCP server directly with
+code-bound organizer, attendees, subject, and start/end timestamps. No model
+sees task titles as instructions. The live catalog must expose exactly one
+approved operation whose schema can bind every required field; unknown
+required fields or ambiguous operations cause an explicit error before a write.
+Only a successful tool result with an event ID resolves the follow-up and
+notifies the owner. Summary posting follows the same contract for its chat
+and text. `workiqOperations.ts` contains the supported schema bindings; a
+tenant exposing a different schema needs a verified binding before it can
+write, rather than falling back to a general agent.
 
 Everything else — filtering Planner tasks in Brief and Follow-up, computing
 new due dates in Extend, proposing meeting slots in Blocker, resolving
@@ -893,7 +897,7 @@ All card verbs are strings in `activity.value.verb`:
 | `approve_extend` | Extension request card | Only while the request is still `pending` (old cards for decided/cancelled requests are refused): `updatePlannerTaskDueDate` + DM owner |
 | `reject_extend` | Extension request card | Only while `pending`: deterministic DM to owner "not approved" |
 | `reassign` | Extension request card | Manual handoff: closes the check-in, cancels the pending extension request / queued delivery, and tells the leader to change the assignee in Planner |
-| `book_meeting` | Blocker meeting card | One booking at a time per follow-up (in-flight lock across all slots). Under the lock it refuses a closed request or a task that is complete/deleted in Planner (live check). LLM + `mcp_CalendarTools.book_meeting` first; on exact `OK` → resolve, PATCH `[BLOCKER]` title prefix, DM owner; on failure → DM owner "not booked", keep the check-in open |
+| `book_meeting` | Blocker meeting card | Per-follow-up lock; validate current request/task and future slot. Direct Calendar MCP call with fixed organizer, attendees, and times. A returned event ID permits resolution and the owner DM; failure leaves the request open. |
 | `defer_blocker` | Blocker meeting card | Snooze — resolves the followup with a note |
 | `esc_reassign` | Escalation card | Same manual handoff as `reassign` |
 | `esc_extend` | Escalation card | Sends the leader an extension approval card |

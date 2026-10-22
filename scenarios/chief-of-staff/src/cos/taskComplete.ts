@@ -59,7 +59,7 @@ export async function runTaskComplete(
   _state: TurnState,
   client: Client
 ): Promise<TaskCompleteOutcome> {
-  console.log('[taskComplete] Trigger received.', { taskId: payload.taskId });
+  console.log('[taskComplete] Trigger received.', { taskId: payload.taskId?.slice(0, 8) });
   const alreadyDelivered = new Set((payload.alreadyDelivered ?? []).map((a) => a.toLowerCase()));
   const delivered: string[] = [];
 

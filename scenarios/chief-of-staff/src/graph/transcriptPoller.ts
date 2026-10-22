@@ -329,15 +329,25 @@ async function advanceCapture(
   //    reuses its join URL, so the list can contain earlier occurrences'
   //    transcripts — pick only one created during this occurrence that no
   //    other capture has already consumed.
-  if (!cap.transcriptId) {
+  // Re-list while collecting artifacts: stopping/restarting transcription
+  // creates multiple records on the same meeting occurrence.
+  if (!cap.extractedItems) {
     const transcripts = await fetchTranscriptsForMeeting(
       opts,
       cap.ownerUpn,
       cap.meetingId
     );
-    const match = selectTranscriptForOccurrence(transcripts, cap, now);
+    const matches = selectTranscriptsForOccurrence(transcripts, cap, now);
+    const match = matches[0];
     if (match) {
+      const old = cap.transcriptSegments ?? [];
+      const segments = matches.map((s) => ({
+        ...s,
+        content: old.find((o) => o.transcriptId === s.transcriptId)?.content ??
+          (matches.length === 1 && cap.transcriptId === s.transcriptId ? cap.transcriptContent : undefined),
+      }));
       updateCapture(cap.eventId, {
+        transcriptSegments: segments,
         transcriptId: match.transcriptId,
         transcriptFetchedAt: now,
         transcriptCallId: match.callId,
@@ -359,17 +369,18 @@ async function advanceCapture(
   //     content via the app-permission Graph worker so the LLM can extract
   //     from it inline (no dependency on mcp_TeamsServer.get_meeting_transcript
   //     which currently 400s for these token-shaped ids).
-  if (cap.transcriptId && !cap.transcriptContent) {
-    const content = await fetchTranscriptContent(
-      opts,
-      cap.ownerUpn,
-      cap.meetingId,
-      cap.transcriptId
-    );
-    if (content) {
-      updateCapture(cap.eventId, { transcriptContent: content });
-      cap.transcriptContent = content;
+  if (cap.transcriptId) {
+    const segments = cap.transcriptSegments ?? [{ transcriptId: cap.transcriptId, content: cap.transcriptContent }];
+    for (const segment of segments) {
+      if (!segment.content) {
+        segment.content = await fetchTranscriptContent(opts, cap.ownerUpn, cap.meetingId, segment.transcriptId);
+      }
     }
+    const complete = segments.every((s) => !!s.content?.trim());
+    updateCapture(cap.eventId, {
+      transcriptSegments: segments,
+      transcriptContent: complete ? segments.map((s) => s.content).join('\n\n') : undefined,
+    });
   }
 
   // 2) If transcript is here, try insights (once per cycle until fetched).
@@ -380,8 +391,9 @@ async function advanceCapture(
     insights = await fetchAiInsightsForMeeting(opts, cap.ownerUpn, cap.meetingId, {
       callId: cap.transcriptCallId,
       contentCorrelationId: cap.transcriptCorrelationId,
-      windowStart: (cap.startTime ?? cap.endTime - cap.durationMinutes * 60 * 1000) - 15 * 60 * 1000,
-      windowEnd: insightsWindowEnd(cap),
+      callIds: cap.transcriptSegments?.flatMap((s) => s.callId ? [s.callId] : []),
+      contentCorrelationIds: cap.transcriptSegments?.flatMap((s) => s.contentCorrelationId ? [s.contentCorrelationId] : []),
+      windowStart: cap.startTime ?? cap.endTime - cap.durationMinutes * 60 * 1000,
     });
     if (insights.available) {
       updateCapture(cap.eventId, {
@@ -428,6 +440,8 @@ async function advanceCapture(
   // artifact fetch (bounded by giveUpAfter above).
   const ready =
     !!cap.transcriptId &&
+    now >= cap.endTime &&
+    (!cap.transcriptSegments || cap.transcriptSegments.every((s) => !!s.content?.trim())) &&
     hasReadableContent(cap) &&
     (cap.insightsFetched || waitBudgetExhausted || transcriptSufficient);
 
@@ -515,17 +529,6 @@ function sameMeetingNeighbors(
   return Array.from(byEvent.values());
 }
 
-/**
- * Upper bound for time-matched insights: the start of the next occurrence on
- * the same join URL, or the capture deadline when there is none.
- */
-function insightsWindowEnd(cap: PendingCapture): number {
-  const later = sameMeetingNeighbors(cap)
-    .map((n) => occurrenceStart(n))
-    .filter((s) => s >= cap.endTime);
-  return later.length > 0 ? Math.min(...later) : cap.giveUpAfter;
-}
-
 /** Log-safe event reference — event ids share a mailbox prefix, so use the tail. */
 function eventRef(eventId: string | undefined): string {
   return `event=…${String(eventId ?? '?').slice(-8)}`;
@@ -537,12 +540,12 @@ function eventRef(eventId: string | undefined): string {
  * slack capped so it never overlaps a neighbouring occurrence of the same
  * online meeting, and not already consumed by another capture.
  */
-export function selectTranscriptForOccurrence(
+export function selectTranscriptsForOccurrence(
   transcripts: TranscriptSummary[],
   cap: Pick<PendingCapture, 'eventId' | 'meetingId' | 'joinWebUrl' | 'startTime' | 'endTime' | 'durationMinutes'>,
   now: number,
   neighbors: OccurrenceSpan[] = sameMeetingNeighbors(cap)
-): TranscriptSummary | undefined {
+): TranscriptSummary[] {
   const start = occurrenceStart(cap);
   let windowStart = start - OCCURRENCE_EARLY_SLACK_MS;
   let windowEnd = cap.endTime + OCCURRENCE_LATE_SLACK_MS;
@@ -561,7 +564,7 @@ export function selectTranscriptForOccurrence(
       }
     }
   }
-  if (now < windowStart) return undefined;
+  if (now < windowStart) return [];
   const candidates = transcripts
     .filter((t) => !isTranscriptClaimed(t.transcriptId, cap.eventId))
     .filter((t) => {
@@ -570,5 +573,15 @@ export function selectTranscriptForOccurrence(
       return endExclusive ? created < windowEnd : created <= windowEnd;
     })
     .sort((a, b) => Date.parse(a.createdDateTime!) - Date.parse(b.createdDateTime!));
-  return candidates[0];
+  return candidates;
+}
+
+/** Backwards-compatible single-segment lookup; capture uses the full list. */
+export function selectTranscriptForOccurrence(
+  transcripts: TranscriptSummary[],
+  cap: Pick<PendingCapture, 'eventId' | 'meetingId' | 'joinWebUrl' | 'startTime' | 'endTime' | 'durationMinutes'>,
+  now: number,
+  neighbors: OccurrenceSpan[] = sameMeetingNeighbors(cap)
+): TranscriptSummary | undefined {
+  return selectTranscriptsForOccurrence(transcripts, cap, now, neighbors)[0];
 }

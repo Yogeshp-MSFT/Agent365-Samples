@@ -538,6 +538,7 @@ export class CosAgent extends AgentApplication<TurnState> {
       `[agent] InstallationUpdate action=${action} (aad=${redactId(from?.aadObjectId)})`
     );
     if (action === 'add') {
+      rememberConversationRef(context.activity);
       await context.sendActivity(
         "I'm the Chief of Staff. I'll capture decisions from your meetings, remind owners of tasks, brief you daily, and answer your status questions. Add me to your leadership Team and share your calendar to get started."
       );

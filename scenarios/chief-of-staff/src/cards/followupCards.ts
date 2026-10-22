@@ -20,6 +20,7 @@
 // on the blueprint identity, which we are strictly avoiding.
 
 import { tool } from '@openai/agents';
+import { providerError } from '../util/logger';
 import { Authorization, CloudAdapter, TurnContext } from '@microsoft/agents-hosting';
 import {
   createFollowup,
@@ -72,7 +73,7 @@ async function sendCardToUser(
 
 function toolFail(name: string, err: unknown, hint?: string): string {
   const e = err as any;
-  const msg = e?.response?.data ?? e?.message ?? String(e);
+  const msg = providerError(err);
   console.error(`[cards/${name}] failed:`, msg);
   return JSON.stringify({ ok: false, tool: name, error: msg, ...(hint ? { hint } : {}) });
 }
@@ -876,7 +877,7 @@ export async function sendEscalationCardDirect(
     return { ok: true };
   } catch (err) {
     const e = err as any;
-    const msg = e?.response?.data ?? e?.message ?? String(e);
+    const msg = providerError(err);
     console.error('[sendEscalationCardDirect] failed:', msg);
     return { ok: false, error: String(msg) };
   }
@@ -899,7 +900,7 @@ export async function sendExtensionRequestCardDirect(
     return { ok: true, conversationId };
   } catch (err) {
     const e = err as any;
-    const msg = e?.response?.data ?? e?.message ?? String(e);
+    const msg = providerError(err);
     console.error('[sendExtensionRequestCardDirect] failed:', msg);
     return { ok: false, error: String(msg) };
   }
@@ -922,7 +923,7 @@ export async function sendBlockerMeetingCardDirect(
     return { ok: true, conversationId };
   } catch (err) {
     const e = err as any;
-    const msg = e?.response?.data ?? e?.message ?? String(e);
+    const msg = providerError(err);
     console.error('[sendBlockerMeetingCardDirect] failed:', msg);
     return { ok: false, error: String(msg) };
   }
@@ -947,7 +948,7 @@ export async function sendPlainDmToUser(
     return { ok: true };
   } catch (err) {
     const e = err as any;
-    const msg = e?.response?.data ?? e?.message ?? String(e);
+    const msg = providerError(err);
     console.error('[sendPlainDmToUser] failed:', msg);
     return { ok: false, error: String(msg) };
   }

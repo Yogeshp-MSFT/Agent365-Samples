@@ -4,9 +4,6 @@
 // Card action router. Parses either:
 //   - Adaptive Card Action.Submit click  (arrives as activity.value = {verb, ...})
 //   - or a plain text keyword reply      (blocked / extend / ontrack / approve / …)
-// Then dispatches to a deterministic TypeScript handler (Planner writes,
-// proactive DMs, leader cards). The only handler that still calls the LLM is
-// book_meeting, which uses it purely as the transport to mcp_CalendarTools.
 //
 // If nothing matches (activity has no card data and no keyword), returns
 // { handled: false } so the caller can proceed with the normal LLM turn.
@@ -46,6 +43,7 @@ import {
   type CardToolOptions,
 } from './followupCards';
 import { civilDateInZone, DISPLAY_TZ, formatDisplayDate, zonedWallTimeToUtc } from '../util/time';
+import { runWorkIqOperation } from '../workiqOperations';
 
 export interface CardActionResult {
   handled: boolean;
@@ -321,6 +319,7 @@ export function isAffirmativeCompletion(rawText: string): boolean {
   const negation =
     /\b(not|never|no longer|nothing|yet to|still working|still in progress|not yet|cannot|can't|won't|isn't|aren't|wasn't|weren't|haven't|hasn't|hadn't|didn't|doesn't|don't)\b|n't\b/;
   if (negation.test(text)) return false;
+  if (/\b(half|part(?:ly|ially)?|some|portion|percent|per cent|except|remaining|remainder|mostly|almost|nearly|only|but)\b|%|\b\d+\s*\/\s*\d+\b/i.test(text)) return false;
   const nonFactual =
     /\b(will|shall|going to|gonna|plan(?:ning)? to|about to|need to|needs to|have to|has to|want to|wants to|wanted|trying to|try to|hope|hopes|hoped|hoping|wish|wishes|wished|if only|should|would|could|might|may|maybe|perhaps|probably|possibly|apparently|supposedly|ideally|supposed to|meant to|expect|expects|expected|assume|assumed|think|thought|believe|guess|imagine|pretend|almost|nearly|soon|later|tomorrow|next week|once|after|before|until|unless|if|when|whether)\b|'ll\b|'d\b/;
   if (nonFactual.test(text)) return false;
@@ -514,6 +513,9 @@ async function authorizeIntent(
   // leadership plan: card data (or a follow-up created by the LLM tool) can
   // carry any task id the worker app could otherwise read or write.
   if (isLeader) {
+    if (followup && typeof data.taskId === 'string' && data.taskId !== followup.taskId) {
+      return "That card doesn't match the check-in on record, so I didn't change anything.";
+    }
     const leaderTaskId =
       (typeof data.taskId === 'string' && data.taskId ? data.taskId : undefined) ?? followup?.taskId;
     if (leaderTaskId) {
@@ -607,7 +609,7 @@ export async function handleCardActionIfAny(
 
   const startedAt = Date.now();
   console.log(
-    `[cardActionRouter] verb=${intent.verb} leader=${isLeader} matchedFollowup=${followup?.followupId ?? 'none'}`
+    `[cardActionRouter] verb=${intent.verb} leader=${isLeader} matchedFollowup=${followup?.followupId.slice(0, 8) ?? 'none'}`
   );
   // Wrap the rest in a try/finally so we always log elapsed time — makes
   // "why did that card look slow" trivially observable.
@@ -1017,16 +1019,10 @@ async function routeIntent(
           return { handled: true };
         }
       }
-      // Book FIRST. The follow-up is resolved and the owner is told the meeting
-      // is scheduled only after the calendar tool returns exactly "OK".
+      // Book FIRST; only an actual create-event response can resolve the request.
       await context.sendActivity(`📅 Booking **${timeslot}** for the unblock meeting on "${taskTitle}"…`);
 
       // ── Book the calendar event via mcp_CalendarTools ─────────────────────
-      // The LLM is used ONLY as the transport to reach the MCP tool. All
-      // decisions (start/end time, attendees, subject) are already made
-      // deterministically; we hand the LLM literal values and tell it to
-      // invoke the tool with those exact values — no dates for it to
-      // hallucinate.
       const startIso = timeslotIso;
       const endIso = new Date(new Date(timeslotIso).getTime() + 30 * 60 * 1000).toISOString();
       const leaderUpn = process.env.LEADER_UPN?.trim() ?? '';
@@ -1043,37 +1039,25 @@ async function routeIntent(
       }
       if (ownerAad && !ownerUpn) {
         await context.sendActivity(
-          `⚠️ Couldn't resolve ${ownerName}'s email from Graph — the calendar invite will only go to you. Please add ${ownerName} manually if you want them on the invite.`
+          `⚠️ Couldn't resolve ${ownerName}'s email from Graph, so I haven't booked anything. Please retry once their address is available.`
         );
+        bookMeetingSeen.delete(dedupeKey);
+        return { handled: true };
       }
-
-      const attendeeList = ownerUpn
-        ? `    - leader UPN: "${leaderUpn}"\n    - owner UPN:  "${ownerUpn}"`
-        : `    - leader UPN: "${leaderUpn}"  (owner UPN unresolved — leader-only)`;
-
-      const bookingPrompt = `Book a calendar meeting using mcp_CalendarTools. Use these EXACT values. Do NOT change them. Do NOT invent dates. Do NOT call graph_find_user — the attendee list below is already resolved.
-
-  - subject: "Unblock: ${taskTitle}"
-  - startDateTime: "${startIso}"  (UTC, ISO 8601)
-  - endDateTime:   "${endIso}"  (UTC, ISO 8601, 30 minutes after start)
-  - organizer:     "${leaderUpn}"
-  - attendees (required):
-  ${attendeeList}
-  - body: "Auto-booked to unblock the task '${taskTitle}'. Blocker was reported by ${ownerName} via CoS check-in card."
-
-  Steps:
-  1. Call the mcp_CalendarTools create-event / book-meeting tool with the EXACT values above. Pass BOTH attendee UPNs from the list; do not drop any.
-  2. Return ONLY one of two exact strings (no other text, no event ids, no ids of any kind):
-     - "OK" on success
-     - "FAIL: <one short reason>" on error`;
 
       let failure: string | undefined;
       try {
-        const bookResult = await client.invokeAgentWithScope(bookingPrompt);
-        const trimmed = (bookResult ?? '').trim();
-        // The booking contract is exactly "OK" or "FAIL: <reason>"; anything
-        // else (including a failure that mentions "booked") is not success.
-        if (!/^OK$/i.test(trimmed)) failure = trimmed.slice(0, 200) || 'unknown error';
+        if (!leaderUpn || !ownerUpn) throw new Error('Both leader and owner addresses are required');
+        await runWorkIqOperation(client.getPeopleOpts(), {
+          kind: 'event',
+          organizer: leaderUpn,
+          attendees: Array.from(new Set([leaderUpn, ownerUpn])),
+          start: startIso,
+          end: endIso,
+          subject: `Unblock: ${taskTitle}`,
+          body: `Unblock meeting requested through the Chief of Staff check-in card for ${ownerName}.`,
+          transactionId: followup?.followupId ?? dedupeKey,
+        });
       } catch (err) {
         failure = (err as Error)?.message ?? String(err);
       }
@@ -1180,6 +1164,13 @@ async function decideExtension(
   verb: string,
   target: PendingFollowup
 ): Promise<CardActionResult> {
+  // Typed decisions resolve their request after authorizeIntent. Check the
+  // actual selected task here as well, before either decision mutates state.
+  const live = await getPlannerTaskDetails(target.taskId);
+  if (!live.ok || !(await isTaskInAllowedPlan(live.planId))) {
+    await context.sendActivity("I couldn't verify this request belongs to the leadership plan, so I didn't change it.");
+    return { handled: true };
+  }
   if (verb === 'reject_extend') {
     markResolved(target.followupId);
     setExtensionStatus(target.followupId, 'rejected');

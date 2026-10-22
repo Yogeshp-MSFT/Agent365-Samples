@@ -7,6 +7,21 @@
 
 export const DISPLAY_TZ = process.env.BRIEF_DISPLAY_TZ?.trim() || 'Asia/Kolkata';
 
+/** Date-only deadlines (including legacy UTC-midnight values) mean a local due day. */
+export function normalizeDueDate(value: string): string {
+  const civil = /^(\d{4})-(\d{2})-(\d{2})(?:T00:00:00(?:\.0+)?Z)?$/.exec(value);
+  if (civil) {
+    const [, y, m, d] = civil;
+    const date = new Date(Date.UTC(Number(y), Number(m) - 1, Number(d)));
+    if (date.toISOString().slice(0, 10) !== `${y}-${m}-${d}`) throw new Error('Invalid due date');
+    return zonedWallTimeToUtc(Number(y), Number(m), Number(d), 17, 0, DISPLAY_TZ).toISOString();
+  }
+  if (!/T.*(?:Z|[+-]\d{2}:\d{2})$/.test(value) || !Number.isFinite(Date.parse(value))) {
+    throw new Error('Due dates must be YYYY-MM-DD or an ISO timestamp with a timezone');
+  }
+  return new Date(value).toISOString();
+}
+
 /** Offset of `timeZone` from UTC, in minutes, at the given instant. */
 export function zoneOffsetMinutes(timeZone: string, at: Date): number {
   const parts = new Intl.DateTimeFormat('en-US', {

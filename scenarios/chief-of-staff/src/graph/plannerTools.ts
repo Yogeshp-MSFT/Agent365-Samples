@@ -26,6 +26,8 @@ import { tool } from '@openai/agents';
 import { Authorization, TurnContext } from '@microsoft/agents-hosting';
 import { getPlannerPlanId, getPlannerBucketId } from './plannerConfig';
 import { acquireAppOnlyGraphToken } from './graphAppToken';
+import { normalizeDueDate } from '../util/time';
+import { providerError } from '../util/logger';
 
 const GRAPH_BASE = 'https://graph.microsoft.com/v1.0';
 
@@ -54,7 +56,7 @@ function defaultBucketId(): Promise<string | undefined> {
 
 function toolError(name: string, err: unknown): string {
   const e = err as any;
-  const msg = e?.response?.data ?? e?.message ?? String(e);
+  const msg = providerError(err);
   console.error(`[plannerTools] ${name} failed:`, msg);
   return JSON.stringify({ ok: false, tool: name, error: msg });
 }
@@ -149,7 +151,7 @@ export async function createPlannerTaskDirect(input: CreatePlannerTaskInput): Pr
     }
     const body: Record<string, unknown> = { planId: plan.planId, bucketId: bucket.bucketId, title: input.title.trim() };
     if (Object.keys(assignments).length > 0) body.assignments = assignments;
-    if (input.dueDateTime) body.dueDateTime = input.dueDateTime;
+    if (input.dueDateTime) body.dueDateTime = normalizeDueDate(input.dueDateTime);
     if (typeof input.priority === 'number') body.priority = input.priority;
 
     const res = await axios.post(`${GRAPH_BASE}/planner/tasks`, body, {
@@ -173,7 +175,7 @@ export async function createPlannerTaskDirect(input: CreatePlannerTaskInput): Pr
     };
   } catch (err) {
     const e = err as any;
-    const msg = e?.response?.data ?? e?.message ?? String(e);
+    const msg = providerError(err);
     return { ok: false, error: typeof msg === 'string' ? msg : JSON.stringify(msg) };
   }
 }
@@ -271,7 +273,7 @@ function createGetTaskTool(opts: PlannerToolOptions) {
             );
             description = details.data?.description || undefined;
           } catch (err) {
-            console.warn('[plannerTools] planner_get_task could not read description:', (err as Error)?.message);
+            console.warn('[plannerTools] planner_get_task could not read description:', providerError(err));
           }
         }
         return JSON.stringify({
@@ -334,7 +336,7 @@ function createCreateTaskTool(_opts: PlannerToolOptions) {
         },
         dueDateTime: {
           type: ['string', 'null'],
-          description: 'Due date in ISO 8601 (e.g. 2026-07-15T00:00:00Z).',
+          description: 'Due day as YYYY-MM-DD in BRIEF_DISPLAY_TZ (e.g. 2026-07-15), stored at 17:00 local. Explicit timezone-qualified timestamps are also accepted.',
         },
         priority: {
           type: ['integer', 'null'],
@@ -430,7 +432,7 @@ export async function acknowledgePlannerTask(
     );
     return { ok: true, percentComplete: newPct, startDateTime: startIso, alreadyStarted: false };
   } catch (err) {
-    const msg = (err as any)?.response?.data ?? (err as any)?.message ?? String(err);
+    const msg = providerError(err);
     console.error(`[plannerTools] acknowledgePlannerTask failed for task=${taskId.slice(0, 8)}…:`, msg);
     return { ok: false, error: typeof msg === 'string' ? msg : JSON.stringify(msg) };
   }
@@ -484,7 +486,7 @@ export async function updatePlannerTaskDueDate(
     );
     return { ok: true, previousDue, newDue: dueIso };
   } catch (err) {
-    const msg = (err as any)?.response?.data ?? (err as any)?.message ?? String(err);
+    const msg = providerError(err);
     console.error(`[plannerTools] updatePlannerTaskDueDate failed for task=${taskId.slice(0, 8)}…:`, msg);
     return { ok: false, error: typeof msg === 'string' ? msg : JSON.stringify(msg) };
   }
@@ -533,7 +535,7 @@ export async function updatePlannerTaskTitle(
     );
     return { ok: true, previousTitle, newTitle };
   } catch (err) {
-    const msg = (err as any)?.response?.data ?? (err as any)?.message ?? String(err);
+    const msg = providerError(err);
     console.error(`[plannerTools] updatePlannerTaskTitle failed for task=${taskId.slice(0, 8)}…:`, msg);
     return { ok: false, error: typeof msg === 'string' ? msg : JSON.stringify(msg) };
   }
@@ -576,7 +578,7 @@ export async function setPlannerTaskDescription(
     );
     return { ok: true };
   } catch (err) {
-    const msg = (err as any)?.response?.data ?? (err as any)?.message ?? String(err);
+    const msg = providerError(err);
     return { ok: false, error: typeof msg === 'string' ? msg : JSON.stringify(msg) };
   }
 }
@@ -602,7 +604,7 @@ export async function getPlannerTaskDetails(
     const pct = Number(res.data?.percentComplete ?? 0);
     return { ok: true, title, assigneeAads, percentComplete: pct, planId: String(res.data?.planId ?? '') };
   } catch (err) {
-    const msg = (err as any)?.response?.data ?? (err as any)?.message ?? String(err);
+    const msg = providerError(err);
     // Only a 404 proves the task is gone; throttling, 5xx, and transport
     // errors are indeterminate.
     const notFound = (err as any)?.response?.status === 404;
@@ -654,7 +656,7 @@ export async function completePlannerTask(
     );
     return { ok: true, title, previousPercent, alreadyComplete: false };
   } catch (err) {
-    const msg = (err as any)?.response?.data ?? (err as any)?.message ?? String(err);
+    const msg = providerError(err);
     console.error(`[plannerTools] completePlannerTask failed for task=${taskId.slice(0, 8)}…:`, msg);
     return { ok: false, error: typeof msg === 'string' ? msg : JSON.stringify(msg) };
   }
@@ -771,7 +773,7 @@ export async function findOpenTaskByTitle(
       candidates: topTier.slice(0, 5).map((c) => ({ taskId: c.taskId, title: c.title })),
     };
   } catch (err) {
-    const msg = (err as any)?.response?.data ?? (err as any)?.message ?? String(err);
+    const msg = providerError(err);
     console.error(`[plannerTools] findOpenTaskByTitle failed (hint chars=${titleHint.length}):`, msg);
     return { ok: false, reason: 'graph_error', error: typeof msg === 'string' ? msg : JSON.stringify(msg) };
   }

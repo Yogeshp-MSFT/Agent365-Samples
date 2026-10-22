@@ -35,5 +35,5 @@ jobs:
     - name: Install dependencies
       run: npm install --legacy-peer-deps
 
-    - name: Build
-      run: npm run build
+    - name: Build and run regression tests
+      run: npm test

@@ -117,11 +117,11 @@ async function resolveGroupId(rawInput: string): Promise<string | undefined> {
 
   // Display name path — filter groups by exact name + Team resource kind.
   try {
-    const url =
-      `${GRAPH_BASE}/groups?$select=id,displayName` +
-      `&$filter=displayName eq '${raw.replace(/'/g, "''")}'` +
-      ` and resourceProvisioningOptions/Any(x:x eq 'Team')&$top=25`;
-    const res = await axios.get(url, {
+    const url = new URL(`${GRAPH_BASE}/groups`);
+    url.searchParams.set('$select', 'id,displayName');
+    url.searchParams.set('$filter', `displayName eq '${raw.replace(/'/g, "''")}' and resourceProvisioningOptions/Any(x:x eq 'Team')`);
+    url.searchParams.set('$top', '25');
+    const res = await axios.get(url.toString(), {
       headers: {
         Authorization: `Bearer ${token}`,
         ConsistencyLevel: 'eventual',

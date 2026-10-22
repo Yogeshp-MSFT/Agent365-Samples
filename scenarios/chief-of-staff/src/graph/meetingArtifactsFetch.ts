@@ -78,10 +78,15 @@ export async function fetchTranscriptsForMeeting(
       `${GRAPH_V1}/users/${encodeURIComponent(userId)}` +
       `/onlineMeetings/${encodeURIComponent(meetingId)}/transcripts`;
     log.debug('transcriptFetch', `GET transcripts meeting=${meetingId.slice(0, 8)}…`);
-    const res = await axios.get(url, {
-      headers: { Authorization: `Bearer ${token}` },
-    });
-    const items = (res.data?.value ?? []) as any[];
+    const items: { id?: string; createdDateTime?: string; transcriptContentUrl?: string; callId?: string; contentCorrelationId?: string }[] = [];
+    let pageUrl: string | undefined = url;
+    while (pageUrl) {
+      const res: { data: { value?: typeof items; '@odata.nextLink'?: string } } = await axios.get(pageUrl, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      items.push(...(res.data?.value ?? []));
+      pageUrl = res.data?.['@odata.nextLink'];
+    }
     log.debug(
       'transcriptFetch',
       `meeting=${meetingId.slice(0, 8)}… returned ${items.length} transcript(s)`
@@ -210,6 +215,8 @@ export interface InsightsResult {
 export interface InsightsOccurrence {
   callId?: string;
   contentCorrelationId?: string;
+  callIds?: string[];
+  contentCorrelationIds?: string[];
   /** Earliest plausible creation time for this occurrence's insights (ms). */
   windowStart: number;
   /** Insights created at/after this belong to a later occurrence (ms). */
@@ -220,26 +227,16 @@ export interface InsightsOccurrence {
  * Keep only insight records that belong to the captured occurrence. A
  * recurring meeting's aiInsights collection holds every occurrence's
  * results, so records are matched by the transcript's correlation ids; when
- * the transcript has none, only records created after this occurrence began
- * are accepted. Unmatched records are ignored (treated as not available).
+ * the transcript has none, insights are not used: publication time cannot
+ * establish which occurrence produced them. Use the transcript instead.
  */
 export function selectInsightsForOccurrence(insights: any[], occ: InsightsOccurrence): any[] {
-  const byId = !!(occ.callId || occ.contentCorrelationId);
+  const calls = new Set([...(occ.callIds ?? []), ...(occ.callId ? [occ.callId] : [])]);
+  const correlations = new Set([...(occ.contentCorrelationIds ?? []), ...(occ.contentCorrelationId ? [occ.contentCorrelationId] : [])]);
   return insights.filter((ins) => {
-    if (byId) {
-      return (
-        (!!occ.contentCorrelationId && ins.contentCorrelationId === occ.contentCorrelationId) ||
-        (!!occ.callId && ins.callId === occ.callId)
-      );
-    }
-    const created = ins.createdDateTime ? Date.parse(ins.createdDateTime) : NaN;
-    // Time fallback is bounded on both sides: after this occurrence began and
-    // before the next occurrence on the same join URL (or the capture deadline).
-    return (
-      Number.isFinite(created) &&
-      created >= occ.windowStart &&
-      (occ.windowEnd === undefined || created < occ.windowEnd)
-    );
+    // Publication time does not identify the call: an older call's insights
+    // can arrive late. Without correlation, use this occurrence's transcript.
+    return correlations.has(ins.contentCorrelationId) || calls.has(ins.callId);
   });
 }
 

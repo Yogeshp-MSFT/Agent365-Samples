@@ -79,6 +79,14 @@ export interface PendingCapture {
 
   // Fetched artifacts
   transcriptId?: string;
+  /** Every transcript segment belonging to this occurrence, including fetched bodies. */
+  transcriptSegments?: {
+    transcriptId: string;
+    createdDateTime?: string;
+    callId?: string;
+    contentCorrelationId?: string;
+    content?: string;
+  }[];
   transcriptFetchedAt?: number;
   /** Correlation ids of the selected transcript — used to accept only the
    *  Copilot insights that belong to this same occurrence. */
@@ -130,6 +138,7 @@ const store = new PersistentMap<PendingCapture>({
     return {
       ...c,
       transcriptContent: undefined,
+      transcriptSegments: c.transcriptSegments?.map(({ content: _content, ...segment }) => segment),
       insightsActionItems: undefined,
       insightsMeetingNotes: undefined,
     };
@@ -148,7 +157,8 @@ export function getCapture(eventId: string): PendingCapture | undefined {
  *  later occurrence of a recurring meeting from re-processing it. */
 export function isTranscriptClaimed(transcriptId: string, exceptEventId: string): boolean {
   for (const c of store.values()) {
-    if (c.eventId !== exceptEventId && c.transcriptId === transcriptId) return true;
+    if (c.eventId !== exceptEventId &&
+        (c.transcriptId === transcriptId || c.transcriptSegments?.some((s) => s.transcriptId === transcriptId))) return true;
   }
   return false;
 }
@@ -248,6 +258,7 @@ export function rescheduleCapture(
     c.attempts = 0;
     c.processingFailures = 0;
     c.transcriptId = undefined;
+    c.transcriptSegments = undefined;
     c.transcriptFetchedAt = undefined;
     c.insightsFetched = false;
     result = 'reopened';
@@ -287,6 +298,7 @@ export function reopenRevokedCapture(
   c.processingFailures = 0;
   c.nextCheckAt = Date.now();
   c.transcriptId = undefined;
+  c.transcriptSegments = undefined;
   c.transcriptFetchedAt = undefined;
   c.transcriptCallId = undefined;
   c.transcriptCorrelationId = undefined;
@@ -305,6 +317,7 @@ export function markCaptureComplete(eventId: string): void {
   const c = store.get(eventId);
   if (!c) return;
   c.status = 'complete';
+  c.transcriptSegments = c.transcriptSegments?.map(({ content: _content, ...segment }) => segment);
   c.extractedItems = undefined;
   // Strip fat fields — the transcript has already been fed to the LLM.
   // Keeping them in memory serves no purpose and the serializeTransform
@@ -319,6 +332,7 @@ export function markCaptureGaveUp(eventId: string): void {
   const c = store.get(eventId);
   if (!c) return;
   c.status = 'gave-up';
+  c.transcriptSegments = c.transcriptSegments?.map(({ content: _content, ...segment }) => segment);
   c.transcriptContent = undefined;
   c.insightsActionItems = undefined;
   c.insightsMeetingNotes = undefined;

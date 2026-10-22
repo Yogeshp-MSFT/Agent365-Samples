@@ -48,6 +48,22 @@ function loadConfiguredServers(): ResolvedWorkIqServerConfig[] {
   });
 }
 
+/** Reuse manifest, per-audience token, and request context for direct calls. */
+export async function getWorkIqConnection(
+  serverName: string,
+  authorization: Authorization,
+  authHandlerName: string,
+  context: TurnContext
+): Promise<{ url: string; headers: Record<string, string> }> {
+  const server = loadConfiguredServers().find((s) => s.mcpServerName === serverName);
+  if (!server) throw new Error(`WorkIQ server ${serverName} is not configured`);
+  const token = await getServerToken(server, authorization, authHandlerName, context);
+  return {
+    url: server.url,
+    headers: { ...server.headers, ...Utility.GetToolRequestHeaders(token, context, { orchestratorName: 'OpenAI' }) },
+  };
+}
+
 export function resolveWorkIqTokenScope(server: WorkIqServerConfig): string {
   if (!server.audience) return SHARED_MCP_SCOPE;
   return server.scope

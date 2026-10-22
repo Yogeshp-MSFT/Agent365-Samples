@@ -324,7 +324,7 @@ interface ListAttendeesArgs {
   chatId: string;
 }
 
-function createListMeetingAttendeesTool(opts: PeopleToolOptions) {
+function createListMeetingAttendeesTool(opts: PeopleToolOptions, allowedChatId: string) {
   return tool({
     name: 'graph_list_meeting_attendees',
     description:
@@ -348,6 +348,9 @@ function createListMeetingAttendeesTool(opts: PeopleToolOptions) {
       const args = (rawArgs ?? {}) as ListAttendeesArgs;
       try {
         if (!args.chatId) return toolError('graph_list_meeting_attendees', 'chatId is required');
+        if (args.chatId !== allowedChatId) {
+          return toolError('graph_list_meeting_attendees', 'Only the server-selected capture meeting chat may be read.');
+        }
         const token = await acquireGraphToken(opts);
         const res = await axios.get(
           `${GRAPH_BASE}/chats/${encodeURIComponent(args.chatId)}/members`,
@@ -433,6 +436,9 @@ function createFindUserTool(opts: PeopleToolOptions) {
 }
 
 // ─── Public factory ────────────────────────────────────────────────────────
-export function createPeopleTools(opts: PeopleToolOptions) {
-  return [createListMeetingAttendeesTool(opts), createFindUserTool(opts)];
+export function createPeopleTools(opts: PeopleToolOptions, captureChatId?: string) {
+  return [
+    ...(captureChatId ? [createListMeetingAttendeesTool(opts, captureChatId)] : []),
+    createFindUserTool(opts),
+  ];
 }

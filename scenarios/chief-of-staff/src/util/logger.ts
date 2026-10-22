@@ -31,7 +31,31 @@ function stamp(): string {
 function fmt(scope: string, level: Level, msg: string): string {
   const tag =
     level === 'debug' ? 'DEBUG ' : level === 'trace' ? 'TRACE ' : '';
-  return `${stamp()} [${scope}] ${tag}${msg}`;
+  return `${stamp()} [${scope}] ${tag}${redactLogText(msg)}`;
+}
+
+/** Provider errors can echo request URLs, ids, and content. Log metadata only. */
+export function errorSummary(error: unknown): { status?: number; code?: string; name: string } {
+  const e = error as { name?: unknown; code?: unknown; response?: { status?: unknown; data?: { error?: { code?: unknown } } } } | null;
+  const status = e?.response?.status;
+  const code = e?.response?.data?.error?.code ?? e?.code;
+  return {
+    ...(typeof status === 'number' ? { status } : {}),
+    ...(typeof code === 'string' && /^[A-Za-z_][A-Za-z0-9_.-]{0,60}$/.test(code) ? { code } : {}),
+    name: typeof e?.name === 'string' && /^[A-Za-z]{1,40}$/.test(e.name) ? e.name : 'OperationError',
+  };
+}
+
+export function providerError(error: unknown): string {
+  // Literal strings here are repository validation messages, not provider bodies.
+  return typeof error === 'string' ? redactLogText(error) : JSON.stringify(errorSummary(error));
+}
+
+export function redactLogText(text: string): string {
+  return text
+    .replace(/https?:\/\/[^\s"'<>]+/gi, '[url]')
+    .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi, (s) => `${s.slice(0, 8)}…`)
+    .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, '[address]');
 }
 
 /** Redact obvious secrets from a value before printing. */
@@ -39,15 +63,17 @@ function safe(meta: unknown): unknown {
   if (!meta) return '';
   try {
     const json = JSON.stringify(meta, (k, v) => {
+      if (['body', 'stack', 'request', 'response', 'config'].includes(k)) return '[omitted]';
+      if (v instanceof Error || (k === 'error' && v != null)) return errorSummary(v);
       if (typeof k === 'string' && /token|secret|password|api[-_]?key|authorization/i.test(k)) {
         return typeof v === 'string' && v.length > 8 ? `${v.slice(0, 4)}…redacted` : '<redacted>';
       }
-      return v;
+      return typeof v === 'string' ? redactLogText(v) : v;
     });
     // Trim very large payloads so a debug log doesn't scroll a terminal into orbit.
     return json.length > 4000 ? json.slice(0, 4000) + '…[truncated]' : json;
   } catch {
-    return String(meta);
+    return '[unserializable metadata]';
   }
 }
 

@@ -95,6 +95,10 @@ function pendingAsCompletedTasks(): CompletedTask[] {
 // POLL_TASKS_MS) — that is a real completion and must notify. Tasks that
 // already existed at seed time stay suppressed.
 const pollerMeta = new PersistentMap<number>({ file: 'planner-poller-meta.json' });
+// Begin watching immediately, not only after the first successful poll.
+// Pre-existing completed tasks remain suppressed; tasks created while the
+// initial Graph request is failing still generate completion notifications.
+const watchingSince = pollerMeta.get('seededAt') ?? Date.now();
 
 // Seeded before (even for a plan that was empty then) → compare normally.
 let firstPollDone = lastProgress.size > 0 || pollerMeta.get('seededAt') !== undefined;
@@ -135,11 +139,11 @@ export async function pollForCompletedTasks(opts: {
       const curr = typeof t.percentComplete === 'number' ? t.percentComplete : 0;
       // Fire on a witnessed transition to 100, or on a task created after the
       // baseline was seeded that is already complete when first seen.
-      const seededAt = pollerMeta.get('seededAt');
+      const seededAt = pollerMeta.get('seededAt') ?? watchingSince;
       const created = t.createdDateTime ? Date.parse(t.createdDateTime) : NaN;
       const newSinceSeed =
         prev === undefined && seededAt !== undefined && Number.isFinite(created) && created >= seededAt;
-      if (firstPollDone && curr === 100 && ((prev !== undefined && prev < 100) || newSinceSeed)) {
+      if (curr === 100 && ((firstPollDone && prev !== undefined && prev < 100) || newSinceSeed)) {
         completedNow.push(t.id);
         if (!pendingCompletions.has(t.id)) {
           pendingCompletions.set(t.id, { planId: t.planId, detectedAt: Date.now(), attempts: 0, delivered: [] });
@@ -157,7 +161,7 @@ export async function pollForCompletedTasks(opts: {
     }
     if (!firstPollDone) {
       firstPollDone = true;
-      pollerMeta.set('seededAt', Date.now());
+      pollerMeta.set('seededAt', watchingSince);
       console.log(
         `[plannerPoller] baseline seeded with ${lastProgress.size} tasks — future completions will fire runTaskComplete.`
       );

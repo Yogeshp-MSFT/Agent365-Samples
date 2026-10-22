@@ -43,11 +43,21 @@ A running Node service on your dev machine (or Azure App Service) that:
 | **Recall / chit-chat** — the leader asks "where are we on X?" and gets a status answer, restricted to leadership team members (Teams chat **and** email) | LLM turn with `planner_list_tasks` + `mcp_CalendarTools` |
 
 Everything is deterministic **except** capture extraction (LLM parses the
-transcript), recall/chit-chat, and the blocker card's `book_meeting` handler,
-which uses the LLM only as the transport to `mcp_CalendarTools` (start/end,
-attendees, and subject are fixed in TypeScript). Every other card verb —
-approve/reject, reassign, defer, escalate — sends its DMs deterministically.
-All routing, dedup, date math, and Planner writes are TypeScript.
+transcript) and recall/chit-chat. Booking and meeting-summary posts call
+WorkIQ directly with code-bound recipients, timestamps, and text. They require
+an actual event/message ID in the tool result; model text such as `OK` is not
+a success signal. All routing, dedup, date math, and Planner writes are TypeScript.
+
+`npm test` builds the sample and runs offline regression tests with mocked
+Graph/MCP responses; CI runs the same command on Node 20 and 22. No tenant
+credentials are required. Direct WorkIQ writes require a catalog schema that
+can bind all approved fields; unsupported or ambiguous schemas fail before
+making a write. Verify live tool compatibility in the target tenant before
+relying on booking or summary delivery.
+
+Due days from chat, capture, and extension requests use `BRIEF_DISPLAY_TZ`
+and are stored at 17:00 local. Date-only input (`YYYY-MM-DD`) is preferred;
+legacy UTC-midnight values are treated as that same civil due day.
 
 ---
 
@@ -512,7 +522,7 @@ POST /planner/tasks   × N
   - **I'm blocked** → agent proposes 3 slots (10:00 / 14:00 / 16:00 in
     `BRIEF_DISPLAY_TZ`) and DMs the leader a meeting picker. Leader clicks a
     slot → agent books the calendar invite first; only when the booking
-    returns `OK` does it close the check-in and DM the owner that the meeting
+    returns a created event ID does it close the check-in and DM the owner that the meeting
     is scheduled. A failed booking leaves the check-in open, tells the owner
     nothing was booked, and lets the leader pick another slot. Only one
     booking runs at a time per card, so clicking a second slot while the
