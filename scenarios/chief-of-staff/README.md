@@ -43,13 +43,12 @@ A running Node service on your dev machine (or Azure App Service) that:
 | **Recall / chit-chat** — the leader asks "where are we on X?" and gets a status answer, restricted to leadership team members (Teams chat **and** email) | LLM turn with `planner_list_tasks` + `mcp_CalendarTools` |
 
 Everything is deterministic **except** capture extraction (LLM parses the
-transcript), recall/chit-chat, and free-text unblock. Card booking and meeting-summary posts call
-WorkIQ directly with code-bound recipients, timestamps, and text. They require
+transcript), recall/chit-chat, and free-text unblock. Card booking and
+meeting-summary posts call WorkIQ directly with code-bound recipients,
+timestamps, and text. They require
 an actual event/message ID in the tool result; model text such as `OK` is not
-a success signal. A free-text DM can still book through the conversational client's MCP tools. All routing, dedup, date math, and Planner writes are TypeScript.
-WorkIQ directly with code-bound recipients, timestamps, and text. They require
-an actual event/message ID in the tool result; model text such as `OK` is not
-a success signal. All routing, dedup, date math, and Planner writes are TypeScript.
+a success signal. A free-text DM can still book through the conversational
+client's MCP tools. All routing, dedup, date math, and Planner writes are TypeScript.
 
 `npm test` builds the sample and runs offline regression tests with mocked
 Graph/MCP responses; CI runs the same command on Node 20 and 22. No tenant
@@ -61,6 +60,9 @@ relying on booking or summary delivery.
 Due days from chat, capture, and extension requests use `BRIEF_DISPLAY_TZ`
 and are stored at 17:00 local. Date-only input (`YYYY-MM-DD`) is preferred;
 legacy UTC-midnight values are treated as that same civil due day.
+This legacy conversion happens only at the conversational tool boundary;
+capture checkpoints already hold resolved instants and pass them unchanged
+to Planner and the assignment card.
 
 ---
 

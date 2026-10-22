@@ -19,6 +19,7 @@ import { acquireAppOnlyGraphToken } from '../graph/graphAppToken';
 import { getPlannerTaskDetails } from '../graph/plannerTools';
 import { sendPlainDmToUser } from '../cards/followupCards';
 import { cancelOutstandingRequestsForTask } from '../state/followupStore';
+import { providerError } from '../util/logger';
 
 export interface TaskCompletePayload {
   taskId?: string;
@@ -48,7 +49,7 @@ async function resolveDisplayName(token: string, aad: string): Promise<string | 
     const name = (res.data?.displayName ?? '').toString().trim();
     return name || null;
   } catch (err) {
-    console.warn(`[taskComplete] resolveDisplayName failed for aad=${aad.slice(0, 8)}…:`, (err as Error)?.message);
+    console.warn(`[taskComplete] resolveDisplayName failed for aad=${aad.slice(0, 8)}…:`, providerError(err));
     return null;
   }
 }
@@ -143,7 +144,7 @@ export async function runTaskComplete(
     try {
       leaderAad = (await client.resolveUpnToAad(process.env.LEADER_UPN)) || '';
     } catch (err) {
-      console.warn('[taskComplete] LEADER_UPN lookup threw:', (err as Error)?.message ?? err);
+      console.warn('[taskComplete] LEADER_UPN lookup threw:', providerError(err));
     }
   }
   if (!leaderAad) {

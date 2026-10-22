@@ -151,7 +151,15 @@ export async function createPlannerTaskDirect(input: CreatePlannerTaskInput): Pr
     }
     const body: Record<string, unknown> = { planId: plan.planId, bucketId: bucket.bucketId, title: input.title.trim() };
     if (Object.keys(assignments).length > 0) body.assignments = assignments;
-    if (input.dueDateTime) body.dueDateTime = normalizeDueDate(input.dueDateTime);
+    if (input.dueDateTime) {
+      // Direct callers (capture) already resolved the civil due day. Midnight
+      // UTC may be 17:00 local, so interpreting it as another civil day would
+      // shift the deadline twice. Only the conversational tool normalizes.
+      if (!/T.*(?:Z|[+-]\d{2}:\d{2})$/.test(input.dueDateTime) || !Number.isFinite(Date.parse(input.dueDateTime))) {
+        return { ok: false, error: 'Direct task creation requires a timezone-qualified due-date instant.' };
+      }
+      body.dueDateTime = new Date(input.dueDateTime).toISOString();
+    }
     if (typeof input.priority === 'number') body.priority = input.priority;
 
     const res = await axios.post(`${GRAPH_BASE}/planner/tasks`, body, {
@@ -347,7 +355,15 @@ function createCreateTaskTool(_opts: PlannerToolOptions) {
     } as any,
     execute: async (rawArgs: unknown) => {
       const args = (rawArgs ?? {}) as CreateTaskArgs;
-      const r = await createPlannerTaskDirect(args);
+      let r: CreatePlannerTaskResult;
+      try {
+        r = await createPlannerTaskDirect({
+          ...args,
+          dueDateTime: args.dueDateTime ? normalizeDueDate(args.dueDateTime) : args.dueDateTime,
+        });
+      } catch (error) {
+        return toolError('planner_create_task', error);
+      }
       if (r.ok) return JSON.stringify(r);
       if (r.taskId) {
         // The task exists; only the description failed. Report it so the

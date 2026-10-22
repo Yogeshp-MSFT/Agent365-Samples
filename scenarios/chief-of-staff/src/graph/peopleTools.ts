@@ -20,6 +20,7 @@ import axios from 'axios';
 import { tool } from '@openai/agents';
 import { Authorization, TurnContext } from '@microsoft/agents-hosting';
 import { acquireAppOnlyGraphToken } from './graphAppToken';
+import { providerError } from '../util/logger';
 
 const GRAPH_BASE = 'https://graph.microsoft.com/v1.0';
 
@@ -56,7 +57,7 @@ export async function resolveUpnToAad(
     const e = err as any;
     console.warn(
       `[resolveUpnToAad] Failed to resolve a UPN (${key.length} chars):`,
-      e?.response?.data ?? e?.message ?? String(e)
+      providerError(err)
     );
     return null;
   }
@@ -88,7 +89,7 @@ export async function resolveAadToUpn(
     const e = err as any;
     console.warn(
       `[resolveAadToUpn] Failed to resolve aad=${key.slice(0, 8)}…:`,
-      e?.response?.data ?? e?.message ?? String(e)
+      providerError(err)
     );
     return null;
   }
@@ -188,7 +189,7 @@ async function resolveTeamIdentifier(
         const e = err as any;
         console.warn(
           `[resolveTeamIdentifier] group scan failed:`,
-          e?.response?.data ?? e?.message ?? String(e)
+          providerError(err)
         );
         return undefined;
       }
@@ -226,7 +227,7 @@ async function resolveTeamIdentifier(
     const e = err as any;
     console.warn(
       `[resolveTeamIdentifier] displayName lookup failed:`,
-      e?.response?.data ?? e?.message ?? String(e)
+      providerError(err)
     );
     return undefined;
   }
@@ -289,7 +290,7 @@ export async function isUserInTeam(
     const e = err as any;
     console.warn(
       `[isUserInTeam] membership lookup failed — denying access:`,
-      e?.response?.data ?? e?.message ?? String(e)
+      providerError(err)
     );
     return false;
   }
@@ -308,7 +309,7 @@ export { acquireGraphToken };
 
 function toolError(name: string, err: unknown): string {
   const e = err as any;
-  const msg = e?.response?.data ?? e?.message ?? String(e);
+  const msg = providerError(err);
   console.error(`[peopleTools] ${name} failed:`, msg);
   return JSON.stringify({ ok: false, tool: name, error: msg });
 }

@@ -21,6 +21,7 @@ import { Authorization, TurnContext } from '@microsoft/agents-hosting';
 import { acquireGraphToken } from './peopleTools';
 import { PersistentMap } from '../state/persistentMap';
 import { getPlannerPlanId } from './plannerConfig';
+import { providerError } from '../util/logger';
 
 const GRAPH_BASE = 'https://graph.microsoft.com/v1.0';
 
@@ -171,7 +172,7 @@ export async function pollForCompletedTasks(opts: {
     return pendingAsCompletedTasks();
   } catch (err) {
     const e = err as any;
-    console.warn('[plannerPoller] failed:', e?.response?.data ?? e?.message ?? String(e));
+    console.warn('[plannerPoller] failed:', providerError(err));
     // Still retry undelivered notifications from earlier polls.
     return pendingAsCompletedTasks();
   }

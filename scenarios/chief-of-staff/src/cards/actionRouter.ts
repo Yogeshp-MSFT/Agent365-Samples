@@ -319,7 +319,7 @@ export function isAffirmativeCompletion(rawText: string): boolean {
   const negation =
     /\b(not|never|no longer|nothing|yet to|still working|still in progress|not yet|cannot|can't|won't|isn't|aren't|wasn't|weren't|haven't|hasn't|hadn't|didn't|doesn't|don't)\b|n't\b/;
   if (negation.test(text)) return false;
-  if (/\b(half|part(?:ly|ially)?|some|portion|percent|per cent|except|remaining|remainder|mostly|almost|nearly|only|but)\b|%|\b\d+\s*\/\s*\d+\b/i.test(text)) return false;
+  if (/\b(half|thirds?|quarters?|fraction|part(?:ly|ially)?|some|portion|percent|per cent|except|remaining|remainder|mostly|almost|nearly|only|but)\b|%|\b\d+\s*\/\s*\d+\b/i.test(text)) return false;
   const nonFactual =
     /\b(will|shall|going to|gonna|plan(?:ning)? to|about to|need to|needs to|have to|has to|want to|wants to|wanted|trying to|try to|hope|hopes|hoped|hoping|wish|wishes|wished|if only|should|would|could|might|may|maybe|perhaps|probably|possibly|apparently|supposedly|ideally|supposed to|meant to|expect|expects|expected|assume|assumed|think|thought|believe|guess|imagine|pretend|almost|nearly|soon|later|tomorrow|next week|once|after|before|until|unless|if|when|whether)\b|'ll\b|'d\b/;
   if (nonFactual.test(text)) return false;
@@ -340,11 +340,25 @@ export function isAffirmativeCompletion(rawText: string): boolean {
   if (request.test(text)) return false;
 
   const done = '(done|complete|completed|finished|closed|wrapped up)';
+  if (text.includes('TASK')) {
+    // With an explicit title, accept only a statement about that entire
+    // object. "I finished the introduction to TASK" must not complete TASK.
+    const target = '(?:the\\s+|my\\s+|our\\s+)?(?:task\\s+)?TASK';
+    const end = '[.!]*$';
+    return [
+      new RegExp(`^${target}\\s+(is|was|has been|got)\\s+(now\\s+|already\\s+|fully\\s+)?${done}${end}`, 'i'),
+      new RegExp(`^(i|we)('ve|\\s+have|\\s+had)?\\s+(just\\s+|already\\s+|now\\s+|finally\\s+)?(completed|finished|done|wrapped up|closed)\\s+${target}${end}`, 'i'),
+      new RegExp(`^(i'm|im|i am|we're|we are)\\s+(all\\s+|now\\s+)?done\\s+with\\s+${target}${end}`, 'i'),
+      new RegExp(`^${done}\\s+(?:with\\s+)?${target}${end}`, 'i'),
+    ].some((re) => re.test(text));
+  }
   const statements = [
     new RegExp(`^(task\\s+|all\\s+)?(done|complete|completed|finished)\\b`),
-    new RegExp(`\\b(i'm|im|i am|we're|we are)\\s+(all\\s+|now\\s+)?done\\b`),
-    new RegExp(`\\b(i|we)('ve|\\s+have|\\s+had)?\\s+(just\\s+|already\\s+|now\\s+|finally\\s+)?(completed|finished|done|wrapped up|closed)\\b`),
-    new RegExp(`\\b(is|are|was|were|has been|have been|got)\\s+(now\\s+|already\\s+|fully\\s+|all\\s+)?${done}\\b`),
+    new RegExp(`^(i'm|im|i am|we're|we are)\\s+(all\\s+|now\\s+)?done\\b`),
+    new RegExp(`^(i|we)('ve|\\s+have|\\s+had)?\\s+(just\\s+|already\\s+|now\\s+|finally\\s+)?(completed|finished|done|wrapped up|closed)\\b`),
+    // A subject reporting the whole task, not an arbitrary clause ending in
+    // "is done" ("one third of TASK is done", "the first section ...").
+    new RegExp(`^(?:(?:the|my|our|this|that)\\s+)?(?:task(?:\\s+task)?|work|assignment|it|everything|all tasks)\\s+(is|are|was|were|has been|have been|got)\\s+(now\\s+|already\\s+|fully\\s+|all\\s+)?${done}[.!]*$`, 'i'),
   ];
   return statements.some((re) => re.test(text));
 }

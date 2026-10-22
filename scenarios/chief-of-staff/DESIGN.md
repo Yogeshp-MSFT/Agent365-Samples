@@ -370,6 +370,14 @@ Things to note:
   and combined in creation order. Capture waits until the meeting has ended
   and every selected segment body is readable. Segment IDs are persisted so
   other occurrences cannot claim them.
+- Artifact reacquisition is independent of extraction: a reopened capture
+  with a checkpoint but no transcript ID fetches its artifacts again, then
+  resumes the saved writes. If a segment remains unreadable at the capture
+  deadline, the capture is abandoned even when correlated insights exist;
+  it cannot stay pending indefinitely.
+- Civil deadlines are normalized once. The conversational task tool converts
+  date-only/legacy UTC-midnight inputs; the deterministic creation helper
+  treats capture deadlines as timezone-qualified instants and preserves them.
 - When `hasInsights=false` (no Copilot license or empty response) the LLM
   extracts from the raw VTT — with the same output contract. That's the path
   demo tenants without a Copilot license end up on, and it produces the same

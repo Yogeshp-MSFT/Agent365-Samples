@@ -22,6 +22,7 @@ import { Authorization, CloudAdapter, TurnContext } from '@microsoft/agents-host
 import { getBotAppId, sendCardProactively } from './proactiveSend';
 import { hasConversationRef } from '../state/conversationRefs';
 import { DISPLAY_TZ } from '../util/time';
+import { providerError } from '../util/logger';
 
 export interface BriefToolOptions {
   authorization: Authorization;
@@ -488,7 +489,7 @@ export function createBriefCardTool(opts: BriefToolOptions) {
         });
       } catch (err) {
         const e = err as any;
-        const msg = e?.response?.data ?? e?.message ?? String(e);
+        const msg = providerError(err);
         console.error('[send_brief_card] failed:', msg);
         return JSON.stringify({
           ok: false,
@@ -500,4 +501,3 @@ export function createBriefCardTool(opts: BriefToolOptions) {
     },
   });
 }
-

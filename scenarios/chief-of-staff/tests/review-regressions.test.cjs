@@ -59,13 +59,25 @@ test('civil deadlines and legacy UTC-midnight chat dates agree in the display zo
   const { createPlannerTaskDirect } = require('../dist/graph/plannerTools');
   const r = await createPlannerTaskDirect({ title: 'Review', dueDateTime: '2026-10-23T00:00:00Z' });
   assert.equal(r.ok, true);
-  assert.equal(body.dueDateTime, '2026-10-24T00:00:00.000Z');
+  assert.equal(body.dueDateTime, '2026-10-23T00:00:00.000Z', 'direct inputs are already instants');
+  await createPlannerTaskDirect({ title: 'Review', dueDateTime: '2026-10-24T00:00:00.000Z' });
+  assert.equal(body.dueDateTime, '2026-10-24T00:00:00.000Z', '17:00 PDT must not be normalized twice');
+  const createTool = require('../dist/graph/plannerTools').createPlannerTools({}).find((tool) => tool.name === 'planner_create_task');
+  const result = JSON.parse(await createTool.invoke({}, JSON.stringify({
+    title: 'Chat task', description: null, planId: null, bucketId: null,
+    assigneeAadIds: null, dueDateTime: '2026-10-23T00:00:00Z', priority: null,
+  })));
+  assert.equal(result.ok, true);
+  assert.equal(body.dueDateTime, '2026-10-24T00:00:00.000Z', 'legacy conversion happens at the chat tool boundary');
 });
 
 test('partial completion, denial, and questions never count as whole-task completion', () => {
   for (const text of ['Only half of "Submit budget" is done.', '50% of "Submit budget" is done',
     'Part of "Submit budget" is complete', '"Submit budget" is done except the appendix',
-    'It is false that "Submit budget" is done.', 'Please check whether "Submit budget" is done.']) {
+    'It is false that "Submit budget" is done.', 'Please check whether "Submit budget" is done.',
+    'One third of "Submit budget" is done.', 'The first section of "Submit budget" is done.',
+    'I finished two thirds of "Submit budget".', 'I finished one eighth of "Submit budget".',
+    'I completed the introduction to "Submit budget".']) {
     assert.equal(router.isAffirmativeCompletion(text), false, text);
   }
   for (const text of ['done "QA"', 'The task "Some partial results" is done', "I've finished the task"]) {
@@ -346,5 +358,132 @@ test('capture waits for every segment body and emits their combined content', as
     assert.ok(captures.isTranscriptClaimed('seg-b', 'other-event'));
   } finally {
     for (const [k, v] of Object.entries(settings)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+  }
+});
+
+test('fresh extraction sends the same once-normalized deadline to Planner and assignment cards', async (t) => {
+  const cards = require('../dist/cards/followupCards');
+  const id = 'once-normalized-capture';
+  captures.createPendingCapture({
+    eventId: id, meetingId: 'meeting', subject: 'Meeting', ownerUpn: 'leader@example.com',
+    endTime: Date.now(), durationMinutes: 30, waitBudgetMinutes: 5, giveUpAfter: Date.now() + 3600000,
+  });
+  t.mock.method(clients, 'getClient', async () => ({ invokeAgentWithScope: async () => JSON.stringify({ items: [
+    { kind: 'task', title: 'Dated task', ownerAad: ctx.leaderAad, ownerName: 'Leader', description: null, dueDateTime: '2099-10-23' },
+    { kind: 'task', title: 'Default due task', ownerAad: ctx.leaderAad, ownerName: 'Leader', description: null, dueDateTime: null },
+  ] }) }));
+  const bodies = [], assignments = [];
+  t.mock.method(axios, 'post', async (_url, body) => {
+    bodies.push(body);
+    return { data: { id: `new-${bodies.length}`, title: body.title, bucketId: body.bucketId } };
+  });
+  t.mock.method(cards, 'sendTaskAssignmentCardDirect', async (_opts, args) => { assignments.push(args); return { ok: true }; });
+  await runCapture({ eventId: id, meetingId: 'meeting', transcriptId: 'transcript', transcriptContent: 'WEBVTT' }, {}, {}, {
+    getPeopleOpts: () => ({ authorization: {}, context: {}, authHandlerName: 'agentic' }),
+  });
+  assert.equal(bodies[0].dueDateTime, '2099-10-24T00:00:00.000Z');
+  assert.deepEqual(bodies.map((body) => body.dueDateTime), assignments.map((card) => card.dueDate));
+  assert.deepEqual(bodies.map((body) => body.dueDateTime), captures.getCapture(id).extractedItems.map((item) => item.dueDateTime));
+  assert.equal(times.formatDisplayDate(bodies[0].dueDateTime, { month: 'short', day: 'numeric' }), times.formatDisplayDate('2099-10-23T17:00:00-07:00', { month: 'short', day: 'numeric' }));
+  captures.markCaptureComplete(id);
+});
+
+test('a revoked checkpoint reacquires artifacts and resumes without duplicating completed work', async (t) => {
+  const watcher = require('../dist/graph/meetingWatcher');
+  const { pollForNewTranscripts } = require('../dist/graph/transcriptPoller');
+  const saved = { LEADER_UPN: process.env.LEADER_UPN, COS_AGENT_UPN: process.env.COS_AGENT_UPN, CAPTURE_GRAPH_OWNER: process.env.CAPTURE_GRAPH_OWNER };
+  Object.assign(process.env, { LEADER_UPN: 'leader@example.com', COS_AGENT_UPN: 'agent@example.com', CAPTURE_GRAPH_OWNER: 'leader', CAPTURE_MIN_ATTEMPTS_TRANSCRIPT_ONLY: '1' });
+  const id = 'reopened-checkpoint-artifacts', now = Date.now();
+  const timing = { startTime: now - 3600000, endTime: now - 1800000, durationMinutes: 30, waitBudgetMinutes: 5, giveUpAfter: now + 3600000 };
+  captures.createPendingCapture({ eventId: id, meetingId: 'reopened-meeting', subject: 'Meeting', ownerUpn: 'leader@example.com', ...timing });
+  const checkpoint = [{ itemId: 'i1', kind: 'task', title: 'Existing task', ownerAad: ctx.leaderAad, ownerName: 'Leader', taskId: 'preserved-task', cardSent: true, descriptionSaved: true }];
+  captures.updateCapture(id, { extractedItems: checkpoint, transcriptId: 'old-transcript' });
+  captures.markCaptureRevoked(id);
+  assert.equal(captures.reopenRevokedCapture(id, timing), true);
+  assert.equal(captures.getCapture(id).transcriptId, undefined);
+  t.mock.method(watcher, 'discoverQualifyingMeetings', async () => []);
+  t.mock.method(watcher, 'checkEventParticipation', async () => 'qualified');
+  let lists = 0, writes = 0;
+  t.mock.method(insights, 'fetchTranscriptsForMeeting', async () => {
+    lists++;
+    return [{ transcriptId: 'reacquired-transcript', createdDateTime: new Date(timing.startTime + 5000).toISOString() }];
+  });
+  t.mock.method(insights, 'fetchTranscriptContent', async () => 'WEBVTT\nreacquired');
+  t.mock.method(insights, 'fetchAiInsightsForMeeting', async () => ({ available: false, unsupported: true }));
+  t.mock.method(axios, 'post', async () => { writes++; throw new Error('must not duplicate'); });
+  try {
+    const ready = (await pollForNewTranscripts({ authorization: {}, context: {}, authHandlerName: 'agentic' })).find((r) => r.eventId === id);
+    assert.ok(ready);
+    assert.equal(ready.transcriptId, 'reacquired-transcript');
+    assert.equal(lists, 1);
+    assert.equal(captures.getCapture(id).extractedItems[0].taskId, 'preserved-task');
+    await runCapture(ready, {}, {}, { getPeopleOpts: () => ({ authorization: {}, context: {}, authHandlerName: 'agentic' }) });
+    assert.equal(writes, 0);
+    captures.markCaptureComplete(id);
+  } finally {
+    for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+  }
+});
+
+test('an unreadable segment reaches its deadline even when usable correlated insights exist', async (t) => {
+  const watcher = require('../dist/graph/meetingWatcher');
+  const { pollForNewTranscripts } = require('../dist/graph/transcriptPoller');
+  const saved = { LEADER_UPN: process.env.LEADER_UPN, COS_AGENT_UPN: process.env.COS_AGENT_UPN, CAPTURE_GRAPH_OWNER: process.env.CAPTURE_GRAPH_OWNER };
+  Object.assign(process.env, { LEADER_UPN: 'leader@example.com', COS_AGENT_UPN: 'agent@example.com', CAPTURE_GRAPH_OWNER: 'leader' });
+  const id = 'expired-partial-segments', now = Date.now();
+  captures.createPendingCapture({
+    eventId: id, meetingId: 'expired-meeting', subject: 'Meeting', ownerUpn: 'leader@example.com',
+    startTime: now - 7200000, endTime: now - 3600000, durationMinutes: 60, waitBudgetMinutes: 5, giveUpAfter: now - 1,
+    transcriptId: 'readable-first-segment', transcriptSegments: [
+      { transcriptId: 'readable-first-segment', content: 'WEBVTT' }, { transcriptId: 'unreadable-second-segment' },
+    ], insightsFetched: true, insightsActionItems: [{ title: 'Correlated action item' }],
+  });
+  t.mock.method(watcher, 'discoverQualifyingMeetings', async () => []);
+  t.mock.method(watcher, 'checkEventParticipation', async () => 'qualified');
+  let fetches = 0;
+  t.mock.method(insights, 'fetchTranscriptContent', async () => { fetches++; return undefined; });
+  try {
+    const ready = await pollForNewTranscripts({ authorization: {}, context: {}, authHandlerName: 'agentic' });
+    assert.ok(!ready.some((r) => r.eventId === id));
+    assert.equal(captures.getCapture(id).status, 'gave-up');
+    assert.equal(fetches, 0);
+    assert.equal(captures.findCapturesDueForCheck().some((c) => c.eventId === id), false);
+  } finally {
+    for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+  }
+});
+
+test('people lookup, polling, and brief delivery errors log metadata, not provider content', async (t) => {
+  const privateId = '44444444-5555-6666-7777-888888888888';
+  const error = Object.assign(new Error(`private-person@example.com ${privateId} CONFIDENTIAL_PROVIDER_BODY`), {
+    response: { status: 503, data: { error: { code: 'Unavailable', message: `CONFIDENTIAL_PROVIDER_BODY ${privateId}` } } },
+  });
+  const output = [];
+  t.mock.method(console, 'warn', (...args) => output.push(JSON.stringify(args)));
+  t.mock.method(console, 'error', (...args) => output.push(JSON.stringify(args)));
+  t.mock.method(axios, 'get', async () => { throw error; });
+  const opts = { authorization: {}, context: {}, authHandlerName: 'agentic' };
+  assert.equal(await people.resolveUpnToAad('private-person@example.com', opts), null);
+  assert.equal(await people.resolveAadToUpn(privateId, opts), null);
+  await require('../dist/graph/plannerPoller').pollForCompletedTasks(opts);
+  const refs = require('../dist/state/conversationRefs');
+  refs.rememberConversationRef({
+    from: { aadObjectId: 'brief-log-recipient' }, recipient: { id: 'bot' },
+    conversation: { id: 'personal-brief', conversationType: 'personal' },
+    serviceUrl: 'https://example.test', channelId: 'msteams',
+  });
+  const { createBriefCardTool } = require('../dist/cards/briefTool');
+  const tool = createBriefCardTool({
+    ...opts, context: { adapter: { continueConversation: async () => { throw error; } } },
+  });
+  const result = JSON.parse(await tool.invoke({}, JSON.stringify({
+    leaderAadObjectId: 'brief-log-recipient', headline: 'Brief', priorities: ['Priority'], watchList: [], calendar: [],
+  })));
+  assert.equal(result.ok, false);
+  const logged = output.join('\n');
+  assert.ok(logged.includes('503') && logged.includes('Unavailable'));
+  for (const content of [privateId, 'private-person@example.com', 'CONFIDENTIAL_PROVIDER_BODY']) {
+    assert.ok(!logged.includes(content), logged);
+    assert.ok(!JSON.stringify(result).includes(content));
   }
 });

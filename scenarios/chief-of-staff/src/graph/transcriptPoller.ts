@@ -313,7 +313,12 @@ async function advanceCapture(
   const hasReadableContent = (c: PendingCapture) =>
     !!c.transcriptContent ||
     (c.insightsActionItems?.length ?? 0) + (c.insightsMeetingNotes?.length ?? 0) > 0;
-  if (now > cap.giveUpAfter && !hasReadableContent(cap)) {
+  const hasCompleteArtifacts = (c: PendingCapture) =>
+    !!c.transcriptId && hasReadableContent(c) &&
+    (c.transcriptSegments?.length
+      ? c.transcriptSegments.every((s) => !!s.content?.trim())
+      : !!c.transcriptContent?.trim());
+  if (now > cap.giveUpAfter && !hasCompleteArtifacts(cap)) {
     log.warn(
       'capturePoller',
       `giving up on ${eventRef(cap.eventId)} — no ${cap.transcriptId ? 'readable transcript content' : 'transcript'} after ${(
@@ -331,7 +336,7 @@ async function advanceCapture(
   //    other capture has already consumed.
   // Re-list while collecting artifacts: stopping/restarting transcription
   // creates multiple records on the same meeting occurrence.
-  if (!cap.extractedItems) {
+  if (!cap.extractedItems || !cap.transcriptId) {
     const transcripts = await fetchTranscriptsForMeeting(
       opts,
       cap.ownerUpn,
@@ -439,10 +444,8 @@ async function advanceCapture(
   // Copilot insights must carry usable items. Otherwise keep retrying the
   // artifact fetch (bounded by giveUpAfter above).
   const ready =
-    !!cap.transcriptId &&
+    hasCompleteArtifacts(cap) &&
     now >= cap.endTime &&
-    (!cap.transcriptSegments || cap.transcriptSegments.every((s) => !!s.content?.trim())) &&
-    hasReadableContent(cap) &&
     (cap.insightsFetched || waitBudgetExhausted || transcriptSufficient);
 
   if (ready) {

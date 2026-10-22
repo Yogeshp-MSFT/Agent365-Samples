@@ -30,6 +30,7 @@ import type { Activity, ConversationReference } from '@microsoft/agents-activity
 
 import { getClient, Client } from './client';
 import { runWithObservabilityContext } from './observability';
+import { providerError } from './util/logger';
 import { runBrief } from './cos/brief';
 import { runFollowup } from './cos/followup';
 import { runCapture } from './cos/capture';
@@ -174,7 +175,7 @@ export function startScheduler(deps: SchedulerDeps): void {
           fireInAuthedContext(deps, 'brief', async (ctx, state, client) => {
             await runBrief({}, ctx, state, client);
           }),
-        errorHandler: (err) => console.error('[scheduler] brief cron error:', err),
+        errorHandler: (err) => console.error('[scheduler] brief cron error:', providerError(err)),
       })
     );
   } else {
@@ -193,7 +194,7 @@ export function startScheduler(deps: SchedulerDeps): void {
           await retryUndeliveredLeaderRequests(deps, ctx);
           await sweepStaleFollowupsAndEscalate(deps, ctx, client);
         }),
-      errorHandler: (err) => console.error('[scheduler] followup cron error:', err),
+      errorHandler: (err) => console.error('[scheduler] followup cron error:', providerError(err)),
     })
   );
 
@@ -244,7 +245,7 @@ export function startScheduler(deps: SchedulerDeps): void {
                 `[scheduler] runCapture(${t.transcriptId.slice(0, 8)}…) failed — ${
                   next === 'retry' ? 'kept READY for retry' : 'giving up after repeated failures'
                 }:`,
-                err
+                providerError(err)
               );
             }
           }
@@ -285,7 +286,7 @@ export function startScheduler(deps: SchedulerDeps): void {
               acknowledgeCompletion(t.taskId, outcome);
             } catch (err) {
               acknowledgeCompletion(t.taskId, { complete: false, delivered: [] });
-              console.error(`[scheduler] runTaskComplete(${t.taskId.slice(0, 8)}…) failed — will retry:`, err);
+              console.error(`[scheduler] runTaskComplete(${t.taskId.slice(0, 8)}…) failed — will retry:`, providerError(err));
             }
           }
         });
@@ -318,7 +319,7 @@ async function retryUndeliveredLeaderRequests(deps: SchedulerDeps, ctx: TurnCont
     }
     await retryPendingLeaderDeliveries(opts, leaderAad);
   } catch (err) {
-    console.error('[scheduler] leader-delivery retry failed:', (err as Error)?.message ?? err);
+    console.error('[scheduler] leader-delivery retry failed:', providerError(err));
   }
 }
 
@@ -350,7 +351,7 @@ async function sweepStaleFollowupsAndEscalate(
     });
     leaderAad = resolved ?? undefined;
   } catch (err) {
-    console.error('[scheduler] escalation aborted — could not resolve LEADER_UPN:', err);
+    console.error('[scheduler] escalation aborted — could not resolve LEADER_UPN:', providerError(err));
     return;
   }
   if (!leaderAad) {
@@ -385,7 +386,7 @@ async function sweepStaleFollowupsAndEscalate(
     } catch (err) {
       console.warn(
         `[scheduler] pre-escalation Planner check failed for task=${f.taskId.slice(0, 8)}… — will escalate anyway:`,
-        (err as Error)?.message ?? err
+        providerError(err)
       );
     }
 
@@ -454,6 +455,6 @@ async function fireInAuthedContext(
       );
     });
   } catch (err) {
-    console.error(`[scheduler] ${name} error:`, err);
+    console.error(`[scheduler] ${name} error:`, providerError(err));
   }
 }
