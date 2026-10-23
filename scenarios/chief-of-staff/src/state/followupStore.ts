@@ -34,6 +34,10 @@ export interface PendingFollowup {
   extendedTo?: string; // ISO — new due date if extension approved
   /** Due date proposed to the leader for approval. Authoritative for approval. */
   extensionRequestedTo?: string;
+  /** Live Planner deadline observed when this extension was proposed
+   *  (`null` = the task had no due date). Approval only applies while
+   *  Planner still shows this value. */
+  extensionRequestedFrom?: string | null;
   extensionStatus?: 'pending' | 'approved' | 'rejected' | 'cancelled';
   /** Owner request (extension / blocker) that still has to reach the leader.
    *  Written BEFORE the send and cleared only after delivery, so a failed
@@ -43,7 +47,8 @@ export interface PendingFollowup {
 
 export interface PendingLeaderDelivery {
   kind: 'extension' | 'blocker';
-  suggestedNewDueDate?: string; // extension
+  // Extension proposals are computed from the live Planner due date at
+  // delivery time, so nothing date-related is queued here.
   blockerSummary?: string; // blocker
   queuedAt: number;
   attempts: number;
@@ -115,10 +120,15 @@ export function findOpenFollowupForOwnerTask(
 }
 
 /** Record that an extension to `dueIso` was proposed to the leader. */
-export function recordExtensionRequest(followupId: string, dueIso: string): void {
+export function recordExtensionRequest(
+  followupId: string,
+  dueIso: string,
+  baseDueIso: string | null
+): void {
   const f = store.get(followupId);
   if (!f) return;
   f.extensionRequestedTo = dueIso;
+  f.extensionRequestedFrom = baseDueIso;
   f.extensionStatus = 'pending';
   store.set(followupId, f);
 }
@@ -164,7 +174,7 @@ export function findPendingLeaderDeliveries(): PendingFollowup[] {
 
 export function setExtensionStatus(
   followupId: string,
-  status: 'pending' | 'approved' | 'rejected'
+  status: 'pending' | 'approved' | 'rejected' | 'cancelled'
 ): void {
   const f = store.get(followupId);
   if (!f) return;

@@ -31,6 +31,7 @@ import {
   recordExtensionRequest,
 } from '../state/followupStore';
 import { getBotAppId, sendCardProactively } from './proactiveSend';
+import { getPlannerTaskDetails, isTaskInAllowedPlan } from '../graph/plannerTools';
 import { hasConversationRef } from '../state/conversationRefs';
 
 export interface CardToolOptions {
@@ -340,15 +341,19 @@ function buildExtensionRequestCard(args: ExtensionRequestArgs): object {
     version: '1.5',
     body,
     actions: [
+      // baseDueDate binds the decision to the deadline this proposal was
+      // computed from ('' = the task had no due date).
       actionButton('Approve new date', 'approve_extend', {
         followupId: args.followupId,
         taskId: args.taskId,
         newDueDate: args.suggestedNewDueDate,
+        baseDueDate: args.currentDueDate ?? '',
       }),
       actionButton('Reject', 'reject_extend', {
         followupId: args.followupId,
         taskId: args.taskId,
         newDueDate: args.suggestedNewDueDate,
+        baseDueDate: args.currentDueDate ?? '',
       }),
       actionButton('Reassign', 'reassign', {
         followupId: args.followupId,
@@ -401,12 +406,30 @@ export function createExtensionRequestTool(opts: CardToolOptions) {
         );
       }
       try {
+        // The current deadline comes from Planner, never from the model: the
+        // proposal is bound to it and approval is refused if it changes.
+        const live = await getPlannerTaskDetails(args.taskId);
+        if (!live.ok || !(await isTaskInAllowedPlan(live.planId))) {
+          return toolFail(
+            'send_extension_request_card',
+            'could not verify the task in the leadership plan',
+            'Check the taskId; extension requests are limited to tasks in the leadership plan.'
+          );
+        }
+        args.currentDueDate = live.dueDateTime;
         // Conversational input only: normalize before both rendering and
         // persistence. Deterministic owner requests already hold an instant.
         args.suggestedNewDueDate = normalizeDueDate(args.suggestedNewDueDate);
+        if (live.dueDateTime && !(Date.parse(args.suggestedNewDueDate) > Date.parse(live.dueDateTime))) {
+          return toolFail(
+            'send_extension_request_card',
+            'proposed date is not later than the current Planner due date',
+            `The task is currently due ${live.dueDateTime}; propose a later date.`
+          );
+        }
         const card = buildExtensionRequestCard(args);
         const { conversationId } = await sendCardToUser(opts, args.leaderAadObjectId, card, 'extension-request');
-        recordExtensionRequest(args.followupId, args.suggestedNewDueDate);
+        recordExtensionRequest(args.followupId, args.suggestedNewDueDate, live.dueDateTime);
         return JSON.stringify({ ok: true, conversationId });
       } catch (err) {
         return toolFail('send_extension_request_card', err);
@@ -618,7 +641,7 @@ function buildEscalationCard(args: EscalationArgs): object {
       },
       {
         type: 'TextBlock',
-        text: 'Pick an action — or reply `reassign` / `extend` / `escalate`.',
+        text: 'Pick an action below.',
         wrap: true,
         isSubtle: true,
         spacing: 'Medium',

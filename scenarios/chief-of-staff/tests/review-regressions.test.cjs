@@ -200,7 +200,7 @@ test('late-published historical insights are never matched using their publicati
 
 test('typed approval validates the resolved request plan before PATCH', async (t) => {
   const request = followups.createFollowup({ taskId: 'private-task', taskTitle: 'Private', ownerAad: 'owner', ownerName: 'Owner' });
-  followups.recordExtensionRequest(request.followupId, '2099-01-01T00:00:00Z');
+  followups.recordExtensionRequest(request.followupId, '2099-01-01T00:00:00Z', null);
   t.mock.method(axios, 'get', async () => ({ data: { planId: 'other-plan', title: 'Private', assignments: {}, percentComplete: 0 } }));
   let patches = 0;
   t.mock.method(axios, 'patch', async () => { patches++; return { data: {} }; });
@@ -496,8 +496,8 @@ test('people lookup, polling, and brief delivery errors log metadata, not provid
 test('old extension cards cannot approve or reject a replacement proposal', async (t) => {
   const record = followups.createFollowup({ taskId: 'proposal-task', taskTitle: 'Task', ownerAad: 'owner', ownerName: 'Owner' });
   const oldDate = times.normalizeDueDate('2099-11-02'), currentDate = times.normalizeDueDate('2099-11-03');
-  followups.recordExtensionRequest(record.followupId, oldDate);
-  followups.recordExtensionRequest(record.followupId, currentDate);
+  followups.recordExtensionRequest(record.followupId, oldDate, null);
+  followups.recordExtensionRequest(record.followupId, currentDate, null);
   t.mock.method(axios, 'get', async () => ({ data: { '@odata.etag': 'current-etag', planId: 'allowed-plan', assignments: {}, title: 'Task' } }));
   const patches = [];
   t.mock.method(axios, 'patch', async (_url, body) => { patches.push(body); return { data: {} }; });
@@ -537,6 +537,8 @@ test('conversational extension day renders and writes once at 17:00 local', asyn
     }) },
   } };
   const record = followups.createFollowup({ taskId: 'date-extension', taskTitle: 'Task', ownerAad: 'owner', ownerName: 'Owner' });
+  // The tool reads the live Planner task (no due date here) before sending.
+  t.mock.method(axios, 'get', async () => ({ data: { '@odata.etag': 'date-etag', planId: 'allowed-plan', title: 'Task' } }));
   const cards = require('../dist/cards/followupCards');
   const tool = cards.createExtensionRequestTool(opts);
   const result = JSON.parse(await tool.invoke({}, JSON.stringify({
@@ -550,19 +552,21 @@ test('conversational extension day renders and writes once at 17:00 local', asyn
   const card = delivered[0].attachments[0].content;
   assert.equal(card.actions.find((a) => a.data.verb === 'approve_extend').data.newDueDate, expected);
   assert.equal(card.actions.find((a) => a.data.verb === 'reject_extend').data.newDueDate, expected);
+  assert.equal(card.actions.find((a) => a.data.verb === 'approve_extend').data.baseDueDate, '');
+  assert.equal(followups.getFollowup(record.followupId).extensionRequestedFrom, null);
   let patched;
-  t.mock.method(axios, 'get', async () => ({ data: { '@odata.etag': 'date-etag', planId: 'allowed-plan', title: 'Task' } }));
   t.mock.method(axios, 'patch', async (_url, body) => { patched = body; return { data: {} }; });
   await router.handleCardActionIfAny({
     activity: { id: 'date-extension-approve', from: { aadObjectId: ctx.leaderAad },
-      value: { verb: 'approve_extend', followupId: record.followupId, newDueDate: expected } },
+      value: { verb: 'approve_extend', followupId: record.followupId, newDueDate: expected, baseDueDate: '' } },
     sendActivity: async () => {},
   }, { getPeopleOpts: () => opts }, ctx.leaderAad);
   assert.equal(patched.dueDateTime, expected);
   // Bare days remain supported at the deterministic writer; resolved instants
   // are preserved, including local 17:00 falling on UTC midnight.
   const planner = require('../dist/graph/plannerTools');
-  await planner.updatePlannerTaskDueDate(record.taskId, '2026-10-23');
+  patched = undefined;
+  await planner.updatePlannerTaskDueDate(record.taskId, '2026-10-23', null);
   assert.equal(patched.dueDateTime, expected);
 });
 
@@ -658,4 +662,237 @@ test('environment template declares the runtime-instance override separately fro
   assert.match(template, /^agent365Observability__agentInstanceId=$/m);
   assert.match(template, /^agent365Observability__agentId=$/m);
   assert.ok(template.indexOf('agent365Observability__agentInstanceId=') < template.indexOf('# NOTE: agent365Observability__agentId'));
+});
+
+// ── PR #333 review: extension proposals bound to the live Planner deadline ──
+const LIVE_SNAPSHOT_DUE = '2099-10-24T00:00:00.000Z'; // check-in snapshot
+const LIVE_MOVED_DUE = '2099-11-14T01:00:00.000Z'; // deadline moved later in Planner
+const peopleOptsClient = { getPeopleOpts: () => ({ authorization: {}, context: {}, authHandlerName: 'agentic' }) };
+
+test('owner extension request is computed from the live Planner due date, not the check-in snapshot', async (t) => {
+  const cards = require('../dist/cards/followupCards');
+  const planner = require('../dist/graph/plannerTools');
+  const record = followups.createFollowup({
+    taskId: 'live-due-task', taskTitle: 'Live task', ownerAad: 'owner-live', ownerName: 'Owner', dueDate: LIVE_SNAPSHOT_DUE,
+  });
+  t.mock.method(planner, 'getPlannerTaskDetails', async () => ({
+    ok: true, title: 'Live task', planId: 'allowed-plan', assigneeAads: ['owner-live'], percentComplete: 0, dueDateTime: LIVE_MOVED_DUE,
+  }));
+  const sent = [];
+  t.mock.method(cards, 'sendExtensionRequestCardDirect', async (_opts, args) => { sent.push(args); return { ok: true }; });
+  const messages = [];
+  await router.handleCardActionIfAny({
+    activity: { id: 'live-due-extend', from: { aadObjectId: 'owner-live', name: 'Owner' },
+      value: { verb: 'extend', followupId: record.followupId, taskId: record.taskId } },
+    sendActivity: async (s) => messages.push(s),
+  }, peopleOptsClient, ctx.leaderAad);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].currentDueDate, LIVE_MOVED_DUE);
+  const expected = router.computeNextDueDateIso(LIVE_MOVED_DUE);
+  assert.equal(sent[0].suggestedNewDueDate, expected);
+  assert.ok(Date.parse(expected) > Date.parse(LIVE_MOVED_DUE), 'proposal never shortens the live deadline');
+  const stored = followups.getFollowup(record.followupId);
+  assert.equal(stored.extensionRequestedTo, expected);
+  assert.equal(stored.extensionRequestedFrom, LIVE_MOVED_DUE);
+  assert.equal(stored.extensionStatus, 'pending');
+  followups.setExtensionStatus(record.followupId, 'rejected');
+});
+
+test('approval is cancelled without a PATCH when the Planner deadline changed after the proposal', async (t) => {
+  const cards = require('../dist/cards/followupCards');
+  const record = followups.createFollowup({ taskId: 'moved-before-approval', taskTitle: 'Moved', ownerAad: 'owner-moved', ownerName: 'Owner' });
+  const proposal = router.computeNextDueDateIso(LIVE_SNAPSHOT_DUE);
+  followups.recordExtensionRequest(record.followupId, proposal, LIVE_SNAPSHOT_DUE);
+  t.mock.method(axios, 'get', async () => ({ data: {
+    '@odata.etag': 'moved-etag', planId: 'allowed-plan', title: 'Moved', assignments: {}, percentComplete: 0, dueDateTime: LIVE_MOVED_DUE,
+  } }));
+  let patches = 0;
+  t.mock.method(axios, 'patch', async () => { patches++; return { data: {} }; });
+  const dms = [];
+  t.mock.method(cards, 'sendPlainDmToUser', async (_opts, _aad, text) => { dms.push(text); return { ok: true }; });
+  const messages = [];
+  await router.handleCardActionIfAny({
+    activity: { id: 'moved-approve', from: { aadObjectId: ctx.leaderAad },
+      value: { verb: 'approve_extend', followupId: record.followupId, taskId: record.taskId, newDueDate: proposal, baseDueDate: LIVE_SNAPSHOT_DUE } },
+    sendActivity: async (s) => messages.push(s),
+  }, peopleOptsClient, ctx.leaderAad);
+  assert.equal(patches, 0);
+  assert.equal(followups.getFollowup(record.followupId).extensionStatus, 'cancelled');
+  assert.ok(messages.some((m) => m.includes('changed after this proposal')), messages.join('\n'));
+  assert.ok(dms.some((m) => m.includes('no longer applies')));
+});
+
+test('a card whose baseline deadline differs from the stored proposal is treated as superseded', async (t) => {
+  const record = followups.createFollowup({ taskId: 'baseline-mismatch', taskTitle: 'Baseline', ownerAad: 'owner-base', ownerName: 'Owner' });
+  const proposal = router.computeNextDueDateIso(LIVE_MOVED_DUE);
+  followups.recordExtensionRequest(record.followupId, proposal, LIVE_MOVED_DUE);
+  t.mock.method(axios, 'get', async () => ({ data: { '@odata.etag': 'e', planId: 'allowed-plan', title: 'Baseline', assignments: {}, dueDateTime: LIVE_MOVED_DUE } }));
+  let patches = 0;
+  t.mock.method(axios, 'patch', async () => { patches++; return { data: {} }; });
+  const messages = [];
+  await router.handleCardActionIfAny({
+    activity: { id: 'baseline-mismatch-approve', from: { aadObjectId: ctx.leaderAad },
+      value: { verb: 'approve_extend', followupId: record.followupId, taskId: record.taskId, newDueDate: proposal, baseDueDate: LIVE_SNAPSHOT_DUE } },
+    sendActivity: async (s) => messages.push(s),
+  }, peopleOptsClient, ctx.leaderAad);
+  assert.equal(patches, 0);
+  assert.ok(messages.some((m) => m.includes('superseded')));
+  assert.equal(followups.getFollowup(record.followupId).extensionStatus, 'pending');
+  followups.setExtensionStatus(record.followupId, 'rejected');
+});
+
+test('an ETag conflict during approval cancels the proposal instead of reporting a retryable failure', async (t) => {
+  const cards = require('../dist/cards/followupCards');
+  const record = followups.createFollowup({ taskId: 'etag-conflict', taskTitle: 'Conflict', ownerAad: 'owner-412', ownerName: 'Owner' });
+  const proposal = router.computeNextDueDateIso(LIVE_MOVED_DUE);
+  followups.recordExtensionRequest(record.followupId, proposal, LIVE_MOVED_DUE);
+  t.mock.method(axios, 'get', async () => ({ data: {
+    '@odata.etag': 'stale-etag', planId: 'allowed-plan', title: 'Conflict', assignments: {}, percentComplete: 0, dueDateTime: LIVE_MOVED_DUE,
+  } }));
+  t.mock.method(axios, 'patch', async () => { throw Object.assign(new Error('Precondition Failed'), { response: { status: 412 } }); });
+  const dms = [];
+  t.mock.method(cards, 'sendPlainDmToUser', async (_opts, _aad, text) => { dms.push(text); return { ok: true }; });
+  const messages = [];
+  await router.handleCardActionIfAny({
+    activity: { id: 'etag-conflict-approve', from: { aadObjectId: ctx.leaderAad },
+      value: { verb: 'approve_extend', followupId: record.followupId, taskId: record.taskId, newDueDate: proposal, baseDueDate: LIVE_MOVED_DUE } },
+    sendActivity: async (s) => messages.push(s),
+  }, peopleOptsClient, ctx.leaderAad);
+  assert.equal(followups.getFollowup(record.followupId).extensionStatus, 'cancelled');
+  assert.ok(messages.some((m) => m.includes('changed during approval')), messages.join('\n'));
+  assert.ok(!dms.some((m) => m.includes('not yet synced')));
+});
+
+test('an approval that already reached Planner is recorded as approved without another PATCH', async (t) => {
+  const cards = require('../dist/cards/followupCards');
+  const record = followups.createFollowup({ taskId: 'already-applied', taskTitle: 'Applied', ownerAad: 'owner-applied', ownerName: 'Owner' });
+  const proposal = router.computeNextDueDateIso(LIVE_MOVED_DUE);
+  followups.recordExtensionRequest(record.followupId, proposal, LIVE_MOVED_DUE);
+  t.mock.method(axios, 'get', async () => ({ data: {
+    '@odata.etag': 'e', planId: 'allowed-plan', title: 'Applied', assignments: {}, percentComplete: 0, dueDateTime: proposal,
+  } }));
+  let patches = 0;
+  t.mock.method(axios, 'patch', async () => { patches++; return { data: {} }; });
+  t.mock.method(cards, 'sendPlainDmToUser', async () => ({ ok: true }));
+  await router.handleCardActionIfAny({
+    activity: { id: 'already-applied-approve', from: { aadObjectId: ctx.leaderAad },
+      value: { verb: 'approve_extend', followupId: record.followupId, taskId: record.taskId, newDueDate: proposal, baseDueDate: LIVE_MOVED_DUE } },
+    sendActivity: async () => {},
+  }, peopleOptsClient, ctx.leaderAad);
+  assert.equal(patches, 0);
+  assert.equal(followups.getFollowup(record.followupId).extensionStatus, 'approved');
+});
+
+test('the conversational extension tool uses the live deadline and rejects proposals that shorten it', async (t) => {
+  const cards = require('../dist/cards/followupCards');
+  const record = followups.createFollowup({ taskId: 'tool-live', taskTitle: 'Tool', ownerAad: 'owner-tool', ownerName: 'Owner', dueDate: LIVE_SNAPSHOT_DUE });
+  t.mock.method(axios, 'get', async () => ({ data: { '@odata.etag': 'e', planId: 'allowed-plan', title: 'Tool', dueDateTime: LIVE_MOVED_DUE } }));
+  const tool = cards.createExtensionRequestTool({ authorization: {}, context: {}, authHandlerName: 'agentic' });
+  const result = JSON.parse(await tool.invoke({}, JSON.stringify({
+    leaderAadObjectId: ctx.leaderAad, followupId: record.followupId, taskId: record.taskId,
+    taskTitle: 'Tool', ownerName: 'Owner', currentDueDate: LIVE_SNAPSHOT_DUE, agentRationale: null,
+    suggestedNewDueDate: '2099-11-02',
+  })));
+  assert.equal(result.ok, false);
+  assert.match(result.error, /not later than the current Planner due date/);
+  assert.equal(followups.getFollowup(record.followupId).extensionStatus, undefined);
+});
+
+test('an old escalation card cannot revive a cancelled extension', async (t) => {
+  const planner = require('../dist/graph/plannerTools');
+  const cards = require('../dist/cards/followupCards');
+  const record = followups.createFollowup({ taskId: 'revive-cancelled', taskTitle: 'Revive', ownerAad: 'owner-revive', ownerName: 'Owner' });
+  followups.recordExtensionRequest(record.followupId, router.computeNextDueDateIso(LIVE_MOVED_DUE), LIVE_MOVED_DUE);
+  followups.cancelOutstandingRequestsForTask(record.taskId);
+  t.mock.method(planner, 'getPlannerTaskDetails', async () => ({
+    ok: true, title: 'Revive', planId: 'allowed-plan', assigneeAads: ['owner-revive'], percentComplete: 0, dueDateTime: LIVE_MOVED_DUE,
+  }));
+  let sends = 0;
+  t.mock.method(cards, 'sendExtensionRequestCardDirect', async () => { sends++; return { ok: true }; });
+  await router.handleCardActionIfAny({
+    activity: { id: 'revive-esc-extend', from: { aadObjectId: ctx.leaderAad },
+      value: { verb: 'esc_extend', followupId: record.followupId, taskId: record.taskId } },
+    sendActivity: async () => {},
+  }, peopleOptsClient, ctx.leaderAad);
+  assert.equal(sends, 0);
+  assert.equal(followups.getFollowup(record.followupId).extensionStatus, 'cancelled');
+});
+
+// ── PR #333 review: deleted tasks never escalate ──
+test('a task deleted in Planner closes its requests and is never escalated', async (t) => {
+  const scheduler = require('../dist/scheduler');
+  const cards = require('../dist/cards/followupCards');
+  const planner = require('../dist/graph/plannerTools');
+  const deps = { authorization: {}, authHandlerName: 'agentic', adapter: {} };
+  const f = followups.createFollowup({ taskId: 'deleted-task', taskTitle: 'Deleted', ownerAad: 'owner-deleted', ownerName: 'Owner' });
+  t.mock.method(followups, 'findStaleForEscalation', () => [f]);
+  t.mock.method(people, 'resolveUpnToAad', async () => ctx.leaderAad);
+  t.mock.method(planner, 'getPlannerTaskDetails', async () => ({ ok: false, error: 'Not Found', notFound: true }));
+  let sends = 0;
+  t.mock.method(cards, 'sendEscalationCardDirect', async () => { sends++; return { ok: true }; });
+  await scheduler.sweepStaleFollowupsAndEscalate(deps, {}, {});
+  assert.equal(sends, 0);
+  assert.equal(followups.getFollowup(f.followupId).status, 'resolved');
+  assert.equal(followups.getFollowup(f.followupId).escalatedAt, undefined);
+});
+
+// ── PR #333 review: overlapping follow-up cron ticks ──
+test('a follow-up tick that fires while the previous run is in flight is skipped', async () => {
+  const { singleFlight } = require('../dist/scheduler');
+  let runs = 0;
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  // The first run pauses (like a slow owner-name lookup) while a second tick fires.
+  const tick = singleFlight('follow-up', async () => { runs++; await gate; });
+  const first = tick();
+  await tick();
+  assert.equal(runs, 1, 'overlapping tick must not start a second run');
+  release();
+  await first;
+  await tick();
+  assert.equal(runs, 2, 'the next tick after completion runs normally');
+});
+
+// ── PR #333 review: transcript wait budget starts at the first fetch ──
+test('re-listing the same transcript keeps the first fetch time, so the wait budget can expire', async (t) => {
+  const watcher = require('../dist/graph/meetingWatcher');
+  const { pollForNewTranscripts } = require('../dist/graph/transcriptPoller');
+  const saved = {
+    LEADER_UPN: process.env.LEADER_UPN, COS_AGENT_UPN: process.env.COS_AGENT_UPN,
+    CAPTURE_GRAPH_OWNER: process.env.CAPTURE_GRAPH_OWNER, CAPTURE_MIN_ATTEMPTS_TRANSCRIPT_ONLY: process.env.CAPTURE_MIN_ATTEMPTS_TRANSCRIPT_ONLY,
+  };
+  Object.assign(process.env, {
+    LEADER_UPN: 'leader@example.com', COS_AGENT_UPN: 'agent@example.com', CAPTURE_GRAPH_OWNER: 'leader',
+    CAPTURE_MIN_ATTEMPTS_TRANSCRIPT_ONLY: '10',
+  });
+  const id = 'fetch-time-preserved', now = Date.now();
+  const firstFetch = now - 10 * 60 * 1000; // 10 min ago; budget is 3 min
+  const start = now - 20 * 60 * 1000, end = now - 14 * 60 * 1000;
+  captures.createPendingCapture({
+    eventId: id, meetingId: 'fetch-time-meeting', subject: 'Meeting', ownerUpn: 'leader@example.com',
+    startTime: start, endTime: end, durationMinutes: 6, waitBudgetMinutes: 3, giveUpAfter: now + 3600000,
+    transcriptId: 'fetch-time-transcript', transcriptFetchedAt: firstFetch,
+    transcriptSegments: [{ transcriptId: 'fetch-time-transcript', content: 'WEBVTT\nhello' }],
+  });
+  t.mock.method(watcher, 'discoverQualifyingMeetings', async () => []);
+  t.mock.method(watcher, 'checkEventParticipation', async () => 'qualified');
+  t.mock.method(insights, 'fetchTranscriptsForMeeting', async () => [
+    { transcriptId: 'fetch-time-transcript', createdDateTime: new Date(start + 5000).toISOString() },
+  ]);
+  t.mock.method(insights, 'fetchTranscriptContent', async () => 'WEBVTT\nhello');
+  t.mock.method(insights, 'fetchAiInsightsForMeeting', async () => ({ available: false, unsupported: false }));
+  try {
+    const ready = await pollForNewTranscripts({ authorization: {}, context: {}, authHandlerName: 'agentic' });
+    assert.equal(captures.getCapture(id).transcriptFetchedAt, firstFetch, 're-list must not reset the first fetch time');
+    assert.ok(ready.some((r) => r.eventId === id), 'budget measured from the first fetch has expired, so the capture is ready');
+    captures.markCaptureComplete(id);
+  } finally {
+    for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+  }
+});
+
+// ── PR #333 review: observability export is opt-in ──
+test('environment template keeps observability export disabled by default', () => {
+  const template = fs.readFileSync(path.join(__dirname, '..', '.env.template'), 'utf8');
+  assert.match(template, /^ENABLE_A365_OBSERVABILITY_EXPORTER=false$/m);
 });

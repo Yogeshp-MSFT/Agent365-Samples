@@ -51,14 +51,16 @@ export interface Client {
 }
 
 // ─── Observability ─────────────────────────────────────────────────────────
-// Exporter activation is asserted in code rather than left to
-// ENABLE_A365_OBSERVABILITY_EXPORTER alone — a missing env var otherwise
-// disables telemetry silently. The env var can still force it off.
+// Export is opt-in: only ENABLE_A365_OBSERVABILITY_EXPORTER=true|1|yes|on
+// enables it. A missing or other value keeps spans in-process (local and
+// Playground runs never export by accident).
 const observabilityConfigProvider = new DefaultConfigurationProvider(
   () =>
     new ObservabilityConfiguration({
       isObservabilityExporterEnabled: () =>
-        process.env.ENABLE_A365_OBSERVABILITY_EXPORTER?.trim().toLowerCase() !== 'false',
+        ['true', '1', 'yes', 'on'].includes(
+          process.env.ENABLE_A365_OBSERVABILITY_EXPORTER?.trim().toLowerCase() ?? ''
+        ),
     })
 );
 

@@ -31,6 +31,21 @@ import { providerError } from '../util/logger';
 
 const GRAPH_BASE = 'https://graph.microsoft.com/v1.0';
 
+/**
+ * True when two Planner due dates name the same instant. `null` means "no due
+ * date"; `undefined` means "unknown" and never matches, so callers fail closed.
+ */
+export function samePlannerDueDate(
+  a: string | null | undefined,
+  b: string | null | undefined
+): boolean {
+  if (a === undefined || b === undefined) return false;
+  if (a === null || b === null) return a === b;
+  const aMs = Date.parse(a);
+  const bMs = Date.parse(b);
+  return Number.isFinite(aMs) && Number.isFinite(bMs) && aMs === bMs;
+}
+
 export interface PlannerToolOptions {
   // Kept for API compat with client.ts wiring; unused for auth now that
   // Graph calls go through the standalone worker.
@@ -461,8 +476,12 @@ export async function acknowledgePlannerTask(
 // concurrent edits.
 export async function updatePlannerTaskDueDate(
   taskId: string,
-  newDueIso: string
-): Promise<{ ok: true; previousDue?: string; newDue: string } | { ok: false; error: string }> {
+  newDueIso: string,
+  expectedPreviousDueDate: string | null
+): Promise<
+  | { ok: true; previousDue?: string | null; newDue: string }
+  | { ok: false; error: string; conflict?: boolean; currentDue?: string | null }
+> {
   try {
     if (!taskId) return { ok: false, error: 'taskId is empty' };
     if (!newDueIso) return { ok: false, error: 'newDueIso is empty' };
@@ -482,9 +501,19 @@ export async function updatePlannerTaskDueDate(
       `${GRAPH_BASE}/planner/tasks/${encodeURIComponent(taskId)}`,
       { headers: { Authorization: `Bearer ${token}` } }
     );
+    const previousDue: string | null = getRes.data?.dueDateTime ?? null;
+    // The proposal was computed from this deadline. If someone moved it since,
+    // writing the proposal could shorten the live deadline — refuse instead.
+    if (!samePlannerDueDate(previousDue, expectedPreviousDueDate)) {
+      return {
+        ok: false,
+        conflict: true,
+        currentDue: previousDue,
+        error: 'The Planner due date changed after the extension was proposed.',
+      };
+    }
     const etag = getRes.data['@odata.etag'];
     if (!etag) return { ok: false, error: 'Planner task response missing @odata.etag' };
-    const previousDue: string | undefined = getRes.data.dueDateTime;
 
     // PATCH only the dueDateTime.
     await axios.patch(
@@ -503,6 +532,14 @@ export async function updatePlannerTaskDueDate(
     );
     return { ok: true, previousDue, newDue: dueIso };
   } catch (err) {
+    // 412: the task changed between our GET and PATCH (ETag mismatch).
+    if ((err as any)?.response?.status === 412) {
+      return {
+        ok: false,
+        conflict: true,
+        error: 'The Planner task changed during the update. No change was applied.',
+      };
+    }
     const msg = providerError(err);
     console.error(`[plannerTools] updatePlannerTaskDueDate failed for task=${taskId.slice(0, 8)}…:`, msg);
     return { ok: false, error: typeof msg === 'string' ? msg : JSON.stringify(msg) };
@@ -607,7 +644,14 @@ export async function setPlannerTaskDescription(
 export async function getPlannerTaskDetails(
   taskId: string
 ): Promise<
-  | { ok: true; title: string; assigneeAads: string[]; percentComplete: number; planId: string }
+  | {
+      ok: true;
+      title: string;
+      assigneeAads: string[];
+      percentComplete: number;
+      planId: string;
+      dueDateTime: string | null;
+    }
   | { ok: false; error: string; notFound: boolean }
 > {
   try {
@@ -621,7 +665,14 @@ export async function getPlannerTaskDetails(
     const assignments = (res.data?.assignments ?? {}) as Record<string, unknown>;
     const assigneeAads = Object.keys(assignments);
     const pct = Number(res.data?.percentComplete ?? 0);
-    return { ok: true, title, assigneeAads, percentComplete: pct, planId: String(res.data?.planId ?? '') };
+    return {
+      ok: true,
+      title,
+      assigneeAads,
+      percentComplete: pct,
+      planId: String(res.data?.planId ?? ''),
+      dueDateTime: res.data?.dueDateTime ?? null,
+    };
   } catch (err) {
     const msg = providerError(err);
     // Only a 404 proves the task is gone; throttling, 5xx, and transport

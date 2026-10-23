@@ -37,7 +37,13 @@ import { runCapture } from './cos/capture';
 import { runTaskComplete } from './cos/taskComplete';
 import { pollForNewTranscripts } from './graph/transcriptPoller';
 import { acknowledgeCompletion, pollForCompletedTasks } from './graph/plannerPoller';
-import { findStaleForEscalation, getFollowup, markEscalated, markResolved } from './state/followupStore';
+import {
+  cancelOutstandingRequestsForTask,
+  findStaleForEscalation,
+  getFollowup,
+  markEscalated,
+  markResolved,
+} from './state/followupStore';
 import { markCaptureComplete, markCaptureProcessingFailed } from './state/pendingCaptureStore';
 import { lookupConversationRef } from './state/conversationRefs';
 import { PersistentMap } from './state/persistentMap';
@@ -183,17 +189,22 @@ export function startScheduler(deps: SchedulerDeps): void {
   }
 
   // ── Cron: Follow-up (+ deterministic stale-follow-up escalation sweep) ──
+  // Guard against overlap: with a short CRON_FOLLOWUP (e.g. every minute) a
+  // slow run can still be in flight at the next tick. Two concurrent runs can
+  // both pass the per-task duplicate check and create two check-ins for the
+  // same task (and later a false no-reply escalation). Skip the tick instead.
   scheduledTasks.push(
     CronJob.from({
       cronTime: FOLLOWUP_CRON,
       start: true,
       timeZone: CRON_TIMEZONE,
-      onTick: () =>
+      onTick: singleFlight('follow-up', () =>
         fireInAuthedContext(deps, 'followup', async (ctx, state, client) => {
           await runFollowup({}, ctx, state, client);
           await retryUndeliveredLeaderRequests(deps, ctx);
           await sweepStaleFollowupsAndEscalate(deps, ctx, client);
-        }),
+        })
+      ),
       errorHandler: (err) => console.error('[scheduler] followup cron error:', providerError(err)),
     })
   );
@@ -367,6 +378,15 @@ export async function sweepStaleFollowupsAndEscalate(
     // followup instead of DMing the leader with a stale "no reply" card.
     try {
       const details = await getPlannerTaskDetails(f.taskId);
+      // Planner confirmed the task was deleted: close every outstanding
+      // request for it and never send a no-reply escalation.
+      if (!details.ok && details.notFound) {
+        const closed = cancelOutstandingRequestsForTask(f.taskId);
+        console.log(
+          `[scheduler] skip escalation for task=${f.taskId.slice(0, 8)}… — task no longer exists (closed ${closed} request(s)).`
+        );
+        continue;
+      }
       if (details.ok && (details.percentComplete ?? 0) >= 100) {
         markResolved(f.followupId);
         console.log(
@@ -408,6 +428,26 @@ export async function sweepStaleFollowupsAndEscalate(
     );
     if (res.ok) markEscalated(f.followupId);
   }
+}
+
+/**
+ * Wrap a scheduled job so a tick that fires while the previous run is still
+ * in flight is skipped instead of running concurrently.
+ */
+export function singleFlight(name: string, job: () => Promise<unknown>): () => Promise<void> {
+  let inFlight = false;
+  return async () => {
+    if (inFlight) {
+      console.log(`[scheduler] ${name} skipped — previous run still in flight`);
+      return;
+    }
+    inFlight = true;
+    try {
+      await job();
+    } finally {
+      inFlight = false;
+    }
+  };
 }
 
 // ─── Internal ──────────────────────────────────────────────────────────────

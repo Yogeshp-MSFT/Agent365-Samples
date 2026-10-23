@@ -751,7 +751,11 @@ Used for:
 - Every `context.sendActivity(...)` reply.
 - The WorkIQ MCP tool servers — one agentic token per server audience with
   `Tools.ListInvoke.All` (see Appendix B).
-- The Foundry client (`configureOpenAIClient` in `src/openai-config.ts`).
+
+Model calls do **not** use this identity. The Foundry client
+(`configureOpenAIClient` in `src/openai-config.ts`) authenticates with the
+Azure OpenAI resource API key (`AZURE_OPENAI_API_KEY`); no Entra or agentic
+token is sent to the model endpoint.
 
 ### 7.2 Graph identity (Graph API side)
 
@@ -1500,7 +1504,7 @@ no TurnContext.
 
 | Env | Default | Notes |
 |---|---|---|
-| `ENABLE_A365_OBSERVABILITY_EXPORTER` | `true` | Set `false` to disable the exporter entirely (spans stay in-process). |
+| `ENABLE_A365_OBSERVABILITY_EXPORTER` | `false` | Set `true` (or `1` / `yes` / `on`) to enable the exporter. Any other value, or unset, keeps spans in-process. |
 | `A365_OBSERVABILITY_LOG_LEVEL` | `info` | |
 | `agent365Observability__agentInstanceId` | — | Optional override. Normally left blank; the runtime agent identity is read per turn from `activity.recipient.agenticAppId`. Set it only for deployments where inbound activities don't carry the field — a wrong value here makes every span unbindable and MAC Activity stays empty. |
 | `agent365Observability__agentId` | — | **BLUEPRINT id.** Used only as span metadata (`agentBlueprintId`) and to warm the blueprint's observability token. NOT the primary agent id. |

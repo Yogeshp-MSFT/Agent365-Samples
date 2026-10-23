@@ -351,15 +351,19 @@ async function advanceCapture(
         content: old.find((o) => o.transcriptId === s.transcriptId)?.content ??
           (matches.length === 1 && cap.transcriptId === s.transcriptId ? cap.transcriptContent : undefined),
       }));
+      // Keep the time this occurrence FIRST acquired a transcript: it starts
+      // the insights wait budget. rescheduleCapture / reopenRevokedCapture
+      // clear it when the artifact state is explicitly restarted.
+      const transcriptFetchedAt = cap.transcriptFetchedAt ?? now;
       updateCapture(cap.eventId, {
         transcriptSegments: segments,
         transcriptId: match.transcriptId,
-        transcriptFetchedAt: now,
+        transcriptFetchedAt,
         transcriptCallId: match.callId,
         transcriptCorrelationId: match.contentCorrelationId,
       });
       cap.transcriptId = match.transcriptId;
-      cap.transcriptFetchedAt = now;
+      cap.transcriptFetchedAt = transcriptFetchedAt;
       cap.transcriptCallId = match.callId;
       cap.transcriptCorrelationId = match.contentCorrelationId;
     } else if (transcripts.length > 0) {

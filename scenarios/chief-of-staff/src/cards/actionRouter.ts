@@ -32,6 +32,7 @@ import {
   findOpenTaskByTitle,
   getPlannerTaskDetails,
   isTaskInAllowedPlan,
+  samePlannerDueDate,
   updatePlannerTaskDueDate,
   updatePlannerTaskTitle,
 } from '../graph/plannerTools';
@@ -220,18 +221,26 @@ export async function deliverPendingLeaderRequest(
   const ownerName = followup.ownerName || ownerDisplayName || 'the owner';
   let res: { ok: boolean; error?: string };
   if (d.kind === 'extension') {
-    const suggestedNewDueDate = d.suggestedNewDueDate ?? computeNextDueDateIso(followup.dueDate);
-    res = await sendExtensionRequestCardDirect(opts, {
-      leaderAadObjectId: leaderAad,
-      followupId: followup.followupId,
-      taskId: followup.taskId,
-      taskTitle: followup.taskTitle,
-      ownerName,
-      currentDueDate: followup.dueDate ?? null,
-      suggestedNewDueDate,
-      agentRationale: `Owner (${ownerName}) requested more time via the check-in card.`,
-    });
-    if (res.ok) recordExtensionRequest(followup.followupId, suggestedNewDueDate);
+    // Build the proposal from the LIVE Planner deadline on every attempt
+    // (including scheduler retries) — the check-in snapshot may be stale.
+    const live = await getPlannerTaskDetails(followup.taskId);
+    if (!live.ok || !(await isTaskInAllowedPlan(live.planId))) {
+      res = { ok: false, error: 'Could not verify the current Planner due date.' };
+    } else {
+      const currentDueDate = live.dueDateTime;
+      const suggestedNewDueDate = computeNextDueDateIso(currentDueDate);
+      res = await sendExtensionRequestCardDirect(opts, {
+        leaderAadObjectId: leaderAad,
+        followupId: followup.followupId,
+        taskId: followup.taskId,
+        taskTitle: followup.taskTitle,
+        ownerName,
+        currentDueDate,
+        suggestedNewDueDate,
+        agentRationale: `Owner (${ownerName}) requested more time via the check-in card.`,
+      });
+      if (res.ok) recordExtensionRequest(followup.followupId, suggestedNewDueDate, currentDueDate);
+    }
   } else {
     // Slots are recomputed per attempt so a retried card never offers past times.
     const slots = proposeMeetingSlots();
@@ -792,14 +801,17 @@ async function routeIntent(
     // asked to "pick a sensible date" and it hallucinated dates from its
     // training cutoff era (e.g. "2023-10-05"), which Planner then rejected.
     // The request is queued first so a failed send is retried by the scheduler.
-    const suggestedNewDueDate = computeNextDueDateIso(followup.dueDate);
-    const queued = queueLeaderDelivery(followup.followupId, { kind: 'extension', suggestedNewDueDate });
+    // The proposed date is computed at delivery from the live Planner deadline.
+    const queued = queueLeaderDelivery(followup.followupId, { kind: 'extension' });
     const res = queued
       ? await deliverPendingLeaderRequest(client.getPeopleOpts(), queued, leaderAad, senderName)
       : { ok: false, error: 'follow-up record missing' };
     if (res.ok) {
+      const proposed = getFollowup(followup.followupId)?.extensionRequestedTo;
       await context.sendActivity(
-        `Thanks — I\'ve asked the leader to approve an extension to **${dueLabel(suggestedNewDueDate)}**. I\'ll DM you as soon as they decide.`
+        proposed
+          ? `Thanks — I\'ve asked the leader to approve an extension to **${dueLabel(proposed)}**. I\'ll DM you as soon as they decide.`
+          : `Thanks — I\'ve asked the leader to approve an extension. I\'ll DM you as soon as they decide.`
       );
     } else {
       await context.sendActivity(
@@ -902,7 +914,7 @@ async function routeIntent(
           : target.extensionStatus === 'rejected'
             ? 'was already rejected'
             : target.extensionStatus === 'cancelled'
-              ? 'was cancelled because the task is complete'
+              ? 'was cancelled'
               : 'is no longer pending';
       await context.sendActivity(
         `That extension request for "${target.taskTitle}" ${state}, so I didn't change anything.`
@@ -917,7 +929,15 @@ async function routeIntent(
     try {
       if (cardFollowupId) {
         const shownDate = typeof intent.data.newDueDate === 'string' ? intent.data.newDueDate : undefined;
-        if (!shownDate || Date.parse(shownDate) !== Date.parse(target.extensionRequestedTo)) {
+        // The card also carries the deadline it was computed from ('' = none).
+        const rawBase = intent.data.baseDueDate;
+        const shownBaseDate =
+          typeof rawBase === 'string' ? (rawBase === '' ? null : rawBase) : rawBase === null ? null : undefined;
+        if (
+          !shownDate ||
+          Date.parse(shownDate) !== Date.parse(target.extensionRequestedTo) ||
+          !samePlannerDueDate(shownBaseDate, target.extensionRequestedFrom)
+        ) {
           await context.sendActivity("That extension proposal has been superseded. Please use the latest card or type approve/reject for the current pending proposal. I haven't changed anything.");
           return { handled: true };
         }
@@ -1176,6 +1196,31 @@ async function routeIntent(
   return { handled: false };
 }
 
+/**
+ * Cancel an extension proposal whose baseline deadline no longer matches
+ * Planner. Planner is left unchanged; leader and owner are both told.
+ */
+async function cancelStaleExtension(
+  context: TurnContext,
+  client: Client,
+  target: PendingFollowup,
+  reason: string
+): Promise<CardActionResult> {
+  markResolved(target.followupId);
+  setExtensionStatus(target.followupId, 'cancelled');
+  await sendPlainDmToUser(
+    client.getPeopleOpts(),
+    target.ownerAad,
+    `ℹ️ **Extension request closed: ${target.taskTitle}**\n\n` +
+      `The task's due date was changed in Planner, so your earlier extension request no longer applies. ` +
+      `Check the current due date in Planner, and reply \`extend\` on your next check-in if you still need more time.`
+  );
+  await context.sendActivity(
+    `${reason} I've cancelled the stale proposal and haven't changed Planner. ${target.ownerName} has been asked to request a new extension if needed.`
+  );
+  return { handled: true };
+}
+
 /** Apply the leader's decision on a pending extension request. */
 async function decideExtension(
   context: TurnContext,
@@ -1227,8 +1272,44 @@ async function decideExtension(
     return { handled: true };
   }
 
+  // A previous approval already moved Planner to this date (e.g. the process
+  // stopped before the approval was saved). Record it instead of cancelling.
+  if (samePlannerDueDate(live.dueDateTime, newDueDate)) {
+    markResolved(target.followupId, { extendedTo: newDueDate });
+    setExtensionStatus(target.followupId, 'approved');
+    await sendPlainDmToUser(
+      client.getPeopleOpts(),
+      target.ownerAad,
+      `✅ **Extension approved: ${taskTitle}**\n\nYour due date is **${dueLabel(newDueDate)}**, and Planner shows it.`
+    );
+    await context.sendActivity(
+      `✅ Planner already shows "${taskTitle}" due ${dueLabel(newDueDate)}, so this extension is recorded as approved.`
+    );
+    return { handled: true };
+  }
+
+  // The proposal is bound to the deadline it was computed from. If Planner
+  // changed since, approving could shorten or overwrite a newer deadline.
+  const expectedPreviousDueDate = target.extensionRequestedFrom;
+  if (expectedPreviousDueDate === undefined || !samePlannerDueDate(live.dueDateTime, expectedPreviousDueDate)) {
+    return await cancelStaleExtension(
+      context,
+      client,
+      target,
+      `The Planner due date for "${taskTitle}" changed after this proposal was created.`
+    );
+  }
+
   // 1) Patch Planner first; only a successful PATCH counts as approved.
-  const r = await updatePlannerTaskDueDate(target.taskId, newDueDate);
+  const r = await updatePlannerTaskDueDate(target.taskId, newDueDate, expectedPreviousDueDate);
+  if (!r.ok && r.conflict) {
+    return await cancelStaleExtension(
+      context,
+      client,
+      target,
+      `The Planner due date for "${taskTitle}" changed during approval.`
+    );
+  }
   if (!r.ok) {
     // Keep the request pending so the leader can retry.
     const dm = await sendPlainDmToUser(
@@ -1305,29 +1386,64 @@ async function handleActionForwardToExtendOffer(
   followup: PendingFollowup | undefined,
   leaderAad: string
 ): Promise<CardActionResult> {
-  if (followup) markResolved(followup.followupId);
+  if (!followup) {
+    await context.sendActivity("I couldn't identify the task for this extension proposal, so I didn't send anything.");
+    return { handled: true };
+  }
+  // An old escalation card must not revive a closed or already-decided request.
+  if (
+    followup.status === 'resolved' ||
+    followup.extensionStatus === 'approved' ||
+    followup.extensionStatus === 'rejected' ||
+    followup.extensionStatus === 'cancelled'
+  ) {
+    await context.sendActivity(
+      `The check-in for "${followup.taskTitle}" is already closed, so I didn't propose a new date.`
+    );
+    return { handled: true };
+  }
 
-  // Deterministic — no LLM. Compute the new date and send the extension card
-  // straight to the leader for approval.
-  const suggestedNewDueDate = computeNextDueDateIso(followup?.dueDate);
+  // Deterministic — no LLM. Compute the new date from the LIVE Planner
+  // deadline and send the extension card straight to the leader for approval.
+  const live = await getPlannerTaskDetails(followup.taskId);
+  if (!live.ok && live.notFound) {
+    cancelOutstandingRequestsForTask(followup.taskId);
+    await context.sendActivity(`"${followup.taskTitle}" no longer exists in Planner, so I closed its check-in.`);
+    return { handled: true };
+  }
+  if (!live.ok || !(await isTaskInAllowedPlan(live.planId))) {
+    await context.sendActivity(
+      `I couldn't verify the current Planner deadline for "${followup.taskTitle}". No extension proposal was sent.`
+    );
+    return { handled: true };
+  }
+  if (live.percentComplete >= 100) {
+    cancelOutstandingRequestsForTask(followup.taskId);
+    await context.sendActivity(`"${followup.taskTitle}" is already complete in Planner, so no extension is needed.`);
+    return { handled: true };
+  }
+
+  const currentDueDate = live.dueDateTime;
+  const suggestedNewDueDate = computeNextDueDateIso(currentDueDate);
+  markResolved(followup.followupId);
   const res = await sendExtensionRequestCardDirect(client.getPeopleOpts(), {
     leaderAadObjectId: leaderAad,
-    followupId: followup?.followupId ?? '',
-    taskId: followup?.taskId ?? '<unknown>',
-    taskTitle: followup?.taskTitle ?? 'the task',
-    ownerName: followup?.ownerName ?? 'the owner',
-    currentDueDate: followup?.dueDate ?? null,
+    followupId: followup.followupId,
+    taskId: followup.taskId,
+    taskTitle: followup.taskTitle,
+    ownerName: followup.ownerName,
+    currentDueDate,
     suggestedNewDueDate,
     agentRationale: 'Auto-suggested after no reply to the follow-up.',
   });
   if (res.ok) {
-    if (followup) recordExtensionRequest(followup.followupId, suggestedNewDueDate);
+    recordExtensionRequest(followup.followupId, suggestedNewDueDate, currentDueDate);
     await context.sendActivity(
-      `⏰ Extension proposed. I've sent you an approval card for "${followup?.taskTitle ?? 'the task'}" with a new due date of **${dueLabel(suggestedNewDueDate)}** — approve it to update Planner and notify ${followup?.ownerName ?? 'the owner'}.`
+      `⏰ Extension proposed. I've sent you an approval card for "${followup.taskTitle}" with a new due date of **${dueLabel(suggestedNewDueDate)}** — approve it to update Planner and notify ${followup.ownerName}.`
     );
   } else {
     await context.sendActivity(
-      `⏰ Couldn't send the extension card (${res.error ?? 'unknown error'}). Please retry or contact ${followup?.ownerName ?? 'the owner'} directly.`
+      `⏰ Couldn't send the extension card (${res.error ?? 'unknown error'}). Please retry or contact ${followup.ownerName} directly.`
     );
   }
   return { handled: true };
