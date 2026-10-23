@@ -279,8 +279,8 @@ PLANNER_PLAN_NAME=Leadership Rhythm
 PLANNER_BUCKET_NAME=Inbox
 ```
 
-**To skip auto-resolve entirely** (fastest boot, needed if the standalone
-Graph worker isn't set up), paste the explicit IDs from Planner UI + Graph
+**To skip auto-resolve entirely** (fastest boot; the §3b Graph worker is
+still required), paste the explicit IDs from Planner UI + Graph
 Explorer:
 
 ```text
