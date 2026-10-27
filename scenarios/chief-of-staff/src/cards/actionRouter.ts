@@ -1236,6 +1236,11 @@ async function decideExtension(
     await context.sendActivity("I couldn't verify this request belongs to the leadership plan, so I didn't change it.");
     return { handled: true };
   }
+  if (live.percentComplete >= 100) {
+    cancelOutstandingRequestsForTask(target.taskId);
+    await context.sendActivity(`"${target.taskTitle}" is already complete in Planner, so I closed its outstanding requests without changing the due date.`);
+    return { handled: true };
+  }
   if (target.extensionStatus !== 'pending' || target.extensionRequestedTo !== proposal) {
     await context.sendActivity("That extension proposal changed while I was checking Planner. Please use the latest card. I haven't changed anything.");
     return { handled: true };
@@ -1302,6 +1307,11 @@ async function decideExtension(
 
   // 1) Patch Planner first; only a successful PATCH counts as approved.
   const r = await updatePlannerTaskDueDate(target.taskId, newDueDate, expectedPreviousDueDate);
+  if (!r.ok && r.completed) {
+    cancelOutstandingRequestsForTask(target.taskId);
+    await context.sendActivity(`"${taskTitle}" was completed in Planner during approval, so I closed its outstanding requests without changing the due date.`);
+    return { handled: true };
+  }
   if (!r.ok && r.conflict) {
     return await cancelStaleExtension(
       context,
@@ -1425,7 +1435,6 @@ async function handleActionForwardToExtendOffer(
 
   const currentDueDate = live.dueDateTime;
   const suggestedNewDueDate = computeNextDueDateIso(currentDueDate);
-  markResolved(followup.followupId);
   const res = await sendExtensionRequestCardDirect(client.getPeopleOpts(), {
     leaderAadObjectId: leaderAad,
     followupId: followup.followupId,
@@ -1438,6 +1447,7 @@ async function handleActionForwardToExtendOffer(
   });
   if (res.ok) {
     recordExtensionRequest(followup.followupId, suggestedNewDueDate, currentDueDate);
+    markResolved(followup.followupId);
     await context.sendActivity(
       `⏰ Extension proposed. I've sent you an approval card for "${followup.taskTitle}" with a new due date of **${dueLabel(suggestedNewDueDate)}** — approve it to update Planner and notify ${followup.ownerName}.`
     );

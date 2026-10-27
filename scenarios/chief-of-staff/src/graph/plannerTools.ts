@@ -21,7 +21,7 @@
 // `additionalProperties: false` — required by Azure OpenAI's strict function
 // schema validator on the /openai/deployments/... path.
 
-import axios from 'axios';
+import { graphHttp as axios } from './graphHttp';
 import { tool } from '@openai/agents';
 import { Authorization, TurnContext } from '@microsoft/agents-hosting';
 import { getPlannerPlanId, getPlannerBucketId } from './plannerConfig';
@@ -480,7 +480,7 @@ export async function updatePlannerTaskDueDate(
   expectedPreviousDueDate: string | null
 ): Promise<
   | { ok: true; previousDue?: string | null; newDue: string }
-  | { ok: false; error: string; conflict?: boolean; currentDue?: string | null }
+  | { ok: false; error: string; conflict?: boolean; completed?: boolean; currentDue?: string | null }
 > {
   try {
     if (!taskId) return { ok: false, error: 'taskId is empty' };
@@ -501,6 +501,9 @@ export async function updatePlannerTaskDueDate(
       `${GRAPH_BASE}/planner/tasks/${encodeURIComponent(taskId)}`,
       { headers: { Authorization: `Bearer ${token}` } }
     );
+    if (getRes.data?.percentComplete >= 100) {
+      return { ok: false, completed: true, error: 'The Planner task is already complete.' };
+    }
     const previousDue: string | null = getRes.data?.dueDateTime ?? null;
     // The proposal was computed from this deadline. If someone moved it since,
     // writing the proposal could shorten the live deadline — refuse instead.

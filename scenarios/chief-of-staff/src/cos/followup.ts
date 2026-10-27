@@ -21,7 +21,7 @@
 // the owner ignored for more than FOLLOWUP_ESCALATE_AFTER_HOURS and sends an
 // escalation card to the leader.
 
-import axios from 'axios';
+import { graphHttp as axios } from '../graph/graphHttp';
 import { providerError } from '../util/logger';
 import { CloudAdapter, TurnContext, TurnState } from '@microsoft/agents-hosting';
 import type { Client } from '../client';

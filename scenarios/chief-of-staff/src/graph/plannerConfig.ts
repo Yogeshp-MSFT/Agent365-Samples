@@ -23,7 +23,7 @@
 // Both resolutions are memoized after first success. Failures are cached
 // negatively for a short window so we don't hammer Graph on every tick.
 
-import axios from 'axios';
+import { graphHttp as axios } from './graphHttp';
 import { acquireAppOnlyGraphToken } from './graphAppToken';
 import { providerError } from '../util/logger';
 

@@ -66,6 +66,15 @@ to Planner and the assignment card.
 The conversational extension-card tool follows the same boundary: its card
 and stored proposal share one normalized instant. A card for a superseded
 proposal cannot approve a newer date; use the latest card or a typed decision.
+Extension decisions recheck live completion, including the fresh ETag snapshot
+used for the due-date PATCH; completed tasks have their outstanding requests
+cancelled without changing the deadline. Failed escalation extension-card sends
+leave the check-in open so the leader can retry the same action.
+
+Graph requests used by follow-ups, daily briefs, Planner configuration, and
+leader-request lookups have a 30-second timeout plus a whole-request abort
+signal. A stalled Graph response fails instead of holding the follow-up
+single-flight guard indefinitely; a later scheduled tick can run again.
 
 ---
 

@@ -17,7 +17,7 @@
 //   5. Format each row in server-local TZ, then build the Adaptive Card
 //      in code and DM the leader via sendCardProactively.
 
-import axios from 'axios';
+import { graphHttp as axios } from '../graph/graphHttp';
 import { providerError } from '../util/logger';
 import { CloudAdapter, TurnContext, TurnState } from '@microsoft/agents-hosting';
 import type { Client } from '../client';

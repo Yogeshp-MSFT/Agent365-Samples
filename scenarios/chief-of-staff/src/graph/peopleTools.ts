@@ -16,7 +16,7 @@
 // Both use the standalone Graph worker app (application permissions):
 // ChatMember.Read.All for meeting-chat members and User.Read.All for users.
 
-import axios from 'axios';
+import { graphHttp as axios } from './graphHttp';
 import { tool } from '@openai/agents';
 import { Authorization, TurnContext } from '@microsoft/agents-hosting';
 import { acquireAppOnlyGraphToken } from './graphAppToken';

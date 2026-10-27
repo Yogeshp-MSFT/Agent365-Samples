@@ -892,6 +892,120 @@ test('re-listing the same transcript keeps the first fetch time, so the wait bud
 });
 
 // ── PR #333 review: observability export is opt-in ──
+test('failed escalation extension delivery remains retryable until the proposal is sent', async (t) => {
+  const planner = require('../dist/graph/plannerTools');
+  const cards = require('../dist/cards/followupCards');
+  const record = followups.createFollowup({ taskId: 'retry-escalation', taskTitle: 'Retry', ownerAad: 'owner-retry', ownerName: 'Owner' });
+  followups.markEscalated(record.followupId);
+  t.mock.method(planner, 'getPlannerTaskDetails', async () => ({
+    ok: true, title: 'Retry', planId: 'allowed-plan', assigneeAads: ['owner-retry'], percentComplete: 0, dueDateTime: LIVE_MOVED_DUE,
+  }));
+  let sends = 0;
+  t.mock.method(cards, 'sendExtensionRequestCardDirect', async () => (++sends === 1 ? { ok: false, error: 'temporary failure' } : { ok: true }));
+  const messages = [];
+  const click = async (id) => router.handleCardActionIfAny({
+    activity: { id, from: { aadObjectId: ctx.leaderAad },
+      value: { verb: 'esc_extend', followupId: record.followupId, taskId: record.taskId } },
+    sendActivity: async (s) => messages.push(s),
+  }, peopleOptsClient, ctx.leaderAad);
+  await click('failed-escalation');
+  assert.equal(followups.getFollowup(record.followupId).status, 'escalated');
+  assert.equal(followups.getFollowup(record.followupId).extensionStatus, undefined);
+  assert.ok(messages.some((m) => m.includes('Please retry')));
+  await click('retried-escalation');
+  assert.equal(sends, 2);
+  assert.equal(followups.getFollowup(record.followupId).status, 'resolved');
+  assert.equal(followups.getFollowup(record.followupId).extensionStatus, 'pending');
+  await click('duplicate-escalation');
+  assert.equal(sends, 2);
+  followups.cancelOutstandingRequestsForTask(record.taskId);
+});
+
+for (const verb of ['approve_extend', 'reject_extend']) {
+  test(`${verb} cancels outstanding requests when Planner reports completion`, async (t) => {
+    const cards = require('../dist/cards/followupCards');
+    const record = followups.createFollowup({ taskId: `completed-${verb}`, taskTitle: 'Complete', ownerAad: 'owner-complete', ownerName: 'Owner' });
+    const proposal = router.computeNextDueDateIso(LIVE_MOVED_DUE);
+    followups.recordExtensionRequest(record.followupId, proposal, LIVE_MOVED_DUE);
+    t.mock.method(axios, 'get', async () => ({ data: {
+      '@odata.etag': 'complete-etag', planId: 'allowed-plan', title: 'Complete', assignments: {}, percentComplete: 100, dueDateTime: LIVE_MOVED_DUE,
+    } }));
+    let patches = 0;
+    t.mock.method(axios, 'patch', async () => { patches++; return { data: {} }; });
+    const dms = [];
+    t.mock.method(cards, 'sendPlainDmToUser', async (_opts, _aad, text) => { dms.push(text); return { ok: true }; });
+    const messages = [];
+    await router.handleCardActionIfAny({
+      activity: { id: `completed-${verb}`, from: { aadObjectId: ctx.leaderAad },
+        value: { verb, followupId: record.followupId, taskId: record.taskId, newDueDate: proposal, baseDueDate: LIVE_MOVED_DUE } },
+      sendActivity: async (s) => messages.push(s),
+    }, peopleOptsClient, ctx.leaderAad);
+    assert.equal(patches, 0);
+    assert.equal(dms.length, 0);
+    assert.equal(followups.getFollowup(record.followupId).extensionStatus, 'cancelled');
+    assert.ok(messages.some((m) => m.includes('already complete')));
+  });
+}
+
+test('completion between approval validation and the conditional PATCH cancels the request', async (t) => {
+  const cards = require('../dist/cards/followupCards');
+  const record = followups.createFollowup({ taskId: 'complete-during-approval', taskTitle: 'Race', ownerAad: 'owner-race', ownerName: 'Owner' });
+  const proposal = router.computeNextDueDateIso(LIVE_MOVED_DUE);
+  followups.recordExtensionRequest(record.followupId, proposal, LIVE_MOVED_DUE);
+  let reads = 0;
+  t.mock.method(axios, 'get', async () => ({ data: {
+    '@odata.etag': `etag-${++reads}`, planId: 'allowed-plan', title: 'Race', assignments: {}, percentComplete: reads >= 3 ? 100 : 0, dueDateTime: LIVE_MOVED_DUE,
+  } }));
+  let patches = 0;
+  t.mock.method(axios, 'patch', async () => { patches++; return { data: {} }; });
+  const dms = [];
+  t.mock.method(cards, 'sendPlainDmToUser', async (_opts, _aad, text) => { dms.push(text); return { ok: true }; });
+  const messages = [];
+  await router.handleCardActionIfAny({
+    activity: { id: 'completion-race', from: { aadObjectId: ctx.leaderAad },
+      value: { verb: 'approve_extend', followupId: record.followupId, taskId: record.taskId, newDueDate: proposal, baseDueDate: LIVE_MOVED_DUE } },
+    sendActivity: async (s) => messages.push(s),
+  }, peopleOptsClient, ctx.leaderAad);
+  assert.equal(reads, 3, 'authorization, decision validation, and fresh ETag snapshot');
+  assert.equal(patches, 0);
+  assert.equal(dms.length, 0);
+  assert.equal(followups.getFollowup(record.followupId).extensionStatus, 'cancelled');
+  assert.ok(messages.some((m) => m.includes('completed in Planner during approval')));
+});
+
+test('scheduled Graph requests have a timeout and abort signal, releasing single-flight after failure', async (t) => {
+  const { runFollowup } = require('../dist/cos/followup');
+  const { singleFlight } = require('../dist/scheduler');
+  const { GRAPH_REQUEST_TIMEOUT_MS, graphHttp } = require('../dist/graph/graphHttp');
+  let runs = 0;
+  t.mock.method(axios, 'get', async (_url, options) => {
+    runs++;
+    assert.equal(options.timeout, GRAPH_REQUEST_TIMEOUT_MS);
+    assert.ok(options.signal instanceof AbortSignal);
+    throw Object.assign(new Error('timed out'), { code: 'ECONNABORTED' });
+  });
+  const tick = singleFlight('bounded-follow-up', () => runFollowup({}, {}, {}, {}));
+  await tick();
+  await tick();
+  assert.equal(runs, 2, 'the handler catches the timeout and the next tick retries');
+  t.mock.restoreAll();
+
+  const http = require('node:http');
+  const server = http.createServer(() => {});
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    await assert.rejects(graphHttp.get(`http://127.0.0.1:${server.address().port}`, { timeout: 25, proxy: false }),
+      (err) => ['ERR_CANCELED', 'ECONNABORTED'].includes(err.code));
+    const controller = new AbortController();
+    controller.abort();
+    await assert.rejects(graphHttp.get(`http://127.0.0.1:${server.address().port}`, { signal: controller.signal, proxy: false }),
+      (err) => err.code === 'ERR_CANCELED');
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
 test('environment template keeps observability export disabled by default', () => {
   const template = fs.readFileSync(path.join(__dirname, '..', '.env.template'), 'utf8');
   assert.match(template, /^ENABLE_A365_OBSERVABILITY_EXPORTER=false$/m);
