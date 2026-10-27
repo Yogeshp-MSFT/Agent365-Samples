@@ -82,7 +82,7 @@ single-flight guard indefinitely; a later scheduled tick can run again.
 
 Install on your dev box:
 
-- **Node.js ≥ 18** (`node --version`)
+- **Node.js ≥ 20** (`node --version`) — required by the patched MSAL Node dependency (7.1.0+)
 - **npm ≥ 9**
 - **Azure CLI** (`az --version`) — needed for the one-shot Graph scope grants
 - **PowerShell 7+** — the bootstrap script assumes it

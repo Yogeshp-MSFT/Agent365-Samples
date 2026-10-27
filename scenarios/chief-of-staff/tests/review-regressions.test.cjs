@@ -1006,6 +1006,35 @@ test('scheduled Graph requests have a timeout and abort signal, releasing single
   }
 });
 
+test('patched MSAL supports the Graph worker client-credentials flow and rejects missing tokens', async (t) => {
+  const { ConfidentialClientApplication } = require('@azure/msal-node');
+  const savedModule = require.cache[tokenPath];
+  const keys = ['GRAPH_APP_ID', 'GRAPH_APP_SECRET', 'GRAPH_TENANT_ID'];
+  const savedEnv = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+  Object.assign(process.env, {
+    GRAPH_APP_ID: '22222222-2222-2222-2222-222222222222',
+    GRAPH_APP_SECRET: 'test-only', GRAPH_TENANT_ID: '33333333-3333-3333-3333-333333333333',
+  });
+  const calls = [];
+  t.mock.method(ConfidentialClientApplication.prototype, 'acquireTokenByClientCredential', async (request) => {
+    calls.push(request);
+    return calls.length === 1 ? { accessToken: 'offline-token' } : null;
+  });
+  delete require.cache[tokenPath];
+  try {
+    const worker = require(tokenPath);
+    assert.equal(worker.isGraphAppConfigured(), true);
+    assert.equal(await worker.acquireAppOnlyGraphToken(), 'offline-token');
+    assert.deepEqual(calls[0].scopes, ['https://graph.microsoft.com/.default']);
+    await assert.rejects(worker.acquireAppOnlyGraphToken(), /returned no accessToken/);
+  } finally {
+    require.cache[tokenPath] = savedModule;
+    for (const key of keys) {
+      if (savedEnv[key] === undefined) delete process.env[key]; else process.env[key] = savedEnv[key];
+    }
+  }
+});
+
 test('environment template keeps observability export disabled by default', () => {
   const template = fs.readFileSync(path.join(__dirname, '..', '.env.template'), 'utf8');
   assert.match(template, /^ENABLE_A365_OBSERVABILITY_EXPORTER=false$/m);
