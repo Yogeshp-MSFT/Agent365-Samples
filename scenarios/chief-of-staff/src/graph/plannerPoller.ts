@@ -16,7 +16,7 @@
 // each new poll against the LAST-KNOWN state from disk, so any transition
 // (even one that happened during downtime) fires runTaskComplete.
 
-import axios from 'axios';
+import { graphHttp as axios } from './graphHttp';
 import { Authorization, TurnContext } from '@microsoft/agents-hosting';
 import { acquireGraphToken } from './peopleTools';
 import { PersistentMap } from '../state/persistentMap';

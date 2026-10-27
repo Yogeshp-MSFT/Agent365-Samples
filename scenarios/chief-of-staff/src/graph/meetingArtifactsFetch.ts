@@ -13,7 +13,7 @@
 //   Returns callAiInsight[] with `actionItems` and `meetingNotes`.
 //   Falls back to /beta if /v1.0 returns 404 in the target tenant.
 
-import axios from 'axios';
+import { graphHttp as axios } from './graphHttp';
 import { Authorization, TurnContext } from '@microsoft/agents-hosting';
 import { acquireGraphToken, resolveUpnToAad } from './peopleTools';
 import { SimpleActionItem, SimpleMeetingNote } from '../state/pendingCaptureStore';

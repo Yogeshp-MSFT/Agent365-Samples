@@ -71,10 +71,18 @@ used for the due-date PATCH; completed tasks have their outstanding requests
 cancelled without changing the deadline. Failed escalation extension-card sends
 leave the check-in open so the leader can retry the same action.
 
-Graph requests used by follow-ups, daily briefs, Planner configuration, and
-leader-request lookups have a 30-second timeout plus a whole-request abort
-signal. A stalled Graph response fails instead of holding the follow-up
-single-flight guard indefinitely; a later scheduled tick can run again.
+Graph requests used by follow-ups, daily briefs, Planner configuration,
+leader-request lookups, meeting discovery/artifact capture, and completion
+polling/notifications have a 30-second timeout plus a whole-request abort
+signal. A stalled Graph response fails instead of holding a scheduled job's
+in-flight guard indefinitely; a later scheduled tick can run again.
+
+Daily brief activities are capped at 80 KiB of serialized UTF-8 JSON, leaving
+room below Teams' 100 KB message limit. Oversized briefs retain a bounded
+subset of rows and show the omitted-item count with a Planner link. Captured
+decision titles include their `[DECISION]` prefix before checkpointing and
+are bounded to Planner's 255-character limit; Planner and assignment cards
+use the same final title, including when resuming an older checkpoint.
 
 ---
 

@@ -973,26 +973,32 @@ test('completion between approval validation and the conditional PATCH cancels t
   assert.ok(messages.some((m) => m.includes('completed in Planner during approval')));
 });
 
-test('scheduled Graph requests have a timeout and abort signal, releasing single-flight after failure', async (t) => {
+test('scheduled Graph requests have a timeout and abort signal, releasing single-flight after failure', { timeout: 5000 }, async (t) => {
   const { runFollowup } = require('../dist/cos/followup');
   const { singleFlight } = require('../dist/scheduler');
   const { GRAPH_REQUEST_TIMEOUT_MS, graphHttp } = require('../dist/graph/graphHttp');
   let runs = 0;
+  const seen = [];
   t.mock.method(axios, 'get', async (_url, options) => {
     runs++;
-    assert.equal(options.timeout, GRAPH_REQUEST_TIMEOUT_MS);
-    assert.ok(options.signal instanceof AbortSignal);
+    seen.push(options);
     throw Object.assign(new Error('timed out'), { code: 'ECONNABORTED' });
   });
   const tick = singleFlight('bounded-follow-up', () => runFollowup({}, {}, {}, {}));
   await tick();
   await tick();
   assert.equal(runs, 2, 'the handler catches the timeout and the next tick retries');
+  assert.equal(seen.length, 2);
+  for (const options of seen) {
+    assert.equal(options.timeout, GRAPH_REQUEST_TIMEOUT_MS);
+    assert.ok(options.signal instanceof AbortSignal);
+  }
   t.mock.restoreAll();
 
   const http = require('node:http');
   const server = http.createServer(() => {});
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const cleanupTimer = setTimeout(() => server.closeAllConnections(), 1000);
   try {
     await assert.rejects(graphHttp.get(`http://127.0.0.1:${server.address().port}`, { timeout: 25, proxy: false }),
       (err) => ['ERR_CANCELED', 'ECONNABORTED'].includes(err.code));
@@ -1001,8 +1007,98 @@ test('scheduled Graph requests have a timeout and abort signal, releasing single
     await assert.rejects(graphHttp.get(`http://127.0.0.1:${server.address().port}`, { signal: controller.signal, proxy: false }),
       (err) => err.code === 'ERR_CANCELED');
   } finally {
+    clearTimeout(cleanupTimer);
     server.closeAllConnections();
     await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test('large daily briefs stay within the UTF-8 activity budget and disclose omitted rows', () => {
+  const { buildBriefAdaptiveCard, BRIEF_ACTIVITY_BYTE_BUDGET } = require('../dist/cards/briefTool');
+  for (const title of ['x'.repeat(80), '計画🚀'.repeat(80)]) {
+    const args = { leaderAadObjectId: ctx.leaderAad, priorities: [], watchList: [], calendar: [],
+      priorityItems: Array.from({ length: 200 }, (_, i) => ({
+        band: 0, title, taskId: `task-${i}`, ownerName: 'Owner', meta: '1d overdue',
+        taskUrl: `https://planner.cloud.microsoft/task/${i}`,
+      })),
+      calendarItems: Array.from({ length: 150 }, () => ({ when: 'Tomorrow', subject: title })),
+    };
+    const card = buildBriefAdaptiveCard(args);
+    const activity = { type: 'message', attachments: [{ contentType: 'application/vnd.microsoft.card.adaptive', content: card }] };
+    assert.ok(Buffer.byteLength(JSON.stringify(activity), 'utf8') <= BRIEF_ACTIVITY_BYTE_BUDGET);
+    const note = card.body.find((row) => row.type === 'TextBlock' && row.text.includes('item(s) omitted'));
+    assert.ok(note);
+    assert.ok(note.text.includes('https://planner.cloud.microsoft/'));
+    const shown = card.body.filter((row) => row.type === 'ColumnSet' && row.spacing === 'Small').length;
+    assert.equal(Number(note.text.match(/^\d+/)[0]), 350 - shown);
+    assert.ok(shown > 0);
+  }
+  const small = buildBriefAdaptiveCard({ leaderAadObjectId: ctx.leaderAad, priorities: ['One task'], watchList: [], calendar: [] });
+  assert.ok(JSON.stringify(small).includes('One task'));
+  assert.ok(!JSON.stringify(small).includes('item(s) omitted'));
+});
+
+test('capture checkpoints, Planner, and assignment cards share bounded decision titles', async (t) => {
+  const cards = require('../dist/cards/followupCards');
+  const rawTitle = 'x'.repeat(250);
+  const expectedTitle = `[DECISION] ${rawTitle}`.slice(0, 255);
+  const parsed = parseExtractedItems(JSON.stringify({ items: [
+    { kind: 'decision', title: rawTitle, ownerAad: ctx.leaderAad, ownerName: 'Leader' },
+    { kind: 'decision', title: '[DECISION] Already prefixed', ownerAad: ctx.leaderAad, ownerName: 'Leader' },
+  ] }), ctx);
+  assert.equal(parsed[0].title, expectedTitle);
+  assert.equal(parsed[1].title, '[DECISION] Already prefixed');
+  t.mock.method(clients, 'getClient', async () => ({ invokeAgentWithScope: async () => JSON.stringify({ items: [
+    { kind: 'decision', title: rawTitle, ownerAad: ctx.leaderAad, ownerName: 'Leader' },
+  ] }) }));
+  const bodies = [], assignments = [];
+  t.mock.method(axios, 'post', async (_url, body) => {
+    bodies.push(body);
+    return { data: { id: `decision-${bodies.length}`, title: body.title, bucketId: body.bucketId } };
+  });
+  t.mock.method(cards, 'sendTaskAssignmentCardDirect', async (_opts, args) => { assignments.push(args); return { ok: true }; });
+  for (const legacy of [false, true]) {
+    const id = `bounded-decision-${legacy}`;
+    captures.createPendingCapture({ eventId: id, meetingId: 'meeting', subject: 'Meeting', ownerUpn: 'leader@example.com',
+      endTime: Date.now(), durationMinutes: 30, waitBudgetMinutes: 5, giveUpAfter: Date.now() + 3600000 });
+    if (legacy) captures.updateCapture(id, { extractedItems: [{
+      itemId: 'i1', kind: 'decision', title: rawTitle, ownerAad: ctx.leaderAad, ownerName: 'Leader', dueDateTime: null,
+    }] });
+    await runCapture({ eventId: id, meetingId: 'meeting', transcriptId: 'transcript', transcriptContent: 'WEBVTT' }, {}, {}, {
+      getPeopleOpts: () => ({ authorization: {}, context: {}, authHandlerName: 'agentic' }),
+    });
+    assert.equal(captures.getCapture(id).extractedItems[0].title, expectedTitle);
+    captures.markCaptureComplete(id);
+  }
+  assert.deepEqual(bodies.map((b) => b.title), [expectedTitle, expectedTitle]);
+  assert.deepEqual(assignments.map((a) => a.taskTitle), [expectedTitle, expectedTitle]);
+});
+
+test('capture and completion polling requests use the bounded Graph transport', async (t) => {
+  const { GRAPH_REQUEST_TIMEOUT_MS } = require('../dist/graph/graphHttp');
+  const watcher = require('../dist/graph/meetingWatcher');
+  const poller = require('../dist/graph/plannerPoller');
+  const taskComplete = require('../dist/cos/taskComplete');
+  const cards = require('../dist/cards/followupCards');
+  const planner = require('../dist/graph/plannerTools');
+  const seen = [];
+  t.mock.method(axios, 'get', async (url, options) => {
+    seen.push({ url, options });
+    throw Object.assign(new Error('timed out'), { code: 'ECONNABORTED' });
+  });
+  const opts = { authorization: {}, context: {}, authHandlerName: 'agentic' };
+  await watcher.discoverQualifyingMeetings({ ...opts, graphOwnerUpn: 'leader@example.com', leaderUpn: 'leader@example.com', cosAgentUpn: 'agent@example.com', watchHours: 24 });
+  await insights.fetchTranscriptsForMeeting(opts, ctx.leaderAad, 'meeting');
+  await poller.pollForCompletedTasks(opts);
+  t.mock.method(planner, 'getPlannerTaskDetails', async () => ({ ok: true, title: 'Completed', assigneeAads: ['owner-timeout'], percentComplete: 100 }));
+  t.mock.method(cards, 'sendPlainDmToUser', async () => ({ ok: true }));
+  await taskComplete.runTaskComplete({ taskId: 'bounded-completion' }, {}, {}, peopleOptsClient);
+  for (const pathFragment of ['/calendarView', '/transcripts', '/planner/plans/', '/users/owner-timeout']) {
+    assert.ok(seen.some((entry) => entry.url.includes(pathFragment)), pathFragment);
+  }
+  for (const { options } of seen) {
+    assert.equal(options.timeout, GRAPH_REQUEST_TIMEOUT_MS);
+    assert.ok(options.signal instanceof AbortSignal);
   }
 });
 

@@ -108,6 +108,10 @@ export async function runCapture(
     });
   }
 
+  // Normalize older checkpoints too, before retrying any writes.
+  for (const item of items) item.title = captureTitle(item.kind, item.title);
+  updateCapture(payload.eventId, { extractedItems: items });
+
   // ── Phase 2: deterministic writes, persisted per item ──
   const bucketId = await getPlannerBucketId();
   const leaderName = process.env.LEADER_NAME?.trim() || 'the Leader';
@@ -117,9 +121,8 @@ export async function runCapture(
 
   for (const item of items) {
     if (!item.taskId) {
-      const title = item.kind === 'decision' && !item.title.startsWith('[DECISION]') ? `[DECISION] ${item.title}` : item.title;
       const r = await createPlannerTaskDirect({
-        title,
+        title: item.title,
         description: item.description ?? null,
         bucketId: bucketId ?? null,
         assigneeAadIds: [item.ownerAad],
@@ -152,7 +155,7 @@ export async function runCapture(
         ownerAadObjectId: item.ownerAad,
         ownerName: item.ownerName,
         taskId: item.taskId!,
-        taskTitle: item.kind === 'decision' ? `[DECISION] ${item.title.replace(/^\[DECISION\]\s*/, '')}` : item.title,
+        taskTitle: item.title,
         taskDescription: item.description ?? null,
         dueDate: item.kind === 'decision' ? null : item.dueDateTime ?? null,
         assignedByName: item.kind === 'decision' ? 'Chief of Staff' : leaderName,
@@ -290,8 +293,8 @@ export function parseExtractedItems(
         (it.dueDateTime != null && typeof it.dueDateTime !== 'string')) {
       throw new Error('runCapture: extraction item has invalid required fields');
     }
-    const title = it.title.replace(/\s+/g, ' ').trim();
     const kind: CaptureItem['kind'] = it.kind;
+    const title = captureTitle(kind, it.title);
     const ownerAad = kind === 'decision' || !GUID_RE.test(String(it?.ownerAad ?? '')) ? ctx.leaderAad : String(it.ownerAad);
     const ownerName = String(it?.ownerName ?? '').trim().slice(0, 120) || (ownerAad === ctx.leaderAad ? process.env.LEADER_NAME?.trim() || 'the Leader' : 'there');
     let dueDateTime: string | null = null;
@@ -304,6 +307,15 @@ export function parseExtractedItems(
     items.push({ itemId: `i${items.length + 1}`, kind, title, description, dueDateTime, ownerAad, ownerName });
   }
   return items;
+}
+
+function captureTitle(kind: CaptureItem['kind'], value: string): string {
+  const normalized = value.replace(/\s+/g, ' ').trim();
+  const title = kind === 'decision'
+    ? `[DECISION] ${normalized.replace(/^\[DECISION\]\s*/i, '')}`
+    : normalized;
+  // Planner's 255-character limit includes the decision prefix.
+  return title.slice(0, 255).replace(/[\uD800-\uDBFF]$/, '');
 }
 
 /** YYYY-MM-DD for a civil date. */

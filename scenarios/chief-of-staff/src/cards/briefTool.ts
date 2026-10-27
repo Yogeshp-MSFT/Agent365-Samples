@@ -93,6 +93,9 @@ function sanitizeBriefLine(line: unknown): string | null {
   return collapsed.length > 200 ? collapsed.slice(0, 200) + '…' : collapsed;
 }
 
+// Leave room below Teams' 100 KB limit for channel-added activity metadata.
+export const BRIEF_ACTIVITY_BYTE_BUDGET = 80 * 1024;
+
 export function buildBriefAdaptiveCard(args: BriefCardArgs): object {
   const now = new Date();
   // Header uses the same zone as the card contents and the brief schedule.
@@ -310,7 +313,7 @@ export function buildBriefAdaptiveCard(args: BriefCardArgs): object {
 
   const totalCount = priorityRows.length + watchRows.length + calendarRows.length;
 
-  return {
+  const render = (omitted: number) => ({
     type: 'AdaptiveCard',
     $schema: 'http://adaptivecards.io/schemas/adaptive-card.json',
     version: '1.5',
@@ -325,7 +328,7 @@ export function buildBriefAdaptiveCard(args: BriefCardArgs): object {
             items: [
               {
                 type: 'TextBlock',
-                text: args.headline?.trim() || 'Daily Brief',
+                text: sanitizeBriefLine(args.headline) || 'Daily Brief',
                 weight: 'Bolder',
                 size: 'Large',
                 wrap: true,
@@ -362,6 +365,12 @@ export function buildBriefAdaptiveCard(args: BriefCardArgs): object {
       ...section('Priorities', priorityRows, priorityRows.length),
       ...section('Risks & blockers', watchRows, watchRows.length),
       ...section('Upcoming meetings', calendarRows, calendarRows.length),
+      ...(omitted > 0 ? [{
+        type: 'TextBlock',
+        text: `${omitted} item(s) omitted to keep this brief within Teams' message limit. [Open Planner](https://planner.cloud.microsoft/) for the full task list; check your calendar for all meetings.`,
+        wrap: true,
+        spacing: 'Medium',
+      }] : []),
       // ── Footer ─────────────────────────────────────────────────────────
       ...(totalCount > 0
         ? [
@@ -377,7 +386,22 @@ export function buildBriefAdaptiveCard(args: BriefCardArgs): object {
           ]
         : []),
     ],
-  };
+  });
+  let omitted = 0;
+  let card = render(omitted);
+  const activityBytes = (content: object) => Buffer.byteLength(JSON.stringify({
+    type: 'message',
+    attachments: [{ contentType: 'application/vnd.microsoft.card.adaptive', content }],
+  }), 'utf8');
+  while (activityBytes(card) > BRIEF_ACTIVITY_BYTE_BUDGET) {
+    // Trim the largest section's tail, retaining earlier (higher-ranked) rows.
+    const largest = [priorityRows, watchRows, calendarRows]
+      .reduce((a, b) => b.length > a.length ? b : a);
+    if (largest.length === 0) throw new Error('Brief header exceeds the activity byte budget');
+    largest.pop();
+    card = render(++omitted);
+  }
+  return card;
 }
 
 // ─── Graph helpers ─────────────────────────────────────────────────────────

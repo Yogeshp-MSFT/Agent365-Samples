@@ -17,7 +17,7 @@
 //   - "cos-agent" mode: policy granted to just the CoS agent's UPN, and every
 //     leader just invites the CoS to their meetings — no per-leader setup
 
-import axios from 'axios';
+import { graphHttp as axios } from './graphHttp';
 import { Authorization, TurnContext } from '@microsoft/agents-hosting';
 import { acquireGraphToken, resolveUpnToAad } from './peopleTools';
 import { log } from '../util/logger';

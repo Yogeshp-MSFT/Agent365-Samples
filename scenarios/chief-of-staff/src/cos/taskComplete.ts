@@ -12,7 +12,7 @@
 //   3. DM the leader:     "✅ <owners> completed <title>."
 //   4. If the title is prefixed [BLOCKER] / [RISK], call it out.
 
-import axios from 'axios';
+import { graphHttp as axios } from '../graph/graphHttp';
 import { TurnContext, TurnState } from '@microsoft/agents-hosting';
 import type { Client } from '../client';
 import { acquireAppOnlyGraphToken } from '../graph/graphAppToken';
